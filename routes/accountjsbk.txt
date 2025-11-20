@@ -1,0 +1,140 @@
+const express = require("express");
+const router = express.Router();
+const db = require("../db");
+
+let jwt;
+try {
+  jwt = require("jsonwebtoken");
+} catch (_) {}
+
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+
+/* ---------------- Auth helper ---------------- */
+function requireAuth(req, res, next) {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const p = jwt.verify(token, JWT_SECRET);
+    req.user = {
+      id: p.id || p.userId || p.sub,
+      email: p.email,
+      name: p.name,
+      role: p.role || "user",
+    };
+    if (!req.user.id) return res.status(401).json({ error: "Unauthorized" });
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+}
+
+/* ------------- Plan name inference ------------- */
+function inferPlanName(codeOrId) {
+  if (!codeOrId) return null;
+  const s = String(codeOrId).toLowerCase();
+  if (s.includes("growth")) return "Growth plan";
+  if (s.includes("essential")) return "App Essentials plan";
+  if (s.includes("custom") || s.includes("enterprise"))
+    return "Custom-made plan";
+  return null;
+}
+
+/* ------------- Read active/trialing subscription ------------- */
+async function getActiveSubscription(userId) {
+  try {
+    // Adapt to your schema; this is intentionally forgiving:
+    const q = await db.query(
+      `SELECT id, user_id, plan_id, plan_code, status,
+              current_period_end, renews_at, portal_url
+         FROM subscriptions
+        WHERE user_id=$1
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [userId]
+    );
+
+    const sub = q.rows[0];
+    if (!sub) return null;
+
+    let planName = null;
+    let planCode = sub.plan_code || sub.plan_id || null;
+
+    // Try to resolve the plan name from a plans table if present
+    try {
+      if (sub.plan_id) {
+        const p = await db.query(
+          `SELECT id, code, slug, name, title
+             FROM subscription_plans
+            WHERE id=$1`,
+          [sub.plan_id]
+        );
+        const row = p.rows[0];
+        if (row) {
+          planCode = row.code || row.slug || row.id || planCode;
+          planName = row.title || row.name || row.slug || row.code || null;
+        }
+      }
+    } catch (_) {}
+
+    // Fallback name inference
+    if (!planName) planName = inferPlanName(planCode);
+
+    return {
+      id: sub.id,
+      status: sub.status || "active",
+      plan: {
+        id: sub.plan_id || planCode || null,
+        code: planCode || null,
+        name: planName || null,
+      },
+      current_period_end: sub.current_period_end || sub.renews_at || null,
+      renews_at: sub.renews_at || sub.current_period_end || null,
+      portal_url: sub.portal_url || null,
+    };
+  } catch (e) {
+    // If we can't read, just return null to avoid hard errors in UI
+    return null;
+  }
+}
+
+/* ---------------- Endpoints ---------------- */
+
+// Basic identity; some backends don’t expose this by default
+router.get("/auth/me", requireAuth, async (req, res) => {
+  try {
+    const q = await db.query(
+      `SELECT id, name, email, role, plan_code
+         FROM users
+        WHERE id=$1`,
+      [req.user.id]
+    );
+    const row = q.rows[0] || {};
+    // Attach an inferred plan_code if present in subscriptions
+    const sub = await getActiveSubscription(req.user.id);
+    return res.json({
+      id: row.id || req.user.id,
+      name: row.name || req.user.name,
+      email: row.email || req.user.email,
+      role: row.role || req.user.role || "user",
+      plan_code: row.plan_code || sub?.plan?.code || null,
+    });
+  } catch (e) {
+    // Fall back to the token payload
+    return res.json(req.user);
+  }
+});
+
+// The object Account page expects; return null (200) if none
+router.get("/subscription/me", requireAuth, async (req, res) => {
+  const sub = await getActiveSubscription(req.user.id);
+  return res.json(sub || null);
+});
+
+// Manage-portal link (Stripe/PayPal); return { portal_url: null } if not set
+router.get("/subscription/portal", requireAuth, async (req, res) => {
+  const sub = await getActiveSubscription(req.user.id);
+  return res.json({ portal_url: sub?.portal_url || null });
+});
+
+module.exports = router;

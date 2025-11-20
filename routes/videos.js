@@ -1,0 +1,845 @@
+// server-api/routes/videos.js
+const express = require("express");
+const router = express.Router();
+const db = require("../db");
+const authenticate = require("../middleware/authenticate");
+
+const path = require("path");
+const fs = require("fs");
+const { getDurationSeconds } = require("../services/mediaMeta");
+
+// 🔔 Centralized FCM sender (Admin SDK with legacy fallback)
+const { sendPush } = require("../notifications/fcm");
+
+/* -------------------- helpers -------------------- */
+
+function isAdmin(user) {
+  const r = (user?.role || user?.type || "").toLowerCase();
+  return r === "admin" || r === "owner";
+}
+
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) if (obj[k] !== undefined) out[k] = obj[k];
+  return out;
+}
+
+function ensureArray(x) {
+  if (x === undefined || x === null) return [];
+  return Array.isArray(x) ? x : [x];
+}
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/** Non-negative integer (or 0) */
+function coerceNonNegInt(v, fallback = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.round(n));
+}
+
+/** Resolve duration from flexible body keys; return seconds (int) or null */
+function resolveDurationSeconds(body = {}) {
+  if (body.duration_seconds != null) {
+    const s = Math.round(num(body.duration_seconds));
+    return Number.isFinite(s) && s > 0 ? s : null;
+  }
+  if (body.duration_sec != null) {
+    const s = Math.round(num(body.duration_sec));
+    return Number.isFinite(s) && s > 0 ? s : null;
+  }
+  if (body.duration != null) {
+    const s = Math.round(num(body.duration));
+    return Number.isFinite(s) && s > 0 ? s : null;
+  }
+  if (
+    body.duration_minutes != null ||
+    body.duration_mins != null ||
+    body.duration_min != null
+  ) {
+    const m = num(
+      body.duration_minutes ?? body.duration_mins ?? body.duration_min
+    );
+    const s = Math.round(m * 60);
+    return Number.isFinite(s) && s > 0 ? s : null;
+  }
+  if (
+    body.duration_hours != null ||
+    body.duration_hrs != null ||
+    body.duration_hr != null
+  ) {
+    const h = num(body.duration_hours ?? body.duration_hrs ?? body.duration_hr);
+    const s = Math.round(h * 3600);
+    return Number.isFinite(s) && s > 0 ? s : null;
+  }
+  if (body.duration_ms != null || body.durationMillis != null) {
+    const ms = num(body.duration_ms ?? body.durationMillis);
+    const s = Math.round(ms / 1000);
+    return Number.isFinite(s) && s > 0 ? s : null;
+  }
+  return null;
+}
+
+/** Map a video_url (absolute or relative) to a local file under /uploads if it exists */
+function resolveLocalUploadPath(videoUrl) {
+  try {
+    if (!videoUrl) return null;
+    let p = String(videoUrl);
+
+    // If absolute URL, take the pathname
+    if (/^https?:\/\//i.test(p)) {
+      try {
+        p = new URL(p).pathname;
+      } catch (_) {}
+    }
+
+    // Normalize: strip leading slashes
+    p = p.replace(/^\/+/, "");
+
+    // Must be under uploads/
+    const m = p.match(/^uploads\/(.+)$/i);
+    if (!m) return null;
+
+    const raw = m[1];
+    const decoded = decodeURIComponent(raw);
+
+    const uploadsDir = path.join(__dirname, "..", "uploads");
+    const candidates = [raw, decoded];
+
+    for (const file of candidates) {
+      const full = path.join(uploadsDir, file);
+      if (fs.existsSync(full)) return full;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** If video_url points to /uploads/..., try probing the local file (handles absolute + encoded) */
+async function detectDurationFromUrlMaybeLocal(videoUrl) {
+  try {
+    const local = resolveLocalUploadPath(videoUrl);
+    if (!local) return null;
+    const sec = await getDurationSeconds(local);
+    return Number.isFinite(sec) && sec > 0 ? Math.round(sec) : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildMetadataFromBody(body) {
+  const {
+    seo_title,
+    seo_description,
+    tags,
+    resources, // [{title,url}]
+    subtitles, // [{lang,url}]
+    audio_track, // {url}
+    trailer, // {url}
+    pricing, // {rental:{currency,price,duration_days}, purchase:{currency,price}, upsell_text}
+    authors, // [string]
+    custom_filters, // [string] or [{key,value}]
+  } = body;
+
+  const md = {};
+  if (seo_title !== undefined) md.seo_title = String(seo_title || "");
+  if (seo_description !== undefined)
+    md.seo_description = String(seo_description || "");
+  if (tags !== undefined) md.tags = ensureArray(tags).map(String);
+
+  if (resources !== undefined)
+    md.resources = ensureArray(resources).map((r) => ({
+      title: String(r.title || ""),
+      url: String(r.url || ""),
+    }));
+
+  if (subtitles !== undefined)
+    md.subtitles = ensureArray(subtitles).map((s) => ({
+      lang: String(s.lang || ""),
+      url: String(s.url || ""),
+    }));
+
+  if (audio_track !== undefined)
+    md.audio_track = audio_track
+      ? { url: String(audio_track.url || "") }
+      : null;
+  if (trailer !== undefined)
+    md.trailer = trailer ? { url: String(trailer.url || "") } : null;
+
+  if (pricing !== undefined) {
+    md.pricing = {
+      rental: pricing?.rental
+        ? {
+            currency: String(pricing.rental.currency || "USD"),
+            price: Number(pricing.rental.price || 0),
+            duration_days: Number(pricing.rental.duration_days || 0),
+          }
+        : null,
+      purchase: pricing?.purchase
+        ? {
+            currency: String(pricing.purchase.currency || "USD"),
+            price: Number(pricing.purchase.price || 0),
+          }
+        : null,
+      upsell_text: String(pricing?.upsell_text || ""),
+    };
+  }
+
+  if (authors !== undefined) md.authors = ensureArray(authors).map(String);
+  if (custom_filters !== undefined)
+    md.custom_filters = ensureArray(custom_filters);
+
+  // passthrough meta fields used in UI (geo, vertical thumb)
+  if (body.geo_allow !== undefined) md.geo_allow = ensureArray(body.geo_allow);
+  if (body.geo_block !== undefined) md.geo_block = ensureArray(body.geo_block);
+  if (body.thumbnail_vertical_url !== undefined)
+    md.thumbnail_vertical_url = String(body.thumbnail_vertical_url || "");
+
+  return md;
+}
+
+function mergeJson(a, b) {
+  return { ...(a || {}), ...(b || {}) };
+}
+
+async function assertOwnerOrAdmin(videoId, user) {
+  const q = await db.query(
+    "SELECT id, created_by FROM videos WHERE id=$1 LIMIT 1",
+    [videoId]
+  );
+  if (q.rowCount === 0) return { ok: false, status: 404 };
+  const row = q.rows[0];
+  if (isAdmin(user)) return { ok: true, row };
+  if (row.created_by && String(row.created_by) === String(user?.id))
+    return { ok: true, row };
+  return { ok: false, status: 403 };
+}
+
+function normalizeVisibility(v) {
+  const val = String(v || "").toLowerCase();
+  return ["public", "private", "unlisted"].includes(val) ? val : "private";
+}
+
+function isDigits(x) {
+  return typeof x === "string" && /^\d+$/.test(x);
+}
+
+/* ---------- SQL helper: safe preview seconds from column OR metadata ---------- */
+const PREVIEW_SECONDS_SQL = `
+  GREATEST(0,
+    COALESCE(
+      v.free_preview_seconds,
+      CASE WHEN (v.metadata->>'free_preview_seconds') ~ '^\\s*\\d+\\s*$'
+           THEN (v.metadata->>'free_preview_seconds')::int END,
+      CASE WHEN (v.metadata->>'preview_seconds') ~ '^\\s*\\d+\\s*$'
+           THEN (v.metadata->>'preview_seconds')::int END,
+      CASE WHEN (v.metadata->>'freePreviewSeconds') ~ '^\\s*\\d+\\s*$'
+           THEN (v.metadata->>'freePreviewSeconds')::int END,
+      CASE WHEN (v.metadata->>'previewSeconds') ~ '^\\s*\\d+\\s*$'
+           THEN (v.metadata->>'previewSeconds')::int END,
+      0
+    )
+  ) AS free_preview_seconds
+`;
+
+/* -------------------- PUBLIC ROUTES -------------------- */
+
+/**
+ * PUBLIC CATALOG SECTIONS
+ * GET /api/videos/public/catalog
+ */
+router.get("/public/catalog", async (req, res) => {
+  try {
+    const { search, only_free, limit = 200 } = req.query;
+
+    const params = [];
+    let where = `
+      WHERE v.is_published = TRUE
+        AND v.visibility <> 'unlisted'
+    `;
+
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (v.title ILIKE $${params.length} OR v.description ILIKE $${params.length})`;
+    }
+
+    if (
+      String(only_free) === "1" ||
+      String(only_free).toLowerCase() === "true"
+    ) {
+      where += ` AND (v.is_premium = false OR v.is_premium IS NULL)`;
+    }
+
+    params.push(Number(limit));
+    const sql = `
+      SELECT
+        v.*,
+        COALESCE(v.is_premium, TRUE) AS is_premium,
+        ${PREVIEW_SECONDS_SQL},
+        c.id   AS category_id,
+        c.name AS category_name
+      FROM videos v
+      LEFT JOIN categories c ON c.id = v.category_id
+      ${where}
+      ORDER BY COALESCE(v.published_at, v.created_at) DESC
+      LIMIT $${params.length}
+    `;
+    const r = await db.query(sql, params);
+
+    // group into sections
+    const map = new Map(); // key => { title, items: [] }
+    for (const row of r.rows) {
+      const key =
+        row.category_name ||
+        (row.category_id != null ? String(row.category_id) : "Videos");
+      const title = row.category_name || "Videos";
+      if (!map.has(key)) map.set(key, { title, items: [] });
+      map.get(key).items.push(row);
+    }
+
+    res.json({
+      sections: Array.from(map.values()),
+    });
+  } catch (e) {
+    console.error("[GET /videos/public/catalog] error:", e);
+    res.status(500).json({ message: "Failed to fetch catalog" });
+  }
+});
+
+/**
+ * PUBLIC LIST (flat)
+ * GET /api/videos/public
+ */
+router.get("/public", async (req, res) => {
+  try {
+    const { search, category_id, only_free, limit = 50 } = req.query;
+
+    const params = [];
+    let where = `
+      WHERE v.is_published = TRUE
+        AND v.visibility <> 'unlisted'
+    `;
+
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (v.title ILIKE $${params.length} OR v.description ILIKE $${params.length})`;
+    }
+    if (category_id) {
+      params.push(category_id);
+      where += ` AND v.category_id = $${params.length}`;
+    }
+
+    if (
+      String(only_free).toLowerCase() === "true" ||
+      String(only_free) === "1"
+    ) {
+      where += ` AND (v.is_premium = false OR v.is_premium IS NULL)`;
+    }
+
+    params.push(Number(limit));
+    const sql = `
+      SELECT
+        v.*,
+        COALESCE(v.is_premium, TRUE) AS is_premium,
+        ${PREVIEW_SECONDS_SQL},
+        c.name AS category_name
+      FROM videos v
+      LEFT JOIN categories c ON c.id = v.category_id
+      ${where}
+      ORDER BY COALESCE(v.published_at, v.created_at) DESC
+      LIMIT $${params.length}
+    `;
+    const r = await db.query(sql, params);
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error("[GET /videos/public] error:", e);
+    res.status(500).json({ message: "Failed to fetch public videos" });
+  }
+});
+
+/**
+ * PUBLIC READ (no auth)
+ * GET /api/videos/public/:id
+ */
+router.get("/public/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+    const r = await db.query(
+      `
+      SELECT
+        v.*,
+        COALESCE(v.is_premium, TRUE) AS is_premium,
+        ${PREVIEW_SECONDS_SQL},
+        c.name AS category_name
+       FROM videos v
+       LEFT JOIN categories c ON c.id = v.category_id
+       WHERE v.id = $1
+         AND v.is_published = TRUE
+       LIMIT 1`,
+      [id]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ message: "Not found" });
+    }
+    return res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[GET /videos/public/:id] error:", e);
+    return res.status(500).json({ message: "Failed to fetch video" });
+  }
+});
+
+/* -------------------- AUTH’D ROUTES -------------------- */
+
+/**
+ * AUTH’D LIST
+ * GET /api/videos
+ */
+router.get("/", authenticate, async (req, res) => {
+  try {
+    const { search, category_id, status = "all", limit = 50 } = req.query;
+
+    const params = [];
+    let where = "WHERE 1=1";
+
+    if (!isAdmin(req.user)) {
+      params.push(req.user.id);
+      where += ` AND v.created_by = $${params.length}`;
+    }
+
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (v.title ILIKE $${params.length} OR v.description ILIKE $${params.length})`;
+    }
+    if (category_id) {
+      params.push(category_id);
+      where += ` AND v.category_id = $${params.length}`;
+    }
+
+    if (String(status).toLowerCase() === "published") {
+      where += ` AND v.is_published = TRUE`;
+    } else if (String(status).toLowerCase() === "unpublished") {
+      where += ` AND (v.is_published = FALSE OR v.is_published IS NULL)`;
+    }
+
+    params.push(Number(limit));
+    const sql = `
+      SELECT v.*,
+             c.name AS category_name,
+             COALESCE(v.is_premium, TRUE) AS is_premium,
+             ${PREVIEW_SECONDS_SQL}
+      FROM videos v
+      LEFT JOIN categories c ON c.id = v.category_id
+      ${where}
+      ORDER BY v.created_at DESC
+      LIMIT $${params.length}
+    `;
+    const r = await db.query(sql, params);
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error("[GET /videos] error:", e);
+    res.status(500).json({ message: "Failed to fetch videos" });
+  }
+});
+
+/**
+ * AUTH’D READ (owner/admin)
+ * GET /api/videos/:id
+ */
+router.get("/:id", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const perm = await assertOwnerOrAdmin(id, req.user);
+    if (!perm.ok) return res.status(perm.status).json({ message: "Forbidden" });
+
+    const r = await db.query(
+      `SELECT v.*, 
+              c.name AS category_name,
+              COALESCE(v.is_premium, TRUE) AS is_premium,
+              ${PREVIEW_SECONDS_SQL}
+       FROM videos v
+       LEFT JOIN categories c ON c.id = v.category_id
+       WHERE v.id = $1
+       LIMIT 1`,
+      [id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ message: "Not found" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[GET /videos/:id] error:", e);
+    res.status(500).json({ message: "Failed to fetch video" });
+  }
+});
+
+/**
+ * AUTH’D CREATE
+ * POST /api/videos
+ */
+router.post("/", authenticate, async (req, res) => {
+  try {
+    const base = pick(req.body, [
+      "title",
+      "description",
+      "short_description",
+      "category_id",
+      "thumbnail_url",
+      "video_url",
+      "visibility",
+      "is_premium",
+      "free_preview_seconds",
+      "is_published",
+      "published_at",
+    ]);
+
+    if (!base.video_url) {
+      return res.status(400).json({ message: "video_url is required" });
+    }
+
+    const visibility =
+      base.visibility === undefined
+        ? "private"
+        : normalizeVisibility(base.visibility);
+    const is_premium = base.is_premium === undefined ? true : !!base.is_premium;
+    const previewSeconds = coerceNonNegInt(base.free_preview_seconds, 0);
+
+    const is_published =
+      base.is_published === undefined ? false : !!base.is_published;
+    const published_at = base.published_at
+      ? new Date(base.published_at)
+      : is_published
+      ? new Date()
+      : null;
+
+    // Try to detect duration
+    let durationSeconds = resolveDurationSeconds(req.body);
+    if (durationSeconds == null) {
+      durationSeconds = await detectDurationFromUrlMaybeLocal(base.video_url);
+    }
+
+    const md = buildMetadataFromBody(req.body);
+
+    const r = await db.query(
+      `INSERT INTO videos
+       (title, description, short_description, category_id, thumbnail_url, video_url,
+        duration_seconds, visibility, is_premium, free_preview_seconds,
+        is_published, published_at, metadata, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      [
+        base.title || null,
+        base.description || null,
+        base.short_description || null,
+        base.category_id || null,
+        base.thumbnail_url || null,
+        String(base.video_url),
+        durationSeconds,
+        visibility,
+        is_premium,
+        previewSeconds,
+        is_published,
+        published_at,
+        JSON.stringify(md),
+        req.user?.id || null,
+      ]
+    );
+
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[POST /videos] error:", e);
+    res.status(500).json({ message: "Failed to create video" });
+  }
+});
+
+/**
+ * AUTH’D UPDATE (owner/admin)
+ * PUT /api/videos/:id
+ */
+router.put("/:id", authenticate, async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) {
+      client.release();
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const perm = await assertOwnerOrAdmin(id, req.user);
+    if (!perm.ok) {
+      client.release();
+      return res.status(perm.status).json({ message: "Forbidden" });
+    }
+
+    await client.query("BEGIN");
+
+    const cur = await client.query(
+      "SELECT metadata, video_url FROM videos WHERE id=$1 FOR UPDATE",
+      [id]
+    );
+    if (cur.rowCount === 0) {
+      await client.query("ROLLBACK");
+      client.release();
+      return res.status(404).json({ message: "Not found" });
+    }
+    const currentMd = cur.rows[0].metadata || {};
+    const currentUrl = cur.rows[0].video_url;
+
+    const mdPatch = buildMetadataFromBody(req.body);
+    const mergedMd = mergeJson(currentMd, mdPatch);
+
+    const base = pick(req.body, [
+      "title",
+      "description",
+      "short_description",
+      "category_id",
+      "thumbnail_url",
+      "video_url",
+      "visibility",
+      "is_premium",
+      "free_preview_seconds",
+      "is_published",
+      "published_at",
+    ]);
+
+    const sets = [];
+    const vals = [];
+    let i = 1;
+
+    for (const [k, v] of Object.entries(base)) {
+      if (k === "visibility") {
+        sets.push(`${k} = $${i++}`);
+        vals.push(normalizeVisibility(v));
+      } else if (k === "is_premium") {
+        sets.push(`${k} = $${i++}`);
+        vals.push(!!v);
+      } else if (k === "free_preview_seconds") {
+        sets.push(`${k} = $${i++}`);
+        vals.push(coerceNonNegInt(v, 0));
+      } else if (k === "is_published") {
+        sets.push(`${k} = $${i++}`);
+        vals.push(!!v);
+      } else if (k === "published_at") {
+        sets.push(`${k} = $${i++}`);
+        vals.push(v ? new Date(v) : null);
+      } else {
+        sets.push(`${k} = $${i++}`);
+        vals.push(v === undefined ? null : v);
+      }
+    }
+
+    // duration_seconds — explicit value wins; otherwise auto-detect if URL changed
+    let maybeDur = resolveDurationSeconds(req.body);
+    if (maybeDur == null) {
+      const newUrl = base.video_url !== undefined ? base.video_url : currentUrl;
+      maybeDur = await detectDurationFromUrlMaybeLocal(newUrl);
+    }
+    if (maybeDur != null) {
+      sets.push(`duration_seconds = $${i++}`);
+      vals.push(maybeDur);
+    }
+
+    sets.push(`metadata = $${i++}`);
+    vals.push(JSON.stringify(mergedMd));
+    vals.push(id);
+
+    const sql = `UPDATE videos SET ${sets.join(
+      ", "
+    )} WHERE id = $${i} RETURNING *`;
+    const r = await client.query(sql, vals);
+
+    await client.query("COMMIT");
+    res.json(r.rows[0]);
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("[PUT /videos/:id] error:", e);
+    res.status(500).json({ message: "Failed to update video" });
+  } finally {
+    try {
+      client.release();
+    } catch {}
+  }
+});
+
+/**
+ * AUTH’D PUBLISH
+ * POST /api/videos/:id/publish
+ */
+router.post("/:id/publish", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) {
+      return res.status(400).json({ message: "Invalid id" });
+    }
+
+    const perm = await assertOwnerOrAdmin(id, req.user);
+    if (!perm.ok) {
+      return res.status(perm.status).json({ message: "Forbidden" });
+    }
+
+    const { rows } = await db.query(
+      `UPDATE videos
+       SET is_published = TRUE,
+           published_at = COALESCE(published_at, NOW())
+       WHERE id = $1
+       RETURNING id, title, created_by`,
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ message: "Not found" });
+    }
+
+    const video = rows[0];
+    const videoId = Number(video.id);
+    const uploaderId = video.created_by || null;
+
+    const title = "New video published";
+    const body = video.title || "A new video is available";
+
+    // 👇 what both the bell + FCM will use
+    const appPayload = {
+      type: "video_published",
+      video_id: videoId,
+      route: `/watch/${videoId}`,
+    };
+
+    /* 1) In-app bell notifications for all users (except uploader) */
+    try {
+      await db.query(
+        `
+        INSERT INTO notifications (user_id, title, body, channel, payload)
+        SELECT
+          u.id,
+          $1::text,
+          $2::text,
+          'video_published'::text,
+          jsonb_build_object(
+            'type', 'video_published',
+            'video_id', $3::int,
+            'route', $4::text
+          )
+        FROM users u
+        WHERE u.id IS NOT NULL
+          AND ($5::int IS NULL OR u.id <> $5)
+      `,
+        [title, body, videoId, `/watch/${videoId}`, uploaderId]
+      );
+    } catch (err) {
+      console.warn(
+        "[notifications] insert on publish failed:",
+        err?.message || err
+      );
+    }
+
+    /* 2) Push notifications (FCM) to all registered tokens (except uploader) */
+    try {
+      const t = await db.query(
+        `
+        SELECT token
+        FROM user_push_tokens
+        WHERE token IS NOT NULL
+          AND token <> ''
+          AND ($1::int IS NULL OR user_id <> $1)
+      `,
+        [uploaderId]
+      );
+      const tokens = t.rows.map((r) => r.token).filter(Boolean);
+
+      if (tokens.length) {
+        await sendPush(tokens, {
+          title,
+          body,
+          data: appPayload, // includes video_id + route
+        });
+      }
+    } catch (e) {
+      console.warn("[FCM] publish notification skipped:", e?.message || e);
+    }
+
+    res.json(video);
+  } catch (e) {
+    console.error("[POST /videos/:id/publish] error:", e);
+    res.status(500).json({ message: "Failed to publish video" });
+  }
+});
+
+/**
+ * AUTH’D UNPUBLISH
+ * POST /api/videos/:id/unpublish
+ */
+router.post("/:id/unpublish", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) return res.status(400).json({ message: "Invalid id" });
+
+    const perm = await assertOwnerOrAdmin(id, req.user);
+    if (!perm.ok) return res.status(perm.status).json({ message: "Forbidden" });
+
+    const { rows } = await db.query(
+      `UPDATE videos
+       SET is_published = FALSE
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "Not found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[POST /videos/:id/unpublish] error:", e);
+    res.status(500).json({ message: "Failed to unpublish video" });
+  }
+});
+
+/**
+ * AUTH’D DELETE (owner/admin)
+ * DELETE /api/videos/:id
+ */
+router.delete("/:id", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) return res.status(400).json({ message: "Invalid id" });
+
+    const perm = await assertOwnerOrAdmin(id, req.user);
+    if (!perm.ok) return res.status(perm.status).json({ message: "Forbidden" });
+
+    await db.query("DELETE FROM videos WHERE id=$1", [id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /videos/:id] error:", e);
+    res.status(500).json({ message: "Failed to delete video" });
+  }
+});
+
+/**
+ * GET /api/videos/:id/playlists
+ */
+router.get("/:id/playlists", async (req, res, next) => {
+  try {
+    const { id } = req.params; // video id
+    if (!isDigits(id)) return res.status(400).json({ message: "Invalid id" });
+
+    const q = `
+      SELECT p.*
+      FROM playlist_videos pv
+      JOIN playlists p ON p.id = pv.playlist_id
+      WHERE pv.video_id = $1
+      ORDER BY COALESCE(pv.sort_index, 999999), pv.added_at DESC
+    `;
+    const { rows } = await db.query(q, [id]);
+    res.json({ items: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+module.exports = router;

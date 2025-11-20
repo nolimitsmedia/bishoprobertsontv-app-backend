@@ -1,0 +1,650 @@
+// server-api/routes/playlists.js
+const express = require("express");
+const router = express.Router();
+const db = require("../db");
+const authenticate = require("../middleware/authenticate");
+
+/* -------------------- helpers -------------------- */
+const slugify = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "");
+
+function isAdmin(user) {
+  const r = (user?.role || user?.type || "").toLowerCase();
+  return r === "admin" || r === "owner";
+}
+
+async function ensureFavorites(userId) {
+  const q = await db.query(
+    `SELECT * FROM playlists
+      WHERE created_by = $1 AND LOWER(title) = 'favorites'
+      ORDER BY id ASC
+      LIMIT 1`,
+    [userId]
+  );
+  if (q.rowCount) return q.rows[0];
+
+  const { rows } = await db.query(
+    `INSERT INTO playlists (title, slug, visibility, created_by, description)
+     VALUES ($1, $2, 'private', $3, $4)
+     RETURNING *`,
+    ["Favorites", slugify("Favorites"), userId, "Your saved videos"]
+  );
+  return rows[0];
+}
+
+function shortRand() {
+  return Math.random().toString(36).slice(2, 6);
+}
+
+/* =========================================================
+   PUBLIC LIST
+========================================================= */
+router.get("/public", async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 24, 200));
+    const nonempty = req.query.nonempty === "0" ? false : true;
+
+    const sql = `
+      SELECT
+        p.id,
+        p.title,
+        COALESCE(p.slug, LOWER(REPLACE(p.title, ' ', '-'))) AS slug,
+        p.description,
+        p.thumbnail_url,
+        p.visibility,
+        p.featured_category_id,
+        p.created_at,
+        COUNT(pv.video_id)::int AS item_count,
+        COUNT(pv.video_id)::int AS video_count
+      FROM playlists p
+      LEFT JOIN playlist_videos pv ON pv.playlist_id = p.id
+      WHERE
+        (p.visibility IN ('public','unlisted') OR p.featured_category_id IS NOT NULL)
+      GROUP BY p.id
+      ${nonempty ? "HAVING COUNT(pv.video_id) > 0" : ""}
+      ORDER BY p.created_at DESC
+      LIMIT $1
+    `;
+    const { rows } = await db.query(sql, [limit]);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error("[GET /playlists/public] error:", e);
+    res.status(500).json({ message: "Failed to fetch playlists" });
+  }
+});
+
+/* =========================================================
+   PUBLIC DETAIL
+========================================================= */
+router.get("/public/:idOrSlug", async (req, res) => {
+  try {
+    const { idOrSlug } = req.params;
+    const isId = /^\d+$/.test(idOrSlug);
+
+    const p = await db.query(
+      `
+      SELECT
+        p.id,
+        p.title,
+        COALESCE(p.slug, LOWER(REPLACE(p.title, ' ', '-'))) AS slug,
+        p.description,
+        p.thumbnail_url,
+        p.visibility,
+        p.featured_category_id,
+        p.created_at
+      FROM playlists p
+      WHERE ${isId ? "p.id = $1" : "p.slug = $1"}
+        AND (p.visibility IN ('public','unlisted') OR p.featured_category_id IS NOT NULL)
+      LIMIT 1`,
+      [idOrSlug]
+    );
+
+    if (p.rowCount === 0) return res.status(404).json({ message: "Not found" });
+    const playlist = p.rows[0];
+
+    const vids = await db.query(
+      `
+      SELECT v.*, c.name AS category_name
+      FROM playlist_videos pv
+      JOIN videos v ON v.id = pv.video_id
+      LEFT JOIN categories c ON c.id = v.category_id
+      WHERE pv.playlist_id = $1
+        AND v.is_published = TRUE
+      ORDER BY pv.sort_index ASC NULLS LAST, pv.added_at ASC NULLS LAST`,
+      [playlist.id]
+    );
+
+    res.json({ ...playlist, videos: vids.rows });
+  } catch (e) {
+    console.error("[GET /playlists/public/:idOrSlug] error:", e);
+    res.status(500).json({ message: "Failed to fetch playlist" });
+  }
+});
+
+/* =========================================================
+   AUTHENTICATED convenience
+========================================================= */
+router.post("/favorites/ensure", authenticate, async (req, res) => {
+  try {
+    const fav = await ensureFavorites(req.user.id);
+    res.json(fav);
+  } catch (e) {
+    console.error("[POST /playlists/favorites/ensure] error:", e);
+    res.status(500).json({ message: "Failed to ensure favorites" });
+  }
+});
+
+/* =========================================================
+   CREATE (define BEFORE param routes)
+   POST /api/playlists/create   <-- alias
+   POST /api/playlists          <-- canonical
+========================================================= */
+async function createPlaylist(req, res) {
+  try {
+    const {
+      title,
+      description,
+      thumbnail_url,
+      visibility = "private",
+      slug,
+      featured_category_id,
+    } = req.body;
+
+    if (!title) return res.status(400).json({ message: "title is required" });
+
+    const finalSlug = slug || slugify(title);
+    const { rows } = await db.query(
+      `
+      INSERT INTO playlists (title, slug, description, thumbnail_url, visibility, featured_category_id, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      RETURNING *`,
+      [
+        title,
+        finalSlug,
+        description || null,
+        thumbnail_url || null,
+        visibility,
+        featured_category_id ?? null,
+        req.user?.id || null,
+      ]
+    );
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[POST /playlists(create)] error:", e);
+    res.status(500).json({ message: "Failed to create playlist" });
+  }
+}
+
+router.post("/create", authenticate, createPlaylist);
+router.post("/", authenticate, createPlaylist);
+
+/* =========================================================
+   AUTHENTICATED CRUD & membership
+========================================================= */
+
+// LIST (admin all or scoped)
+router.get("/", authenticate, async (req, res) => {
+  try {
+    const params = [];
+    let sqlWhere = "";
+    let adminScopeAll = false;
+
+    if (isAdmin(req.user)) {
+      adminScopeAll = String(req.query.scope || "").toLowerCase() === "all";
+      if (!adminScopeAll) {
+        sqlWhere = `
+          WHERE (
+            p.created_by IS NULL
+            OR EXISTS (
+              SELECT 1 FROM users u
+              WHERE u.id = p.created_by
+                AND LOWER(COALESCE(u.role, '')) IN ('admin','owner')
+            )
+          )`;
+      }
+    } else {
+      sqlWhere = "WHERE p.created_by = $1";
+      params.push(req.user.id);
+    }
+
+    const sql = `
+      SELECT
+        p.id,
+        p.title,
+        COALESCE(p.slug, LOWER(REPLACE(p.title, ' ', '-'))) AS slug,
+        p.description,
+        p.thumbnail_url,
+        p.visibility,
+        p.featured_category_id,
+        p.created_at,
+        COUNT(pv.video_id)::int AS item_count,
+        COUNT(pv.video_id)::int AS video_count
+      FROM playlists p
+      LEFT JOIN playlist_videos pv ON pv.playlist_id = p.id
+      ${sqlWhere}
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+      LIMIT 200`;
+    const { rows } = await db.query(sql, params);
+    res.json({ playlists: rows, items: rows });
+  } catch (e) {
+    console.error("[GET /playlists] error:", e);
+    res.status(500).json({ message: "Failed to fetch playlists" });
+  }
+});
+
+// DETAIL (owner/admin)
+router.get("/:idOrSlug", authenticate, async (req, res) => {
+  try {
+    const { idOrSlug } = req.params;
+    const isId = /^\d+$/.test(idOrSlug);
+
+    const cur = await db.query(
+      `SELECT * FROM playlists WHERE ${isId ? "id = $1" : "slug = $1"} LIMIT 1`,
+      [idOrSlug]
+    );
+    if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
+
+    const playlist = cur.rows[0];
+    if (
+      !isAdmin(req.user) &&
+      String(playlist.created_by) !== String(req.user.id)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const vids = await db.query(
+      `
+      SELECT v.*, c.name AS category_name
+      FROM playlist_videos pv
+      JOIN videos v ON v.id = pv.video_id
+      LEFT JOIN categories c ON c.id = v.category_id
+      WHERE pv.playlist_id = $1
+      ORDER BY pv.sort_index ASC NULLS LAST, pv.added_at ASC NULLS LAST`,
+      [playlist.id]
+    );
+
+    playlist.video_count = vids.rowCount || 0;
+    res.json({ ...playlist, videos: vids.rows });
+  } catch (e) {
+    console.error("[GET /playlists/:idOrSlug] error:", e);
+    res.status(500).json({ message: "Failed to fetch playlist" });
+  }
+});
+
+// UPDATE
+router.put("/:id", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const cur = await db.query("SELECT * FROM playlists WHERE id = $1", [id]);
+    if (cur.rowCount === 0)
+      return res.status(404).json({ message: "Not found" });
+
+    const row = cur.rows[0];
+    if (!isAdmin(req.user) && String(row.created_by) !== String(req.user?.id)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const fields = [];
+    const params = [id];
+
+    function push(col, val, transform = (v) => v) {
+      fields.push(`${col} = $${params.length + 1}`);
+      params.push(transform(val));
+    }
+
+    if ("title" in req.body && req.body.title != null)
+      push("title", req.body.title);
+    if ("slug" in req.body) {
+      const finalSlug =
+        req.body.slug ??
+        row.slug ??
+        slugify(req.body.title || row.title || "playlist");
+      push("slug", finalSlug);
+    }
+    if ("description" in req.body)
+      push("description", req.body.description ?? null);
+    if ("thumbnail_url" in req.body)
+      push("thumbnail_url", req.body.thumbnail_url ?? null);
+    if ("visibility" in req.body)
+      push("visibility", req.body.visibility ?? "public");
+    if ("featured_category_id" in req.body) {
+      push("featured_category_id", req.body.featured_category_id ?? null);
+    }
+
+    fields.push(`updated_at = NOW()`);
+    if (fields.length === 1) return res.json(row);
+
+    const sql = `
+      UPDATE playlists
+      SET ${fields.join(", ")}
+      WHERE id = $1
+      RETURNING *`;
+    const r = await db.query(sql, params);
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error("[PUT /playlists/:id] error:", e);
+    res.status(500).json({ message: "Failed to update playlist" });
+  }
+});
+
+// DELETE
+router.delete("/:id", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const cur = await db.query(
+      "SELECT created_by FROM playlists WHERE id = $1",
+      [id]
+    );
+    if (cur.rowCount === 0)
+      return res.status(404).json({ message: "Not found" });
+
+    if (
+      !isAdmin(req.user) &&
+      String(cur.rows[0].created_by) !== String(req.user?.id)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await db.query("DELETE FROM playlist_videos WHERE playlist_id = $1", [id]);
+    await db.query("DELETE FROM playlists WHERE id = $1", [id]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /playlists/:id] error:", e);
+    res.status(500).json({ message: "Failed to delete playlist" });
+  }
+});
+
+// MEMBERSHIP
+router.post("/:id/videos", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { video_id } = req.body;
+    if (!video_id)
+      return res.status(400).json({ message: "video_id required" });
+
+    const cur = await db.query(
+      "SELECT created_by FROM playlists WHERE id = $1",
+      [id]
+    );
+    if (cur.rowCount === 0)
+      return res.status(404).json({ message: "Not found" });
+
+    if (
+      !isAdmin(req.user) &&
+      String(cur.rows[0].created_by) !== String(req.user?.id)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const max = await db.query(
+      "SELECT COALESCE(MAX(sort_index), -1) AS m FROM playlist_videos WHERE playlist_id = $1",
+      [id]
+    );
+    const next = (max.rows[0]?.m ?? -1) + 1;
+
+    await db.query(
+      `INSERT INTO playlist_videos (playlist_id, video_id, sort_index, added_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (playlist_id, video_id) DO NOTHING`,
+      [id, video_id, next]
+    );
+
+    res.json({ ok: true, sort_index: next });
+  } catch (e) {
+    console.error("[POST /playlists/:id/videos] error:", e);
+    res.status(500).json({ message: "Failed to add video" });
+  }
+});
+
+router.delete("/:id/videos/:videoId", authenticate, async (req, res) => {
+  try {
+    const { id, videoId } = req.params;
+
+    const cur = await db.query(
+      "SELECT created_by FROM playlists WHERE id = $1",
+      [id]
+    );
+    if (cur.rowCount === 0)
+      return res.status(404).json({ message: "Not found" });
+
+    if (
+      !isAdmin(req.user) &&
+      String(cur.rows[0].created_by) !== String(req.user?.id)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await db.query(
+      "DELETE FROM playlist_videos WHERE playlist_id = $1 AND video_id = $2",
+      [id, videoId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /playlists/:id/videos/:videoId] error:", e);
+    res.status(500).json({ message: "Failed to remove video" });
+  }
+});
+
+router.put("/:id/reorder", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { order = [] } = req.body;
+
+    const cur = await db.query(
+      "SELECT created_by FROM playlists WHERE id = $1",
+      [id]
+    );
+    if (cur.rowCount === 0)
+      return res.status(404).json({ message: "Not found" });
+
+    if (
+      !isAdmin(req.user) &&
+      String(cur.rows[0].created_by) !== String(req.user?.id)
+    ) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      for (let i = 0; i < order.length; i++) {
+        await client.query(
+          "UPDATE playlist_videos SET sort_index = $3 WHERE playlist_id = $1 AND video_id = $2",
+          [id, order[i], i]
+        );
+      }
+      await client.query("COMMIT");
+      res.json({ ok: true });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error("[PUT /playlists/:id/reorder] error:", e);
+    res.status(500).json({ message: "Failed to reorder" });
+  }
+});
+
+/* =========================================================
+   HELPERS
+========================================================= */
+router.get("/for-video/:videoId", authenticate, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const r = await db.query(
+      `SELECT pv.playlist_id AS id
+       FROM playlist_videos pv
+       JOIN playlists p ON p.id = pv.playlist_id
+       WHERE pv.video_id = $1`,
+      [videoId]
+    );
+    res.json({ items: r.rows.map((x) => x.id) });
+  } catch (e) {
+    console.error("[GET /playlists/for-video/:videoId]", e);
+    res.status(500).json({ message: "Failed to load video membership" });
+  }
+});
+
+router.get("/videos/:videoId", authenticate, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const r = await db.query(
+      `SELECT pv.playlist_id AS id
+         FROM playlist_videos pv
+         JOIN playlists p ON p.id = pv.playlist_id
+        WHERE pv.video_id = $1`,
+      [videoId]
+    );
+    res.json({ playlist_ids: r.rows.map((x) => String(x.id)) });
+  } catch (e) {
+    console.error("[GET /playlists/videos/:videoId]", e);
+    res.status(500).json({ message: "Failed to fetch video playlists" });
+  }
+});
+
+router.post("/:id/share", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const cur = await db.query(
+      "SELECT * FROM playlists WHERE id = $1 LIMIT 1",
+      [id]
+    );
+    if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
+
+    const row = cur.rows[0];
+    if (!isAdmin(req.user) && String(row.created_by) !== String(req.user.id)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const base = slugify(row.title || "playlist") || "playlist";
+    const minted = `${base}-${shortRand()}`;
+
+    const { rows } = await db.query(
+      `UPDATE playlists
+         SET slug=$1, visibility='public', updated_at=NOW()
+       WHERE id=$2
+       RETURNING *`,
+      [minted, id]
+    );
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[POST /playlists/:id/share] error:", e);
+    res.status(500).json({ message: "Failed to share playlist" });
+  }
+});
+
+router.post("/:id/unshare", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const cur = await db.query(
+      "SELECT * FROM playlists WHERE id = $1 LIMIT 1",
+      [id]
+    );
+    if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
+
+    const row = cur.rows[0];
+    if (!isAdmin(req.user) && String(row.created_by) !== String(req.user.id)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { rows } = await db.query(
+      `UPDATE playlists
+         SET slug=NULL, visibility='private', updated_at=NOW()
+       WHERE id=$1
+       RETURNING *`,
+      [id]
+    );
+
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("[POST /playlists/:id/unshare] error:", e);
+    res.status(500).json({ message: "Failed to unshare playlist" });
+  }
+});
+
+// Optional cascade
+router.post("/:id/share-cascade", authenticate, async (req, res) => {
+  const VIDEO_VISIBILITY = "public";
+  const client = await db.connect();
+  try {
+    const { id } = req.params;
+
+    const cur = await client.query(
+      "SELECT * FROM playlists WHERE id = $1 LIMIT 1",
+      [id]
+    );
+    if (!cur.rowCount) {
+      client.release();
+      return res.status(404).json({ message: "Not found" });
+    }
+    const row = cur.rows[0];
+
+    if (!isAdmin(req.user) && String(row.created_by) !== String(req.user.id)) {
+      client.release();
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await client.query("BEGIN");
+
+    const slugBase = slugify(row.title || "playlist") || "playlist";
+    const minted =
+      row.slug && row.slug.trim() ? row.slug : `${slugBase}-${shortRand()}`;
+
+    const pRes = await client.query(
+      `UPDATE playlists
+         SET slug=$1, visibility='public', updated_at=NOW()
+       WHERE id=$2
+       RETURNING *`,
+      [minted, id]
+    );
+    const updatedPlaylist = pRes.rows[0];
+
+    const vids = await client.query(
+      `SELECT pv.video_id FROM playlist_videos pv WHERE pv.playlist_id = $1`,
+      [id]
+    );
+    const videoIds = vids.rows.map((r) => r.video_id);
+
+    if (videoIds.length > 0) {
+      await client.query(
+        `UPDATE videos
+            SET is_published = TRUE,
+                published_at = COALESCE(published_at, NOW()),
+                visibility = $1
+          WHERE id = ANY($2::int[])`,
+        [VIDEO_VISIBILITY, videoIds]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json(updatedPlaylist);
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("[POST /playlists/:id/share-cascade] error:", e);
+    res
+      .status(500)
+      .json({ message: "Failed to share playlist and publish videos" });
+  } finally {
+    try {
+      client.release();
+    } catch {}
+  }
+});
+
+module.exports = router;

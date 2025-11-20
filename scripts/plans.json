@@ -1,0 +1,34 @@
+{
+  "currency": "USD",
+  "trial_days": 14,
+  "product": {
+    "name": "BishopTV Platform",
+    "description": "Subscriptions for BishopTV creators"
+  },
+  "plans": [
+    {
+      "id": "growth",
+      "name": "Growth plan",
+      "monthly": 199,
+      "yearly_monthly_equivalent": 149,
+      "description": "Start earning recurring revenue with seamless video streaming."
+    },
+    {
+      "id": "essentials",
+      "name": "App Essentials plan",
+      "monthly": 599,
+      "yearly_monthly_equivalent": 449,
+      "description": "Build your brand & boost retention with mobile apps."
+    }
+  ],
+  "addons": [
+    {
+      "id": "per_subscriber_fee",
+      "name": "Per-subscriber fee",
+      "amount": 0.99,
+      "interval": "month",
+      "metered": true,
+      "description": "Billed per active paying subscriber (metered)."
+    }
+  ]
+}
