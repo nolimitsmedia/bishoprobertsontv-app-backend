@@ -19,3 +19,6 @@ ffprobe
 ffprobe-static/
 *.exe
 .DS_Store
+
+notifications/*.json
+uploads/
