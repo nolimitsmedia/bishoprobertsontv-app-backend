@@ -1,19 +1,18 @@
 // server-api/db.js
 const { Pool } = require("pg");
 
-// Determine SSL usage:
-// - Production (Render) → Railway requires SSL
-// - Local development → No SSL
-const isProduction = process.env.NODE_ENV === "production";
+const isRender = !!process.env.RENDER;
+const isRailway = process.env.DATABASE_URL?.includes("railway");
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: isProduction
-    ? { rejectUnauthorized: false } // Required for Railway public connections
+  ssl: isRailway
+    ? {
+        rejectUnauthorized: false, // required for Railway SSL
+      }
     : false,
 });
 
-// Test connection on startup
 pool
   .connect()
   .then((client) => {
