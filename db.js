@@ -1,12 +1,19 @@
+// server-api/db.js
 const { Pool } = require("pg");
 
-// Railway uses internal Postgres without SSL.
-// Local development also works without SSL.
+// Determine SSL usage:
+// - Production (Render) → Railway requires SSL
+// - Local development → No SSL
+const isProduction = process.env.NODE_ENV === "production";
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: false,
+  ssl: isProduction
+    ? { rejectUnauthorized: false } // Required for Railway public connections
+    : false,
 });
 
+// Test connection on startup
 pool
   .connect()
   .then((client) => {
