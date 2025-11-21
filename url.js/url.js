@@ -1,13 +1,22 @@
 // server-api/utils/url.js
-function absUrl(req, url) {
-  if (!url) return "";
-  if (/^https?:\/\//i.test(url)) return url; // already absolute
+function absMediaUrl(relativePath) {
+  if (!relativePath) return null;
 
-  const base = `${req.protocol}://${req.get("host")}`;
+  const base = process.env.PUBLIC_BASE_URL || process.env.PUBLIC_URL;
 
-  if (url.startsWith("/")) return base + url;
+  if (!base) return relativePath;
 
-  return `${base}/${url}`;
+  if (
+    relativePath.startsWith("http://") ||
+    relativePath.startsWith("https://")
+  ) {
+    return relativePath;
+  }
+
+  const cleanBase = base.replace(/\/+$/, "");
+  const cleanPath = relativePath.replace(/^\/+/, "");
+
+  return `${cleanBase}/${cleanPath}`;
 }
 
-module.exports = { absUrl };
+module.exports = { absMediaUrl };
