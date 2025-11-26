@@ -238,6 +238,42 @@ router.get("/", authenticate, async (req, res) => {
   }
 });
 
+// =========================================================
+// GET /api/playlists/me
+// =========================================================
+router.get("/me", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const sql = `
+      SELECT
+        p.id,
+        p.title,
+        COALESCE(p.slug, LOWER(REPLACE(p.title, ' ', '-'))) AS slug,
+        p.description,
+        p.thumbnail_url,
+        p.visibility,
+        p.featured_category_id,
+        p.created_at,
+        COUNT(pv.video_id)::int AS item_count,
+        COUNT(pv.video_id)::int AS video_count
+      FROM playlists p
+      LEFT JOIN playlist_videos pv ON pv.playlist_id = p.id
+      WHERE p.created_by = $1
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+      LIMIT 200
+    `;
+
+    const { rows } = await db.query(sql, [userId]);
+
+    res.json({ items: rows });
+  } catch (e) {
+    console.error("[GET /playlists/me] error:", e);
+    res.status(500).json({ message: "Failed to fetch playlists" });
+  }
+});
+
 // DETAIL (owner/admin)
 router.get("/:idOrSlug", authenticate, async (req, res) => {
   try {
