@@ -1,16 +1,30 @@
 // server-api/db.js
 const { Pool } = require("pg");
 
-const isRender = !!process.env.RENDER;
-const isRailway = process.env.DATABASE_URL?.includes("railway");
+// Detect local development properly
+const isLocal =
+  process.env.LOCAL_DEV === "true" ||
+  process.env.NODE_ENV === "development" ||
+  process.env.DATABASE_URL?.includes("localhost") ||
+  process.env.DATABASE_URL?.includes("127.0.0.1");
+
+// For local dev, disable SSL entirely
+// For Railway/Render/Neon/etc, allow self-signed certs
+const sslConfig = isLocal
+  ? false
+  : {
+      rejectUnauthorized: false,
+    };
+
+// Hard override for local to prevent SSL errors
+if (isLocal) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  console.log("[db] TLS override enabled for LOCAL DEV");
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: isRailway
-    ? {
-        rejectUnauthorized: false, // required for Railway SSL
-      }
-    : false,
+  ssl: sslConfig,
 });
 
 pool

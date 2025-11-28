@@ -3,8 +3,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 
-// const { fixVideoUrls, fixPlaylistUrls } = require("../utils/transform");
-const { fixVideoUrls, fixPlaylistUrls } = require("../services/fixUrls");
+const { fixVideoUrls, fixPlaylistUrls } = require("../utils/transform");
 
 /* =======================================================
    PUBLIC CATEGORIES

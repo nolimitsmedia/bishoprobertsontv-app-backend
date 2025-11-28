@@ -565,29 +565,26 @@ router.post("/", authenticate, async (req, res) => {
  * PUT /api/videos/:id
  */
 router.put("/:id", authenticate, async (req, res) => {
-  const client = await db.connect();
   try {
     const { id } = req.params;
     if (!isDigits(id)) {
-      client.release();
       return res.status(400).json({ message: "Invalid id" });
     }
 
     const perm = await assertOwnerOrAdmin(id, req.user);
     if (!perm.ok) {
-      client.release();
       return res.status(perm.status).json({ message: "Forbidden" });
     }
 
-    await client.query("BEGIN");
+    // Start transaction
+    await db.query("BEGIN");
 
-    const cur = await client.query(
+    const cur = await db.query(
       "SELECT metadata, video_url FROM videos WHERE id=$1 FOR UPDATE",
       [id]
     );
     if (cur.rowCount === 0) {
-      await client.query("ROLLBACK");
-      client.release();
+      await db.query("ROLLBACK");
       return res.status(404).json({ message: "Not found" });
     }
     const currentMd = cur.rows[0].metadata || {};
@@ -636,7 +633,7 @@ router.put("/:id", authenticate, async (req, res) => {
       }
     }
 
-    // duration_seconds — explicit value wins; otherwise auto-detect if URL changed
+    // duration_seconds: explicit OR auto-detect
     let maybeDur = resolveDurationSeconds(req.body);
     if (maybeDur == null) {
       const newUrl = base.video_url !== undefined ? base.video_url : currentUrl;
@@ -647,27 +644,27 @@ router.put("/:id", authenticate, async (req, res) => {
       vals.push(maybeDur);
     }
 
+    // Metadata JSON
     sets.push(`metadata = $${i++}`);
     vals.push(JSON.stringify(mergedMd));
+
+    // WHERE id=$i
     vals.push(id);
 
     const sql = `UPDATE videos SET ${sets.join(
       ", "
     )} WHERE id = $${i} RETURNING *`;
-    const r = await client.query(sql, vals);
 
-    await client.query("COMMIT");
-    res.json(r.rows[0]);
+    const r = await db.query(sql, vals);
+
+    await db.query("COMMIT");
+    return res.json(r.rows[0]);
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
     console.error("[PUT /videos/:id] error:", e);
-    res.status(500).json({ message: "Failed to update video" });
-  } finally {
     try {
-      client.release();
+      await db.query("ROLLBACK");
     } catch {}
+    return res.status(500).json({ message: "Failed to update video" });
   }
 });
 

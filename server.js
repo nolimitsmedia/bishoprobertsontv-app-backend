@@ -7,8 +7,25 @@ const path = require("path");
 const http = require("http");
 const { Server } = require("socket.io");
 
+// Detect Local Mode
+const IS_LOCAL = process.env.LOCAL_DEV === "true";
+
+console.log(`[server] Local dev mode: ${IS_LOCAL}`);
+
+// DB - always load (safe)
 const db = require("./db");
-const { sendPushNotification } = require("./notifications/firebase");
+
+// Firebase (conditionally loaded)
+let sendPushNotification = () => {};
+if (!IS_LOCAL) {
+  try {
+    ({ sendPushNotification } = require("./notifications/firebase"));
+  } catch (e) {
+    console.error("[firebase] Failed to load:", e.message);
+  }
+} else {
+  console.log("[local-dev] Firebase disabled");
+}
 
 // Routers
 const authRoutes = require("./routes/auth");
@@ -22,11 +39,22 @@ const siteRoutes = require("./routes/site");
 const pricingRoutes = require("./routes/pricing");
 const checkoutRoutes = require("./routes/checkout");
 const demoRoutes = require("./routes/demo");
-const usageRoutes = require("./routes/usage");
+
 const uploadsRouter = require("./routes/upload");
 const accountRoutes = require("./routes/account");
 const resourcesRoutes = require("./routes/resources");
-const analyticsRoutes = require("./routes/analytics");
+
+// Conditional routes (disabled in local mode)
+let usageRoutes = null;
+let analyticsRoutes = null;
+
+if (!IS_LOCAL) {
+  usageRoutes = require("./routes/usage");
+  analyticsRoutes = require("./routes/analytics");
+} else {
+  console.log("[local-dev] usage & analytics disabled");
+}
+
 const publicRoutes = require("./routes/public");
 const devicesRoutes = require("./routes/devices");
 const devEmailRoutes = require("./routes/dev-email");
@@ -158,11 +186,13 @@ app.use("/api", pricingRoutes);
 app.use("/api", checkoutRoutes);
 app.use("/api/demo", demoRoutes);
 
-app.use("/api/usage", usageRoutes);
-app.use("/api", accountRoutes);
+if (!IS_LOCAL) {
+  app.use("/api/usage", usageRoutes);
+  app.use("/api/analytics", analyticsRoutes);
+}
 
+app.use("/api", accountRoutes);
 app.use("/api/resources", resourcesRoutes);
-app.use("/api/analytics", analyticsRoutes);
 app.use("/api/public", publicRoutes);
 
 app.use("/api/devices", devicesRoutes);
