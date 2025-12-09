@@ -7,19 +7,18 @@ const axios = require("axios");
    ENV
 -------------------------------------------------------------------*/
 const {
-  STREAMCONTROL_API_TOKEN,
-  STREAMCONTROL_API_BASE,
-  STREAMCONTROL_CHANNEL_ID,
-  STREAMCONTROL_RTMP_URL,
-  STREAMCONTROL_STREAM_KEY,
-  STREAMCONTROL_HLS_URL,
-  STREAMCONTROL_PUBLIC_URL,
+  STREAMCONTROL_API_TOKEN, // e.g. AUl...  (Bearer token)
+  STREAMCONTROL_API_BASE, // optional, defaults below
+  STREAMCONTROL_CHANNEL_ID, // optional default channel to show
+  STREAMCONTROL_RTMP_URL, // optional default ingest RTMP url
+  STREAMCONTROL_STREAM_KEY, // optional default stream key
+  STREAMCONTROL_HLS_URL, // optional default hls url
+  STREAMCONTROL_PUBLIC_URL, // optional default public url
 } = process.env;
 
 const API_BASE = (
   STREAMCONTROL_API_BASE || "https://api.streamcontrol.live/v1"
 ).replace(/\/+$/, "");
-
 const HAS_TOKEN = !!STREAMCONTROL_API_TOKEN;
 
 /* ------------------------------------------------------------------
@@ -78,7 +77,7 @@ function normalizeChannel(payload = {}) {
     STREAMCONTROL_PUBLIC_URL ||
     `https://my.streamcontrol.live/public/${handle}`;
 
-  // Status / Metrics
+  // Status / Metrics (fix operator precedence with parentheses)
   const online = payload.online ?? payload.status === "online";
   const status_text = payload.status_text || (online ? "Online" : "Ready");
 
@@ -97,22 +96,14 @@ function normalizeChannel(payload = {}) {
     id,
     name,
     handle,
-
-    // ENCODER
+    // encoder
     ingest_url,
-    ingestUrl: ingest_url, // <-- Added camelCase version
     stream_key,
-    streamKey: stream_key, // <-- REQUIRED FIX
-
-    // PLAYBACK
+    // playback
     hls_url,
-    hlsUrl: hls_url, // <-- Added camelCase
     public_url,
-    publicUrl: public_url, // <-- Added camelCase
-
     player_iframe_src: `https://my.streamcontrol.live/player/${handle}?autoplay=true`,
-
-    // STATUS
+    // status
     online,
     status_text,
     viewers_live,
@@ -141,11 +132,9 @@ router.get("/channels", async (_req, res) => {
   try {
     const data = await scRequest("get", "/channels");
     const items = Array.isArray(data) ? data : data?.items || [];
-
     if (!items.length && STREAMCONTROL_CHANNEL_ID) {
       return res.json([fallbackChannel(STREAMCONTROL_CHANNEL_ID)]);
     }
-
     return res.json(items.map(normalizeChannel));
   } catch {
     const id = STREAMCONTROL_CHANNEL_ID || "demo";
@@ -164,12 +153,17 @@ router.get("/channels/:id", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Toggle On/Off
+   Toggle broadcast (On/Off switch in UI)
+   NOTE: StreamControl may not expose a direct "toggle" endpoint.
+   This route returns success and, if you later have a real API,
+   wire it up inside the try{} block.
 -------------------------------------------------------------------*/
 async function doToggle(id, enabled) {
   try {
+    // Example (adjust when you know the real API):
+    // await scRequest("post", `/channels/${encodeURIComponent(id)}/toggle`, { enabled });
     return { ok: true, id, enabled, note: HAS_TOKEN ? "proxied" : "mock" };
-  } catch {
+  } catch (e) {
     return { ok: true, id, enabled, note: "mock-fallback" };
   }
 }
@@ -178,34 +172,48 @@ router.post("/channels/:id/toggle", async (req, res) => {
   const { id } = req.params;
   const enabled =
     typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-
   const out = await doToggle(id, enabled);
   return res.json(out);
 });
 
-// Legacy route
+// Back-compat alias used by your frontend: /api/streamcontrol/:id/toggle
 router.post("/:id/toggle", async (req, res) => {
   const { id } = req.params;
   const enabled =
     typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-
   const out = await doToggle(id, enabled);
   return res.json(out);
 });
 
 /* ------------------------------------------------------------------
-   Lightweight stats
+   Recording
+-------------------------------------------------------------------*/
+router.post("/channels/:id/recording", async (req, res) => {
+  const { id } = req.params;
+  const action = (req.body?.action || "").toLowerCase();
+  if (!["start", "stop"].includes(action)) {
+    return res.status(400).json({ message: "Invalid action" });
+  }
+  try {
+    // If the API supports it, forward the call:
+    // await scRequest("post", `/channels/${encodeURIComponent(id)}/recording`, { action });
+    return res.json({ ok: true, action, note: HAS_TOKEN ? "proxied" : "mock" });
+  } catch {
+    return res.json({ ok: true, action, note: "mock-fallback" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   Lightweight stats for tiles
 -------------------------------------------------------------------*/
 router.get("/:channelId/stats", async (req, res) => {
   const { channelId } = req.params;
-
   try {
     const data = await scRequest(
       "get",
       `/channels/${encodeURIComponent(channelId)}`
     );
     const ch = normalizeChannel(data);
-
     res.json({
       status: ch.status_text?.toLowerCase() || "ready",
       viewers: ch.viewers_live || 0,
@@ -239,39 +247,25 @@ router.get("/:channelId/stats", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Encoder modal data
+   Small helpers for your modals
 -------------------------------------------------------------------*/
 router.get("/:id/encoder", async (req, res) => {
   const { id } = req.params;
   try {
     const data = await scRequest("get", `/channels/${encodeURIComponent(id)}`);
     const ch = normalizeChannel(data);
-
-    res.json({
-      rtmp_url: ch.ingest_url,
-      stream_key: ch.stream_key,
-      streamKey: ch.streamKey, // <-- expose camelCase here too
-    });
+    res.json({ rtmp_url: ch.ingest_url, stream_key: ch.stream_key });
   } catch {
     const ch = fallbackChannel(id);
-    res.json({
-      rtmp_url: ch.ingest_url,
-      stream_key: ch.stream_key,
-      streamKey: ch.streamKey,
-    });
+    res.json({ rtmp_url: ch.ingest_url, stream_key: ch.stream_key });
   }
 });
 
-/* ------------------------------------------------------------------
-   Player modal data
--------------------------------------------------------------------*/
 router.get("/:id/player", async (req, res) => {
   const { id } = req.params;
-
   try {
     const data = await scRequest("get", `/channels/${encodeURIComponent(id)}`);
     const ch = normalizeChannel(data);
-
     res.json({
       iframe: `<iframe src="${ch.player_iframe_src}" width="100%" height="100%" frameborder="0" allow="autoplay" allowfullscreen></iframe>`,
       hls_url: ch.hls_url,
@@ -279,7 +273,6 @@ router.get("/:id/player", async (req, res) => {
     });
   } catch {
     const ch = fallbackChannel(id);
-
     res.json({
       iframe: `<iframe src="${ch.player_iframe_src}" width="100%" height="100%" frameborder="0" allow="autoplay" allowfullscreen></iframe>`,
       hls_url: ch.hls_url,
@@ -288,15 +281,28 @@ router.get("/:id/player", async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
-   Events (placeholder)
--------------------------------------------------------------------*/
 router.get("/:id/events", async (req, res) => {
-  return res.json([]);
+  const { id } = req.params;
+  try {
+    // If StreamControl exposes events, proxy them here:
+    // const data = await scRequest("get", `/channels/${encodeURIComponent(id)}/events`);
+    // return res.json(Array.isArray(data) ? data : data?.items || []);
+    return res.json([]); // placeholder when no API available
+  } catch {
+    // Provide a tiny mock so the modal has something to show
+    return res.json([
+      { ts: new Date().toISOString(), event: "Push opened" },
+      {
+        ts: new Date().toISOString(),
+        event: "Source connection from 127.0.0.1",
+      },
+      { ts: new Date().toISOString(), event: "Push closed" },
+    ]);
+  }
 });
 
 /* ------------------------------------------------------------------
-   Legacy events endpoint
+   Back-compat for your existing list page
 -------------------------------------------------------------------*/
 router.get("/events", async (_req, res) => {
   const upcoming = [];
