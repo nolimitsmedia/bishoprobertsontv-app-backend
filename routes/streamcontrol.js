@@ -23,7 +23,7 @@ const API_BASE = (
 const HAS_TOKEN = !!STREAMCONTROL_API_TOKEN;
 
 /* ------------------------------------------------------------------
-   Axios client
+   Axios Client
 -------------------------------------------------------------------*/
 const sc = axios.create({
   baseURL: API_BASE,
@@ -44,7 +44,7 @@ async function scRequest(method, path, data) {
 }
 
 /* ------------------------------------------------------------------
-   Normalization helpers
+   Channel Normalization
 -------------------------------------------------------------------*/
 function normalizeChannel(payload = {}) {
   const id =
@@ -57,7 +57,6 @@ function normalizeChannel(payload = {}) {
   const name = payload.name || payload.title || "NLM TEST";
   const handle = payload.handle || id;
 
-  // Ingest + Key
   const ingest_url =
     payload.ingest_url ||
     payload.rtmpUrl ||
@@ -67,7 +66,6 @@ function normalizeChannel(payload = {}) {
   const stream_key =
     payload.stream_key || payload.streamKey || STREAMCONTROL_STREAM_KEY || "";
 
-  // Playback
   const hls_url =
     payload.hls_url ||
     STREAMCONTROL_HLS_URL ||
@@ -78,45 +76,73 @@ function normalizeChannel(payload = {}) {
     STREAMCONTROL_PUBLIC_URL ||
     `https://my.streamcontrol.live/public/${handle}`;
 
-  // Status / Metrics
-  const online = payload.online ?? payload.status === "online";
+  // metrics object from StreamControl (shape can evolve)
+  const metrics = payload.metrics || {};
+
+  // online state
+  const online =
+    payload.online ?? payload.is_online ?? payload.status === "online" ?? false;
+
   const status_text = payload.status_text || (online ? "Online" : "Ready");
 
+  // live metrics
   const viewers_live =
-    payload.viewers_live ||
-    payload.viewers ||
-    payload.metrics?.current_viewers ||
-    0;
+    metrics.current_viewers ?? metrics.viewers_live ?? metrics.viewers ?? 0;
 
-  const bitrate_mbps =
-    payload.bitrate_mbps || payload.metrics?.bitrate_mbps || 0;
+  // bitrate: support mbps or kbps
+  let bitrate_mbps = 0;
+  if (typeof metrics.bitrate_mbps === "number") {
+    bitrate_mbps = metrics.bitrate_mbps;
+  } else if (typeof metrics.bitrate_kbps === "number") {
+    bitrate_mbps = metrics.bitrate_kbps / 1000;
+  }
 
-  const recording = !!payload.recording;
+  // how long stream has been running (seconds)
+  const starting_for_sec = Number(
+    metrics.uptime_sec ||
+      metrics.broadcast_time_sec ||
+      metrics.live_seconds ||
+      0
+  );
+
+  // quality / profile label if StreamControl exposes one
+  const quality =
+    payload.profile ||
+    payload.live_profile ||
+    payload.output_profile ||
+    metrics.profile ||
+    "";
+
+  const recording = !!(
+    payload.recording ||
+    payload.is_recording ||
+    metrics.recording_active
+  );
 
   return {
     id,
     name,
     handle,
 
-    // ENCODER
     ingest_url,
-    ingestUrl: ingest_url, // <-- Added camelCase version
+    ingestUrl: ingest_url,
     stream_key,
-    streamKey: stream_key, // <-- REQUIRED FIX
+    streamKey: stream_key,
 
-    // PLAYBACK
     hls_url,
-    hlsUrl: hls_url, // <-- Added camelCase
+    hlsUrl: hls_url,
     public_url,
-    publicUrl: public_url, // <-- Added camelCase
+    publicUrl: public_url,
 
     player_iframe_src: `https://my.streamcontrol.live/player/${handle}?autoplay=true`,
 
-    // STATUS
     online,
     status_text,
+
     viewers_live,
     bitrate_mbps,
+    starting_for_sec,
+    quality,
     recording,
   };
 }
@@ -135,122 +161,144 @@ function fallbackChannel(id = STREAMCONTROL_CHANNEL_ID || "demo") {
 }
 
 /* ------------------------------------------------------------------
-   Channels list & details
+   CHANNEL LIST + DETAILS
 -------------------------------------------------------------------*/
 router.get("/channels", async (_req, res) => {
   try {
     const data = await scRequest("get", "/channels");
     const items = Array.isArray(data) ? data : data?.items || [];
-
-    if (!items.length && STREAMCONTROL_CHANNEL_ID) {
-      return res.json([fallbackChannel(STREAMCONTROL_CHANNEL_ID)]);
-    }
-
+    if (!items.length) return res.json([fallbackChannel()]);
     return res.json(items.map(normalizeChannel));
   } catch {
-    const id = STREAMCONTROL_CHANNEL_ID || "demo";
-    return res.json([fallbackChannel(id)]);
+    return res.json([fallbackChannel()]);
   }
 });
 
 router.get("/channels/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const data = await scRequest("get", `/channels/${encodeURIComponent(id)}`);
+    const data = await scRequest("get", `/channels/${id}`);
     return res.json(normalizeChannel(data));
   } catch {
     return res.json(fallbackChannel(id));
   }
 });
 
-/* ------------------------------------------------------------------
-   Toggle On/Off
--------------------------------------------------------------------*/
-async function doToggle(id, enabled) {
+/* ==================================================================
+   IMPORTANT: NEXT-LIVE ROUTES MUST BE ABOVE ALL "/:id/..." ROUTES
+===================================================================*/
+
+// GET next live datetime
+router.get("/:channel_id/next-live", async (req, res) => {
   try {
-    return { ok: true, id, enabled, note: HAS_TOKEN ? "proxied" : "mock" };
-  } catch {
-    return { ok: true, id, enabled, note: "mock-fallback" };
+    const { channel_id } = req.params;
+
+    const row = await req.db.query(
+      "SELECT next_live_datetime FROM live_schedules WHERE channel_id = $1 LIMIT 1",
+      [channel_id]
+    );
+
+    return res.json({
+      ok: true,
+      next_live_datetime:
+        row.rows[0]?.next_live_datetime?.toISOString() || null,
+    });
+  } catch (_err) {
+    return res.status(500).json({ ok: false });
   }
-}
-
-router.post("/channels/:id/toggle", async (req, res) => {
-  const { id } = req.params;
-  const enabled =
-    typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
-
-  const out = await doToggle(id, enabled);
-  return res.json(out);
 });
 
-// Legacy route
-router.post("/:id/toggle", async (req, res) => {
-  const { id } = req.params;
-  const enabled =
-    typeof req.body?.enabled === "boolean" ? req.body.enabled : true;
+// SAVE next live datetime
+router.post("/:channel_id/next-live", async (req, res) => {
+  try {
+    const { channel_id } = req.params;
+    const { next_live_datetime } = req.body;
 
-  const out = await doToggle(id, enabled);
-  return res.json(out);
+    await req.db.query(
+      `INSERT INTO live_schedules (channel_id, next_live_datetime)
+       VALUES ($1, $2)
+       ON CONFLICT (channel_id)
+       DO UPDATE SET next_live_datetime = EXCLUDED.next_live_datetime`,
+      [channel_id, next_live_datetime]
+    );
+
+    return res.json({ ok: true });
+  } catch (_err) {
+    return res.status(500).json({ ok: false });
+  }
 });
 
 /* ------------------------------------------------------------------
-   Lightweight stats
+   STATS
 -------------------------------------------------------------------*/
 router.get("/:channelId/stats", async (req, res) => {
   const { channelId } = req.params;
 
   try {
-    const data = await scRequest(
-      "get",
-      `/channels/${encodeURIComponent(channelId)}`
-    );
+    const data = await scRequest("get", `/channels/${channelId}`);
     const ch = normalizeChannel(data);
 
-    res.json({
-      status: ch.status_text?.toLowerCase() || "ready",
+    return res.json({
+      status: ch.online ? "online" : "ready",
+      online: ch.online,
+      starting_for_sec: ch.starting_for_sec || 0,
       viewers: ch.viewers_live || 0,
       bitrate_mbps: ch.bitrate_mbps || 0,
-      recording: !!ch.recording,
-      destinations: [
-        {
-          id: "fb",
-          name: "My Timeline",
-          platform: "facebook",
-          status: "ready",
-        },
-      ],
+      recording: ch.recording || false,
+      quality: ch.quality || "",
     });
   } catch {
-    res.json({
+    return res.json({
       status: "ready",
+      online: false,
+      starting_for_sec: 0,
       viewers: 0,
       bitrate_mbps: 0,
       recording: false,
-      destinations: [
-        {
-          id: "fb",
-          name: "My Timeline",
-          platform: "facebook",
-          status: "ready",
-        },
-      ],
+      quality: "",
     });
   }
 });
 
 /* ------------------------------------------------------------------
-   Encoder modal data
+   RECORDING TOGGLE
+-------------------------------------------------------------------*/
+// NOTE: adjust the internal StreamControl path according to their API docs.
+router.post("/:channelId/recording-toggle", async (req, res) => {
+  const { channelId } = req.params;
+
+  try {
+    // Example: POST /channels/:id/recording-toggle on StreamControl
+    const data = await scRequest(
+      "post",
+      `/channels/${channelId}/recording-toggle`
+    );
+
+    // Some APIs return { channel: {...} }, others just the channel
+    const channelPayload = data.channel || data;
+    const ch = normalizeChannel(channelPayload);
+
+    return res.json({ ok: true, recording: ch.recording });
+  } catch (err) {
+    console.error("recording-toggle error", err?.response?.data || err.message);
+    return res
+      .status(500)
+      .json({ ok: false, error: "RECORDING_TOGGLE_FAILED" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   ENCODER INFO
 -------------------------------------------------------------------*/
 router.get("/:id/encoder", async (req, res) => {
   const { id } = req.params;
   try {
-    const data = await scRequest("get", `/channels/${encodeURIComponent(id)}`);
+    const data = await scRequest("get", `/channels/${id}`);
     const ch = normalizeChannel(data);
-
     res.json({
       rtmp_url: ch.ingest_url,
       stream_key: ch.stream_key,
-      streamKey: ch.streamKey, // <-- expose camelCase here too
+      streamKey: ch.streamKey,
     });
   } catch {
     const ch = fallbackChannel(id);
@@ -263,15 +311,13 @@ router.get("/:id/encoder", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Player modal data
+   PLAYER
 -------------------------------------------------------------------*/
 router.get("/:id/player", async (req, res) => {
   const { id } = req.params;
-
   try {
-    const data = await scRequest("get", `/channels/${encodeURIComponent(id)}`);
+    const data = await scRequest("get", `/channels/${id}`);
     const ch = normalizeChannel(data);
-
     res.json({
       iframe: `<iframe src="${ch.player_iframe_src}" width="100%" height="100%" frameborder="0" allow="autoplay" allowfullscreen></iframe>`,
       hls_url: ch.hls_url,
@@ -279,7 +325,6 @@ router.get("/:id/player", async (req, res) => {
     });
   } catch {
     const ch = fallbackChannel(id);
-
     res.json({
       iframe: `<iframe src="${ch.player_iframe_src}" width="100%" height="100%" frameborder="0" allow="autoplay" allowfullscreen></iframe>`,
       hls_url: ch.hls_url,
@@ -289,27 +334,17 @@ router.get("/:id/player", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   Events (placeholder)
+   EVENTS
 -------------------------------------------------------------------*/
-router.get("/:id/events", async (req, res) => {
+router.get("/:id/events", async (_req, res) => {
   return res.json([]);
 });
 
 /* ------------------------------------------------------------------
-   Legacy events endpoint
+   LEGACY EVENTS ROUTE
 -------------------------------------------------------------------*/
 router.get("/events", async (_req, res) => {
-  const upcoming = [];
-  if (STREAMCONTROL_CHANNEL_ID) {
-    upcoming.push(
-      normalizeChannel({
-        id: STREAMCONTROL_CHANNEL_ID,
-        name: "NLM TEST",
-      })
-    );
-  }
-  const past = [];
-  res.json({ upcoming, past });
+  res.json({ upcoming: [], past: [] });
 });
 
 module.exports = router;
