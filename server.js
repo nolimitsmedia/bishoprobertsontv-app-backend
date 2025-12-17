@@ -44,6 +44,10 @@ const uploadsRouter = require("./routes/upload");
 const accountRoutes = require("./routes/account");
 const resourcesRoutes = require("./routes/resources");
 
+const adminDashboardRoutes = require("./routes/adminDashboard");
+const adminCalendarRoutes = require("./routes/adminCalendar");
+const adminResourcesRoutes = require("./routes/adminResources");
+
 // Conditional routes (disabled in local mode)
 let usageRoutes = null;
 let analyticsRoutes = null;
@@ -209,6 +213,10 @@ app.use("/api", bunnyStreamRouter);
 app.use("/api/channels", channelsRouter);
 app.use("/api/playlists", playlistsRoutes);
 app.use("/api/community", communityRoutes);
+
+app.use("/api/admin/dashboard", adminDashboardRoutes);
+app.use("/api/admin/calendar", adminCalendarRoutes);
+app.use("/api/admin/resources", adminResourcesRoutes);
 
 /* --------------------------------------------------------
    HEALTH
