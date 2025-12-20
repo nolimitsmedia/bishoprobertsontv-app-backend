@@ -47,6 +47,7 @@ const resourcesRoutes = require("./routes/resources");
 const adminDashboardRoutes = require("./routes/adminDashboard");
 const adminCalendarRoutes = require("./routes/adminCalendar");
 const adminResourcesRoutes = require("./routes/adminResources");
+const adminOrganizeRoutes = require("./routes/adminOrganize");
 
 // Conditional routes (disabled in local mode)
 let usageRoutes = null;
@@ -217,7 +218,7 @@ app.use("/api/community", communityRoutes);
 app.use("/api/admin/dashboard", adminDashboardRoutes);
 app.use("/api/admin/calendar", adminCalendarRoutes);
 app.use("/api/admin/resources", adminResourcesRoutes);
-
+app.use("/api/admin/organize", adminOrganizeRoutes);
 /* --------------------------------------------------------
    HEALTH
 --------------------------------------------------------- */

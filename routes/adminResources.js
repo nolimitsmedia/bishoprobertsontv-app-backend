@@ -1,34 +1,11 @@
 // server-api/routes/adminResources.js
 const express = require("express");
 const router = express.Router();
-const pool = require("../db"); // adjust if your db export differs
+const pool = require("../db");
 
 const multer = require("multer");
 const path = require("path");
 
-/**
- * Bunny Storage ENV (set in .env)
- * ----------------------------------------------------
- * USE_BUNNY_STORAGE=true
- * BUNNY_STORAGE_ZONE=yourzone
- * BUNNY_STORAGE_KEY=your_password_or_api_key
- *   OR (legacy/your current env name)
- * BUNNY_STORAGE_API_KEY=your_password_or_api_key
- *
- * Optional:
- * BUNNY_STORAGE_REGION= e.g. "ny" | "la" | "sg" ... depends on your zone region
- * BUNNY_STORAGE_HOST=storage.bunnycdn.com  (optional)
- * BUNNY_CDN_BASE_URL=https://yourpullzone.b-cdn.net/  (recommended for public URLs)
- */
-
-/* If you already have admin auth middleware, plug it in here:
-   const { requireAdmin } = require("../middleware/auth");
-   router.use(requireAdmin);
-*/
-
-/* -------------------------------------------------------
-   Helpers
-------------------------------------------------------- */
 function cleanStr(v) {
   return String(v ?? "").trim();
 }
