@@ -44,6 +44,31 @@ async function scRequest(method, path, data) {
 }
 
 /* ------------------------------------------------------------------
+   DB Helper
+-------------------------------------------------------------------*/
+function getDb(req) {
+  if (req?.db && typeof req.db.query === "function") return req.db;
+
+  try {
+    // eslint-disable-next-line global-require
+    const mod = require("../db");
+
+    if (mod && typeof mod.query === "function") return mod;
+    if (mod && mod.pool && typeof mod.pool.query === "function")
+      return mod.pool;
+
+    if (
+      mod &&
+      typeof mod.connect === "function" &&
+      typeof mod.query === "function"
+    )
+      return mod;
+  } catch (_e) {}
+
+  return null;
+}
+
+/* ------------------------------------------------------------------
    Channel Normalization
 -------------------------------------------------------------------*/
 function normalizeChannel(payload = {}) {
@@ -76,20 +101,16 @@ function normalizeChannel(payload = {}) {
     STREAMCONTROL_PUBLIC_URL ||
     `https://my.streamcontrol.live/public/${handle}`;
 
-  // metrics object from StreamControl (shape can evolve)
   const metrics = payload.metrics || {};
 
-  // online state
   const online =
     payload.online ?? payload.is_online ?? payload.status === "online" ?? false;
 
   const status_text = payload.status_text || (online ? "Online" : "Ready");
 
-  // live metrics
   const viewers_live =
     metrics.current_viewers ?? metrics.viewers_live ?? metrics.viewers ?? 0;
 
-  // bitrate: support mbps or kbps
   let bitrate_mbps = 0;
   if (typeof metrics.bitrate_mbps === "number") {
     bitrate_mbps = metrics.bitrate_mbps;
@@ -97,7 +118,6 @@ function normalizeChannel(payload = {}) {
     bitrate_mbps = metrics.bitrate_kbps / 1000;
   }
 
-  // how long stream has been running (seconds)
   const starting_for_sec = Number(
     metrics.uptime_sec ||
       metrics.broadcast_time_sec ||
@@ -105,7 +125,6 @@ function normalizeChannel(payload = {}) {
       0
   );
 
-  // quality / profile label if StreamControl exposes one
   const quality =
     payload.profile ||
     payload.live_profile ||
@@ -188,33 +207,146 @@ router.get("/channels/:id", async (req, res) => {
    IMPORTANT: NEXT-LIVE ROUTES MUST BE ABOVE ALL "/:id/..." ROUTES
 ===================================================================*/
 
-// GET next live datetime
+/**
+ * GET /streamcontrol/:channel_id/next-live
+ * - If we're currently within a calendar LIVE window (start <= now <= end),
+ *   return state=live_window with current_event, and next_event after it ends.
+ * - Otherwise return state=countdown with next upcoming LIVE event.
+ * - Fallback to live_schedules (legacy) if calendar has no entries.
+ */
 router.get("/:channel_id/next-live", async (req, res) => {
-  try {
-    const { channel_id } = req.params;
+  const { channel_id } = req.params;
+  const db = getDb(req);
 
-    const row = await req.db.query(
+  if (!db)
+    return res.status(500).json({ ok: false, error: "DB_NOT_AVAILABLE" });
+
+  try {
+    const nowIso = new Date().toISOString();
+
+    // --- 1) Calendar-backed schedule (preferred) ---
+    // CURRENT live window: start_at <= now <= end_at (or end_at defaulted)
+    try {
+      const current = await db.query(
+        `
+        SELECT id, title, type, start_at, end_at, notes, video_id, category_id
+        FROM calendar_events
+        WHERE type = 'live'
+          AND start_at <= $1
+          AND COALESCE(end_at, start_at + interval '2 hours') >= $1
+        ORDER BY start_at DESC
+        LIMIT 1
+        `,
+        [nowIso]
+      );
+
+      if (current.rows?.length) {
+        const ev = current.rows[0];
+
+        // Find next live AFTER current ends (or after start if end is null)
+        const boundary = ev.end_at || ev.start_at;
+
+        const nextAfter = await db.query(
+          `
+          SELECT id, title, type, start_at, end_at, notes, video_id, category_id
+          FROM calendar_events
+          WHERE type = 'live'
+            AND start_at > $1
+          ORDER BY start_at ASC
+          LIMIT 1
+          `,
+          [boundary]
+        );
+
+        const nextEv = nextAfter.rows?.[0] || null;
+
+        return res.json({
+          ok: true,
+          state: "live_window",
+          current_event: ev,
+          next_event: nextEv,
+          // Keep these for compatibility with old frontend
+          next_live_at: ev.start_at
+            ? new Date(ev.start_at).toISOString()
+            : null,
+          next_live_datetime: ev.start_at
+            ? new Date(ev.start_at).toISOString()
+            : null,
+          source: "calendar",
+        });
+      }
+
+      // NEXT upcoming event
+      const upcoming = await db.query(
+        `
+        SELECT id, title, type, start_at, end_at, notes, video_id, category_id
+        FROM calendar_events
+        WHERE type = 'live'
+          AND start_at >= $1
+        ORDER BY start_at ASC
+        LIMIT 1
+        `,
+        [nowIso]
+      );
+
+      if (upcoming.rows?.length) {
+        const ev = upcoming.rows[0];
+        return res.json({
+          ok: true,
+          state: "countdown",
+          next_event: ev,
+          next_live_at: ev.start_at
+            ? new Date(ev.start_at).toISOString()
+            : null,
+          next_live_datetime: ev.start_at
+            ? new Date(ev.start_at).toISOString()
+            : null,
+          source: "calendar",
+        });
+      }
+    } catch (_e) {
+      // If calendar table doesn't exist or fails, continue to legacy fallback
+    }
+
+    // --- 2) Legacy fallback ---
+    const legacy = await db.query(
       "SELECT next_live_datetime FROM live_schedules WHERE channel_id = $1 LIMIT 1",
       [channel_id]
     );
 
+    const dt = legacy.rows?.[0]?.next_live_datetime
+      ? new Date(legacy.rows[0].next_live_datetime).toISOString()
+      : null;
+
     return res.json({
       ok: true,
-      next_live_datetime:
-        row.rows[0]?.next_live_datetime?.toISOString() || null,
+      state: dt ? "countdown" : "none",
+      next_live_datetime: dt,
+      next_live_at: dt,
+      next_event: dt
+        ? { type: "live", start_at: dt, title: "Live Stream (Legacy)" }
+        : null,
+      source: "legacy",
     });
-  } catch (_err) {
+  } catch (err) {
+    console.error("[GET /:channel_id/next-live] error:", err);
     return res.status(500).json({ ok: false });
   }
 });
 
-// SAVE next live datetime
+/**
+ * POST /streamcontrol/:channel_id/next-live (legacy writer)
+ */
 router.post("/:channel_id/next-live", async (req, res) => {
-  try {
-    const { channel_id } = req.params;
-    const { next_live_datetime } = req.body;
+  const { channel_id } = req.params;
+  const { next_live_datetime } = req.body;
 
-    await req.db.query(
+  const db = getDb(req);
+  if (!db)
+    return res.status(500).json({ ok: false, error: "DB_NOT_AVAILABLE" });
+
+  try {
+    await db.query(
       `INSERT INTO live_schedules (channel_id, next_live_datetime)
        VALUES ($1, $2)
        ON CONFLICT (channel_id)
@@ -223,7 +355,8 @@ router.post("/:channel_id/next-live", async (req, res) => {
     );
 
     return res.json({ ok: true });
-  } catch (_err) {
+  } catch (err) {
+    console.error("[POST /:channel_id/next-live] error:", err);
     return res.status(500).json({ ok: false });
   }
 });
@@ -263,18 +396,15 @@ router.get("/:channelId/stats", async (req, res) => {
 /* ------------------------------------------------------------------
    RECORDING TOGGLE
 -------------------------------------------------------------------*/
-// NOTE: adjust the internal StreamControl path according to their API docs.
 router.post("/:channelId/recording-toggle", async (req, res) => {
   const { channelId } = req.params;
 
   try {
-    // Example: POST /channels/:id/recording-toggle on StreamControl
     const data = await scRequest(
       "post",
       `/channels/${channelId}/recording-toggle`
     );
 
-    // Some APIs return { channel: {...} }, others just the channel
     const channelPayload = data.channel || data;
     const ch = normalizeChannel(channelPayload);
 

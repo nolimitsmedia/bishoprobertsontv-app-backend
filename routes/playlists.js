@@ -186,9 +186,7 @@ router.post("/", authenticate, createPlaylist);
    ✔ FIXED ORDER — /me MUST COME BEFORE /:idOrSlug
 ========================================================= */
 
-// =========================================================
 // GET /api/playlists/me
-// =========================================================
 router.get("/me", authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -276,7 +274,7 @@ router.get("/", authenticate, async (req, res) => {
 });
 
 /* =========================================================
-   DETAIL — MUST ALWAYS BE LAST
+   DETAIL — MUST ALWAYS BE LAST (for GET routes)
 ========================================================= */
 router.get("/:idOrSlug", authenticate, async (req, res) => {
   try {
@@ -663,6 +661,70 @@ router.post("/:id/share-cascade", authenticate, async (req, res) => {
     try {
       client.release();
     } catch {}
+  }
+});
+
+/* =========================================================
+   REORDER VIDEOS IN A PLAYLIST
+   PUT /api/playlists/:id/reorder
+========================================================= */
+router.put("/:id/reorder", authenticate, async (req, res) => {
+  const playlistId = req.params.id;
+  const videoIds = req.body.video_ids;
+
+  if (!Array.isArray(videoIds) || videoIds.length === 0) {
+    return res
+      .status(400)
+      .json({ message: "video_ids array is required for reorder" });
+  }
+
+  try {
+    // confirm playlist exists and user can edit it
+    const cur = await db.query(
+      "SELECT created_by FROM playlists WHERE id = $1",
+      [playlistId]
+    );
+
+    if (!cur.rowCount) {
+      return res.status(404).json({ message: "Playlist not found" });
+    }
+
+    const createdBy = cur.rows[0].created_by;
+    if (!isAdmin(req.user) && String(createdBy) !== String(req.user?.id)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    await db.query("BEGIN");
+
+    // update sort_index in playlist_videos
+    for (let index = 0; index < videoIds.length; index++) {
+      const videoId = videoIds[index];
+
+      await db.query(
+        `
+        UPDATE playlist_videos
+           SET sort_index = $1
+         WHERE playlist_id = $2
+           AND video_id = $3
+      `,
+        [index, playlistId, videoId]
+      );
+    }
+
+    await db.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      playlist_id: Number(playlistId),
+      video_ids: videoIds,
+    });
+  } catch (e) {
+    try {
+      await db.query("ROLLBACK");
+    } catch (ignore) {}
+
+    console.error("[PUT /playlists/:id/reorder] error:", e);
+    return res.status(500).json({ message: "Failed to reorder playlist" });
   }
 });
 
