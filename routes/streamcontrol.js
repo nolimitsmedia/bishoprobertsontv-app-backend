@@ -8,7 +8,7 @@ const axios = require("axios");
 -------------------------------------------------------------------*/
 const {
   STREAMCONTROL_API_TOKEN,
-  STREAMCONTROL_API_BASE,
+  STREAMCONTROL_API_BASE, // e.g. https://my.streamcontrol.live (NO /v1)
   STREAMCONTROL_CHANNEL_ID,
   STREAMCONTROL_RTMP_URL,
   STREAMCONTROL_STREAM_KEY,
@@ -16,9 +16,19 @@ const {
   STREAMCONTROL_PUBLIC_URL,
 } = process.env;
 
-const API_BASE = (
-  STREAMCONTROL_API_BASE || "https://api.streamcontrol.live/v1"
+/**
+ * IMPORTANT:
+ * StreamControl deployments differ. Some use /v1, some do not.
+ * We'll support both by:
+ *  - Keeping base WITHOUT trailing /v1 by default
+ *  - Trying both prefix "" and "/v1" when calling endpoints
+ */
+const RAW_BASE = (
+  STREAMCONTROL_API_BASE || "https://my.streamcontrol.live"
 ).replace(/\/+$/, "");
+
+// If user accidentally set base ending in /v1, strip it (we'll try it dynamically)
+const API_BASE = RAW_BASE.replace(/\/v1$/i, "");
 
 const HAS_TOKEN = !!STREAMCONTROL_API_TOKEN;
 
@@ -33,38 +43,67 @@ const sc = axios.create({
     : undefined,
 });
 
-async function scRequest(method, path, data) {
+async function scRequest(method, url, data) {
   if (!HAS_TOKEN) {
     const err = new Error("NO_TOKEN");
     err.code = "NO_TOKEN";
     throw err;
   }
-  const res = await sc.request({ method, url: path, data });
+  const res = await sc.request({ method, url, data });
   return res.data;
 }
 
 /* ------------------------------------------------------------------
-   DB Helper
+   Error Helpers
+-------------------------------------------------------------------*/
+function isNoToken(err) {
+  return err?.code === "NO_TOKEN" || err?.message === "NO_TOKEN";
+}
+
+function isNetworkUnreachable(err) {
+  const code = err?.code || err?.cause?.code;
+  return (
+    code === "ENOTFOUND" || code === "ECONNREFUSED" || code === "ETIMEDOUT"
+  );
+}
+
+function isRouteNotFound(err) {
+  // StreamControl often returns JSON: { message: 'The route ... could not be found.' }
+  const msg = err?.response?.data?.message || err?.message || "";
+  return (
+    err?.response?.status === 404 ||
+    /could not be found/i.test(msg) ||
+    /route .* could not be found/i.test(msg)
+  );
+}
+
+/**
+ * Try both with and without /v1. This prevents the "v1/..." route-not-found error.
+ */
+async function scRequestAnyVersion(method, path, data) {
+  // try without /v1 first
+  try {
+    return await scRequest(method, path, data);
+  } catch (e1) {
+    if (!isRouteNotFound(e1)) throw e1;
+  }
+
+  // then try with /v1
+  return await scRequest(method, `/v1${path}`, data);
+}
+
+/* ------------------------------------------------------------------
+   DB Helper (kept)
 -------------------------------------------------------------------*/
 function getDb(req) {
   if (req?.db && typeof req.db.query === "function") return req.db;
 
   try {
-    // eslint-disable-next-line global-require
     const mod = require("../db");
-
     if (mod && typeof mod.query === "function") return mod;
     if (mod && mod.pool && typeof mod.pool.query === "function")
       return mod.pool;
-
-    if (
-      mod &&
-      typeof mod.connect === "function" &&
-      typeof mod.query === "function"
-    )
-      return mod;
   } catch (_e) {}
-
   return null;
 }
 
@@ -102,21 +141,17 @@ function normalizeChannel(payload = {}) {
     `https://my.streamcontrol.live/public/${handle}`;
 
   const metrics = payload.metrics || {};
-
   const online =
     payload.online ?? payload.is_online ?? payload.status === "online" ?? false;
-
-  const status_text = payload.status_text || (online ? "Online" : "Ready");
 
   const viewers_live =
     metrics.current_viewers ?? metrics.viewers_live ?? metrics.viewers ?? 0;
 
   let bitrate_mbps = 0;
-  if (typeof metrics.bitrate_mbps === "number") {
+  if (typeof metrics.bitrate_mbps === "number")
     bitrate_mbps = metrics.bitrate_mbps;
-  } else if (typeof metrics.bitrate_kbps === "number") {
+  else if (typeof metrics.bitrate_kbps === "number")
     bitrate_mbps = metrics.bitrate_kbps / 1000;
-  }
 
   const starting_for_sec = Number(
     metrics.uptime_sec ||
@@ -124,13 +159,6 @@ function normalizeChannel(payload = {}) {
       metrics.live_seconds ||
       0
   );
-
-  const quality =
-    payload.profile ||
-    payload.live_profile ||
-    payload.output_profile ||
-    metrics.profile ||
-    "";
 
   const recording = !!(
     payload.recording ||
@@ -142,27 +170,27 @@ function normalizeChannel(payload = {}) {
     id,
     name,
     handle,
-
     ingest_url,
     ingestUrl: ingest_url,
     stream_key,
     streamKey: stream_key,
-
     hls_url,
     hlsUrl: hls_url,
     public_url,
     publicUrl: public_url,
-
     player_iframe_src: `https://my.streamcontrol.live/player/${handle}?autoplay=true`,
-
     online,
-    status_text,
-
+    status_text: payload.status_text || (online ? "Online" : "Ready"),
     viewers_live,
     bitrate_mbps,
     starting_for_sec,
-    quality,
     recording,
+    quality:
+      payload.profile ||
+      payload.live_profile ||
+      payload.output_profile ||
+      metrics.profile ||
+      "",
   };
 }
 
@@ -180,11 +208,191 @@ function fallbackChannel(id = STREAMCONTROL_CHANNEL_ID || "demo") {
 }
 
 /* ------------------------------------------------------------------
-   CHANNEL LIST + DETAILS
+   NEXT LIVE (from Admin Calendar)
+   - Robust DB fallbacks because table/columns differ between builds
+-------------------------------------------------------------------*/
+
+async function tryQuery(db, text, params) {
+  const r = await db.query(text, params);
+  return r?.rows || [];
+}
+
+function toIsoSafe(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+/**
+ * Attempts to find the next LIVE schedule item.
+ * Returns: { id, title, start_at, end_at, type } OR null
+ */
+async function getNextLiveFromDb(db) {
+  const now = new Date();
+
+  // Candidate tables + column layouts we try in order.
+  // The goal: find next upcoming item where type/category indicates LIVE.
+  const candidates = [
+    // Common pattern A
+    {
+      name: "admin_calendar_items",
+      sql: `
+        SELECT
+          id,
+          COALESCE(title, name) AS title,
+          start_time AS start_at,
+          end_time   AS end_at,
+          COALESCE(type, category) AS type
+        FROM admin_calendar_items
+        WHERE start_time IS NOT NULL
+          AND start_time > $1
+          AND (COALESCE(type, category, '') ILIKE 'live%' OR COALESCE(type, category, '') ILIKE '%live%')
+        ORDER BY start_time ASC
+        LIMIT 1
+      `,
+    },
+    // Pattern B
+    {
+      name: "calendar_items",
+      sql: `
+        SELECT
+          id,
+          COALESCE(title, name) AS title,
+          start_time AS start_at,
+          end_time   AS end_at,
+          COALESCE(type, category) AS type
+        FROM calendar_items
+        WHERE start_time IS NOT NULL
+          AND start_time > $1
+          AND (COALESCE(type, category, '') ILIKE 'live%' OR COALESCE(type, category, '') ILIKE '%live%')
+        ORDER BY start_time ASC
+        LIMIT 1
+      `,
+    },
+    // Pattern C
+    {
+      name: "calendar_events",
+      sql: `
+        SELECT
+          id,
+          COALESCE(title, name) AS title,
+          start_at AS start_at,
+          end_at   AS end_at,
+          COALESCE(type, category) AS type
+        FROM calendar_events
+        WHERE start_at IS NOT NULL
+          AND start_at > $1
+          AND (COALESCE(type, category, '') ILIKE 'live%' OR COALESCE(type, category, '') ILIKE '%live%')
+        ORDER BY start_at ASC
+        LIMIT 1
+      `,
+    },
+    // Pattern D (some apps name it live_events)
+    {
+      name: "live_events",
+      sql: `
+        SELECT
+          id,
+          COALESCE(title, name) AS title,
+          start_time AS start_at,
+          end_time   AS end_at,
+          COALESCE(type, category, 'LIVE') AS type
+        FROM live_events
+        WHERE start_time IS NOT NULL
+          AND start_time > $1
+        ORDER BY start_time ASC
+        LIMIT 1
+      `,
+    },
+    // Pattern E (very generic: "events")
+    {
+      name: "events",
+      sql: `
+        SELECT
+          id,
+          COALESCE(title, name) AS title,
+          start_time AS start_at,
+          end_time   AS end_at,
+          COALESCE(type, category, '') AS type
+        FROM events
+        WHERE start_time IS NOT NULL
+          AND start_time > $1
+          AND (COALESCE(type, category, '') ILIKE 'live%' OR COALESCE(type, category, '') ILIKE '%live%')
+        ORDER BY start_time ASC
+        LIMIT 1
+      `,
+    },
+  ];
+
+  for (const c of candidates) {
+    try {
+      const rows = await tryQuery(db, c.sql, [now]);
+      if (rows && rows.length) {
+        const r = rows[0];
+        return {
+          id: r.id,
+          title: r.title || "Live Stream",
+          type: r.type || "LIVE",
+          start_at: toIsoSafe(r.start_at),
+          end_at: toIsoSafe(r.end_at),
+          _source_table: c.name,
+        };
+      }
+    } catch (_e) {
+      // table/column doesn't exist -> try next
+    }
+  }
+
+  // Nothing found
+  return null;
+}
+
+/**
+ * GET /api/streamcontrol/:channelId/next-live
+ * Used by LivePage countdown.
+ */
+router.get("/:channelId/next-live", async (req, res) => {
+  const db = getDb(req);
+  if (!db) {
+    return res.json({ ok: true, nextLive: null, warning: "DB_NOT_AVAILABLE" });
+  }
+
+  try {
+    const nextLive = await getNextLiveFromDb(db);
+
+    if (!nextLive?.start_at) {
+      return res.json({ ok: true, nextLive: null });
+    }
+
+    const startMs = new Date(nextLive.start_at).getTime();
+    const nowMs = Date.now();
+
+    return res.json({
+      ok: true,
+      nextLive: {
+        id: nextLive.id,
+        title: nextLive.title,
+        type: nextLive.type,
+        start_at: nextLive.start_at,
+        end_at: nextLive.end_at,
+        starts_in_ms: Math.max(0, startMs - nowMs),
+      },
+      // helpful for debugging (safe)
+      source: nextLive._source_table,
+    });
+  } catch (e) {
+    console.error("next-live error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "NEXT_LIVE_FAILED" });
+  }
+});
+
+/* ------------------------------------------------------------------
+   CHANNELS
 -------------------------------------------------------------------*/
 router.get("/channels", async (_req, res) => {
   try {
-    const data = await scRequest("get", "/channels");
+    const data = await scRequestAnyVersion("get", "/channels");
     const items = Array.isArray(data) ? data : data?.items || [];
     if (!items.length) return res.json([fallbackChannel()]);
     return res.json(items.map(normalizeChannel));
@@ -196,181 +404,21 @@ router.get("/channels", async (_req, res) => {
 router.get("/channels/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const data = await scRequest("get", `/channels/${id}`);
+    const data = await scRequestAnyVersion("get", `/channels/${id}`);
     return res.json(normalizeChannel(data));
   } catch {
     return res.json(fallbackChannel(id));
   }
 });
 
-/* ==================================================================
-   IMPORTANT: NEXT-LIVE ROUTES MUST BE ABOVE ALL "/:id/..." ROUTES
-===================================================================*/
-
-/**
- * GET /streamcontrol/:channel_id/next-live
- * - If we're currently within a calendar LIVE window (start <= now <= end),
- *   return state=live_window with current_event, and next_event after it ends.
- * - Otherwise return state=countdown with next upcoming LIVE event.
- * - Fallback to live_schedules (legacy) if calendar has no entries.
- */
-router.get("/:channel_id/next-live", async (req, res) => {
-  const { channel_id } = req.params;
-  const db = getDb(req);
-
-  if (!db)
-    return res.status(500).json({ ok: false, error: "DB_NOT_AVAILABLE" });
-
-  try {
-    const nowIso = new Date().toISOString();
-
-    // --- 1) Calendar-backed schedule (preferred) ---
-    // CURRENT live window: start_at <= now <= end_at (or end_at defaulted)
-    try {
-      const current = await db.query(
-        `
-        SELECT id, title, type, start_at, end_at, notes, video_id, category_id
-        FROM calendar_events
-        WHERE type = 'live'
-          AND start_at <= $1
-          AND COALESCE(end_at, start_at + interval '2 hours') >= $1
-        ORDER BY start_at DESC
-        LIMIT 1
-        `,
-        [nowIso]
-      );
-
-      if (current.rows?.length) {
-        const ev = current.rows[0];
-
-        // Find next live AFTER current ends (or after start if end is null)
-        const boundary = ev.end_at || ev.start_at;
-
-        const nextAfter = await db.query(
-          `
-          SELECT id, title, type, start_at, end_at, notes, video_id, category_id
-          FROM calendar_events
-          WHERE type = 'live'
-            AND start_at > $1
-          ORDER BY start_at ASC
-          LIMIT 1
-          `,
-          [boundary]
-        );
-
-        const nextEv = nextAfter.rows?.[0] || null;
-
-        return res.json({
-          ok: true,
-          state: "live_window",
-          current_event: ev,
-          next_event: nextEv,
-          // Keep these for compatibility with old frontend
-          next_live_at: ev.start_at
-            ? new Date(ev.start_at).toISOString()
-            : null,
-          next_live_datetime: ev.start_at
-            ? new Date(ev.start_at).toISOString()
-            : null,
-          source: "calendar",
-        });
-      }
-
-      // NEXT upcoming event
-      const upcoming = await db.query(
-        `
-        SELECT id, title, type, start_at, end_at, notes, video_id, category_id
-        FROM calendar_events
-        WHERE type = 'live'
-          AND start_at >= $1
-        ORDER BY start_at ASC
-        LIMIT 1
-        `,
-        [nowIso]
-      );
-
-      if (upcoming.rows?.length) {
-        const ev = upcoming.rows[0];
-        return res.json({
-          ok: true,
-          state: "countdown",
-          next_event: ev,
-          next_live_at: ev.start_at
-            ? new Date(ev.start_at).toISOString()
-            : null,
-          next_live_datetime: ev.start_at
-            ? new Date(ev.start_at).toISOString()
-            : null,
-          source: "calendar",
-        });
-      }
-    } catch (_e) {
-      // If calendar table doesn't exist or fails, continue to legacy fallback
-    }
-
-    // --- 2) Legacy fallback ---
-    const legacy = await db.query(
-      "SELECT next_live_datetime FROM live_schedules WHERE channel_id = $1 LIMIT 1",
-      [channel_id]
-    );
-
-    const dt = legacy.rows?.[0]?.next_live_datetime
-      ? new Date(legacy.rows[0].next_live_datetime).toISOString()
-      : null;
-
-    return res.json({
-      ok: true,
-      state: dt ? "countdown" : "none",
-      next_live_datetime: dt,
-      next_live_at: dt,
-      next_event: dt
-        ? { type: "live", start_at: dt, title: "Live Stream (Legacy)" }
-        : null,
-      source: "legacy",
-    });
-  } catch (err) {
-    console.error("[GET /:channel_id/next-live] error:", err);
-    return res.status(500).json({ ok: false });
-  }
-});
-
-/**
- * POST /streamcontrol/:channel_id/next-live (legacy writer)
- */
-router.post("/:channel_id/next-live", async (req, res) => {
-  const { channel_id } = req.params;
-  const { next_live_datetime } = req.body;
-
-  const db = getDb(req);
-  if (!db)
-    return res.status(500).json({ ok: false, error: "DB_NOT_AVAILABLE" });
-
-  try {
-    await db.query(
-      `INSERT INTO live_schedules (channel_id, next_live_datetime)
-       VALUES ($1, $2)
-       ON CONFLICT (channel_id)
-       DO UPDATE SET next_live_datetime = EXCLUDED.next_live_datetime`,
-      [channel_id, next_live_datetime]
-    );
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("[POST /:channel_id/next-live] error:", err);
-    return res.status(500).json({ ok: false });
-  }
-});
-
 /* ------------------------------------------------------------------
-   STATS
+   STATS (kept)
 -------------------------------------------------------------------*/
 router.get("/:channelId/stats", async (req, res) => {
   const { channelId } = req.params;
-
   try {
-    const data = await scRequest("get", `/channels/${channelId}`);
+    const data = await scRequestAnyVersion("get", `/channels/${channelId}`);
     const ch = normalizeChannel(data);
-
     return res.json({
       status: ch.online ? "online" : "ready",
       online: ch.online,
@@ -394,36 +442,139 @@ router.get("/:channelId/stats", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   RECORDING TOGGLE
+   PUBLISHERS (robust multi-endpoint)
 -------------------------------------------------------------------*/
-router.post("/:channelId/recording-toggle", async (req, res) => {
+
+/**
+ * StreamControl varies:
+ *  - /channels/:id/publishers
+ *  - /channels/:id/destinations
+ *  - /channels/:id/restreams
+ *
+ * We'll try all three (w/ and w/out /v1) and normalize to publishers[].
+ */
+async function fetchPublishers(channelId) {
+  const candidates = [
+    `/channels/${channelId}/publishers`,
+    `/channels/${channelId}/destinations`,
+    `/channels/${channelId}/restreams`,
+  ];
+
+  let lastErr = null;
+
+  for (const path of candidates) {
+    try {
+      const data = await scRequestAnyVersion("get", path);
+
+      const items = Array.isArray(data)
+        ? data
+        : data?.items ||
+          data?.publishers ||
+          data?.destinations ||
+          data?.restreams ||
+          [];
+
+      // Normalize each item shape a bit
+      const publishers = (items || []).map((x) => ({
+        id: x.id || x.publisher_id || x.destination_id || x.restream_id,
+        name: x.name || x.title || x.platform || x.provider || "Destination",
+        enabled: x.enabled ?? x.active ?? x.is_enabled ?? true,
+        platform: x.platform || x.provider || x.type || null,
+        raw: x,
+      }));
+
+      return { publishers, sourcePath: path };
+    } catch (err) {
+      lastErr = err;
+
+      // If it is a clean 404/route-not-found, continue trying next candidate
+      if (isRouteNotFound(err)) continue;
+
+      // Anything else: throw (auth/network/etc)
+      throw err;
+    }
+  }
+
+  // none of the endpoints exist on this API
+  if (lastErr) throw lastErr;
+  return { publishers: [], sourcePath: null };
+}
+
+router.get("/:channelId/publishers", async (req, res) => {
   const { channelId } = req.params;
 
   try {
-    const data = await scRequest(
-      "post",
-      `/channels/${channelId}/recording-toggle`
-    );
-
-    const channelPayload = data.channel || data;
-    const ch = normalizeChannel(channelPayload);
-
-    return res.json({ ok: true, recording: ch.recording });
+    const { publishers, sourcePath } = await fetchPublishers(channelId);
+    return res.json({ ok: true, publishers, source: sourcePath });
   } catch (err) {
-    console.error("recording-toggle error", err?.response?.data || err.message);
-    return res
-      .status(500)
-      .json({ ok: false, error: "RECORDING_TOGGLE_FAILED" });
+    if (isNoToken(err)) {
+      return res.json({
+        ok: true,
+        publishers: [],
+        warning: "STREAMCONTROL_API_TOKEN not set; publishers disabled in dev.",
+      });
+    }
+
+    if (isNetworkUnreachable(err)) {
+      const code = err?.code || err?.cause?.code;
+      return res.json({
+        ok: true,
+        publishers: [],
+        warning: `StreamControl unreachable (${code}).`,
+      });
+    }
+
+    // If it's just route-not-found everywhere, don't crash the UI
+    if (isRouteNotFound(err)) {
+      return res.json({
+        ok: true,
+        publishers: [],
+        warning: "Publishers endpoint not available on this StreamControl API.",
+      });
+    }
+
+    console.error("publishers list error", err?.response?.data || err.message);
+    return res.status(500).json({ ok: false, error: "PUBLISHERS_LIST_FAILED" });
   }
 });
 
+/**
+ * This StreamControl deployment doesn't support publisher creation via API.
+ * Keep stable responses so UI can show a friendly message.
+ */
+router.post("/:channelId/publishers", async (_req, res) => {
+  return res.status(400).json({
+    ok: false,
+    error: "PUBLISHER_CREATE_NOT_SUPPORTED",
+    message:
+      "Publishers must be added in the StreamControl dashboard. Use the StreamControl UI to add destinations.",
+  });
+});
+
+router.post("/:channelId/publishers/:pubId/toggle", async (_req, res) => {
+  return res.status(400).json({
+    ok: false,
+    error: "PUBLISHER_TOGGLE_NOT_SUPPORTED",
+    message:
+      "Publisher enable/disable must be managed in the StreamControl dashboard.",
+  });
+});
+
+router.delete("/:channelId/publishers/:pubId", async (_req, res) => {
+  return res.status(400).json({
+    ok: false,
+    error: "PUBLISHER_DELETE_NOT_SUPPORTED",
+    message: "Publishers must be removed in the StreamControl dashboard.",
+  });
+});
+
 /* ------------------------------------------------------------------
-   ENCODER INFO
+   Optional: Encoder + Player (kept)
 -------------------------------------------------------------------*/
 router.get("/:id/encoder", async (req, res) => {
   const { id } = req.params;
   try {
-    const data = await scRequest("get", `/channels/${id}`);
+    const data = await scRequestAnyVersion("get", `/channels/${id}`);
     const ch = normalizeChannel(data);
     res.json({
       rtmp_url: ch.ingest_url,
@@ -440,13 +591,10 @@ router.get("/:id/encoder", async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
-   PLAYER
--------------------------------------------------------------------*/
 router.get("/:id/player", async (req, res) => {
   const { id } = req.params;
   try {
-    const data = await scRequest("get", `/channels/${id}`);
+    const data = await scRequestAnyVersion("get", `/channels/${id}`);
     const ch = normalizeChannel(data);
     res.json({
       iframe: `<iframe src="${ch.player_iframe_src}" width="100%" height="100%" frameborder="0" allow="autoplay" allowfullscreen></iframe>`,
@@ -464,17 +612,11 @@ router.get("/:id/player", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------
-   EVENTS
+   Legacy placeholders
 -------------------------------------------------------------------*/
-router.get("/:id/events", async (_req, res) => {
-  return res.json([]);
-});
-
-/* ------------------------------------------------------------------
-   LEGACY EVENTS ROUTE
--------------------------------------------------------------------*/
-router.get("/events", async (_req, res) => {
-  res.json({ upcoming: [], past: [] });
-});
+router.get("/:id/events", async (_req, res) => res.json([]));
+router.get("/events", async (_req, res) =>
+  res.json({ upcoming: [], past: [] })
+);
 
 module.exports = router;

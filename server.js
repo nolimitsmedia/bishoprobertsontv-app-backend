@@ -49,6 +49,8 @@ const adminCalendarRoutes = require("./routes/adminCalendar");
 const adminResourcesRoutes = require("./routes/adminResources");
 const adminOrganizeRoutes = require("./routes/adminOrganize");
 
+const facebookRoutes = require("./routes/facebook");
+
 // Conditional routes (disabled in local mode)
 let usageRoutes = null;
 let analyticsRoutes = null;
@@ -76,10 +78,14 @@ const {
 } = require("./routes/webhooks");
 
 const app = express();
+
+// ✅ Avoid favicon hitting your 404 handler (and causing swapped-arg bugs elsewhere)
+app.get("/favicon.ico", (req, res) => res.status(204).end());
+
 const server = http.createServer(app);
 
 /* --------------------------------------------------------
-   CORS — FULLY FIXED (GitHub Pages + Render + Localhost)
+   CORS — GitHub Pages + Render + Localhost
 --------------------------------------------------------- */
 
 const baseOrigins = (
@@ -103,7 +109,7 @@ const configuredOrigins = Array.from(
 );
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;
+  if (!origin) return true; // allow curl/postman/no-origin
   if (configuredOrigins.includes(origin)) return true;
   if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return true;
   return false;
@@ -153,6 +159,13 @@ app.post(
 --------------------------------------------------------- */
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
+
+/**
+ * NOTE:
+ * authBridge runs globally. If your Facebook OAuth endpoints must be fully public
+ * (popup cannot attach Authorization headers), keep them mounted BEFORE any
+ * strict auth middleware in your facebook route file.
+ */
 app.use(authBridge);
 
 app.use((req, res, next) => {
@@ -174,6 +187,19 @@ app.use(
     },
   })
 );
+
+/* --------------------------------------------------------
+   FACEBOOK AUTH (Fixes your 404 status)
+--------------------------------------------------------- */
+
+// ✅ Provide status endpoint so frontend polling won't 404
+app.get("/api/auth/facebook/status", (req, res) => {
+  // You can later wire this to DB tokens (connected true/false).
+  res.json({ ok: true, connected: false });
+});
+
+// ✅ Mount your facebook routes where the frontend expects them
+app.use("/api/auth/facebook", facebookRoutes);
 
 /* --------------------------------------------------------
    ROUTES
@@ -219,6 +245,7 @@ app.use("/api/admin/dashboard", adminDashboardRoutes);
 app.use("/api/admin/calendar", adminCalendarRoutes);
 app.use("/api/admin/resources", adminResourcesRoutes);
 app.use("/api/admin/organize", adminOrganizeRoutes);
+
 /* --------------------------------------------------------
    HEALTH
 --------------------------------------------------------- */
@@ -280,13 +307,16 @@ io.on("connection", (socket) => {
 /* --------------------------------------------------------
    ERRORS
 --------------------------------------------------------- */
-app.use("/api", (_req, res) => {
-  res.status(404).json({ message: "Not found" });
+
+// ✅ Proper 404 handler (correct arg order)
+app.use("/api", (req, res) => {
+  res.status(404).json({ ok: false, error: "Not found" });
 });
 
-app.use((err, _req, res) => {
+// ✅ Proper error handler signature (must include next)
+app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
-  res.status(500).json({ message: "Server error" });
+  res.status(500).json({ ok: false, error: "Server error" });
 });
 
 /* --------------------------------------------------------
