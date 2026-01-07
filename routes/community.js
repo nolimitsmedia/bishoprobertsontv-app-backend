@@ -1,6 +1,7 @@
 // server-api/routes/community.js
 const path = require("path");
 const fs = require("fs");
+const https = require("https");
 const express = require("express");
 const multer = require("multer");
 const db = require("../db");
@@ -44,10 +45,12 @@ function buildCommentAuthorName(profileName, userName, userEmail) {
 /* -------------------------------------------------------------------------- */
 /* Uploads                                                                    */
 /* -------------------------------------------------------------------------- */
+
+// Local disk storage (legacy)
 const uploadDir = path.join(__dirname, "..", "uploads", "community");
 fs.mkdirSync(uploadDir, { recursive: true });
 
-const storage = multer.diskStorage({
+const diskStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadDir),
   filename: (_req, file, cb) => {
     const ts = Date.now();
@@ -55,7 +58,6 @@ const storage = multer.diskStorage({
     cb(null, `${ts}-${Math.random().toString(36).slice(2)}${ext}`);
   },
 });
-const upload = multer({ storage });
 
 function toPublicUrl(relPath) {
   const base = process.env.PUBLIC_BASE_URL || "http://localhost:5000";
@@ -66,6 +68,156 @@ function normalizeVisibility(v) {
   const allowed = ["public", "members", "admins"];
   const val = (v || "").toLowerCase();
   return allowed.includes(val) ? val : "public";
+}
+
+/* Bunny config */
+const USE_BUNNY =
+  String(process.env.USE_BUNNY_STORAGE || "").toLowerCase() === "true";
+
+const BUNNY_STORAGE_ZONE = process.env.BUNNY_STORAGE_ZONE || "";
+const BUNNY_STORAGE_API_KEY = process.env.BUNNY_STORAGE_API_KEY || "";
+const BUNNY_STORAGE_HOST =
+  process.env.BUNNY_STORAGE_HOST || "storage.bunnycdn.com";
+const BUNNY_CDN_BASE_URL = process.env.BUNNY_CDN_BASE_URL || "";
+
+// Use memory storage when Bunny is enabled (we need file.buffer)
+const upload = multer({
+  storage: USE_BUNNY ? multer.memoryStorage() : diskStorage,
+});
+
+/* Bunny helpers */
+function safeFileName(originalName = "image") {
+  const ext = path.extname(originalName || "").toLowerCase() || ".jpg";
+  const base =
+    path
+      .basename(originalName || "image", ext)
+      .replace(/[^a-z0-9-_]+/gi, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 60) || "image";
+
+  return `${Date.now()}-${base}${ext}`;
+}
+
+function joinUrl(base, rel) {
+  const b = String(base || "").replace(/\/+$/, "");
+  const r = String(rel || "").replace(/^\/+/, "");
+  return `${b}/${r}`;
+}
+
+function uploadToBunny({ buffer, remotePath }) {
+  return new Promise((resolve, reject) => {
+    if (!BUNNY_STORAGE_ZONE || !BUNNY_STORAGE_API_KEY || !BUNNY_CDN_BASE_URL) {
+      return reject(
+        new Error("Bunny Storage env vars missing (ZONE/API_KEY/CDN_BASE_URL).")
+      );
+    }
+
+    const storagePath = `/${BUNNY_STORAGE_ZONE}/${remotePath}`.replace(
+      /\\/g,
+      "/"
+    );
+
+    const req = https.request(
+      {
+        method: "PUT",
+        host: BUNNY_STORAGE_HOST,
+        path: storagePath,
+        headers: {
+          AccessKey: BUNNY_STORAGE_API_KEY,
+          "Content-Type": "application/octet-stream",
+          "Content-Length": buffer.length,
+        },
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (d) => (body += d));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) return resolve();
+          return reject(
+            new Error(
+              `Bunny upload failed (${res.statusCode}): ${body || "no body"}`
+            )
+          );
+        });
+      }
+    );
+
+    req.on("error", reject);
+    req.write(buffer);
+    req.end();
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Stable media folder logic (Option B: <slug(title)>-<postId>)                */
+/* -------------------------------------------------------------------------- */
+function slugifyTitle(input) {
+  const s = String(input || "")
+    .trim()
+    .toLowerCase();
+  if (!s) return "";
+  const out = s
+    .replace(/['"]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 60);
+  return out;
+}
+
+function makeMediaFolderKey(title, postId) {
+  const slug = slugifyTitle(title);
+  if (slug) return `${slug}-${postId}`;
+  return `post-${postId}`;
+}
+
+async function ensureMediaFolder({ postId, title }) {
+  // If media_folder exists, keep it
+  const existing = await db.query(
+    `SELECT media_folder FROM public.community_posts WHERE id=$1`,
+    [postId]
+  );
+  if (existing.rowCount && existing.rows[0].media_folder) {
+    return existing.rows[0].media_folder;
+  }
+
+  const key = makeMediaFolderKey(title, postId);
+  const up = await db.query(
+    `UPDATE public.community_posts
+        SET media_folder = COALESCE(media_folder, $1)
+      WHERE id = $2
+      RETURNING media_folder`,
+    [key, postId]
+  );
+  return up.rows[0].media_folder || key;
+}
+
+async function uploadCommunityImage({ postId, mediaFolder, file }) {
+  if (!file) return null;
+
+  // Bunny path: Community/<mediaFolder>/<filename>
+  if (USE_BUNNY) {
+    const filename = safeFileName(file.originalname);
+    const remotePath = `Community/${mediaFolder}/${filename}`.replace(
+      /\\/g,
+      "/"
+    );
+
+    // multer memoryStorage => file.buffer
+    if (!file.buffer || !Buffer.isBuffer(file.buffer)) {
+      throw new Error(
+        "Upload buffer missing. Ensure multer memoryStorage is used."
+      );
+    }
+
+    await uploadToBunny({ buffer: file.buffer, remotePath });
+    return joinUrl(BUNNY_CDN_BASE_URL, remotePath);
+  }
+
+  // Local disk path (legacy)
+  const rel = path.join("community", path.basename(file.path));
+  return toPublicUrl(rel.replace(/\\/g, "/"));
 }
 
 /* A tiny helper to compute author_name for POSTS consistently */
@@ -229,7 +381,9 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
     const userId = req.user.id;
 
     const title = (req.body?.title || "").trim() || null;
-    const raw = req.body?.content ?? req.body?.text ?? req.body?.body ?? "";
+
+    // frontend uses "body"
+    const raw = req.body?.body ?? req.body?.content ?? req.body?.text ?? "";
     const body = (raw || "").trim();
 
     const channel_id = req.body?.channel_id
@@ -241,13 +395,6 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
       (req.files || []).find((f) => f.fieldname === "file") ||
       null;
 
-    let mediaUrl = null;
-    if (file) {
-      const rel = path.join("community", path.basename(file.path));
-      mediaUrl = toPublicUrl(rel.replace(/\\/g, "/"));
-    }
-
-    // ✅ anyone creating a post can request to pin it
     const rawPinned = req.body?.is_pinned;
     const is_pinned =
       rawPinned === true ||
@@ -261,19 +408,43 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
       visibility = normalizeVisibility(req.body?.visibility);
     }
 
-    if (!title && !body && !mediaUrl) {
+    if (!title && !body && !file) {
       return res.status(400).json({ message: "Nothing to post" });
     }
 
+    // 1) create post first
     const ins = await db.query(
       `INSERT INTO public.community_posts
        (user_id, title, body, media_url, is_pinned, visibility, channel_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id, user_id, title, body, media_url, created_at, is_pinned, visibility, channel_id`,
-      [userId, title, body || null, mediaUrl, is_pinned, visibility, channel_id]
+      [userId, title, body || null, null, is_pinned, visibility, channel_id]
     );
 
-    const post = ins.rows[0];
+    let post = ins.rows[0];
+
+    // 2) ensure stable media_folder (Option B)
+    await ensureMediaFolder({ postId: post.id, title: post.title });
+
+    // 3) upload image if provided
+    if (file) {
+      const mf = await ensureMediaFolder({
+        postId: post.id,
+        title: post.title,
+      });
+      const mediaUrl = await uploadCommunityImage({
+        postId: post.id,
+        mediaFolder: mf,
+        file,
+      });
+
+      const up = await db.query(
+        `UPDATE public.community_posts SET media_url = $1 WHERE id = $2
+         RETURNING id, user_id, title, body, media_url, created_at, is_pinned, visibility, channel_id`,
+        [mediaUrl, post.id]
+      );
+      post = up.rows[0];
+    }
 
     const { rows: arows } = await db.query(
       `SELECT ${AUTHOR_NAME_SQL} AS author_name
@@ -304,7 +475,9 @@ router.patch("/posts/:id", requireAuth, upload.any(), async (req, res) => {
     if (!postId) return res.status(400).json({ message: "Bad post id" });
 
     const cur = await db.query(
-      `SELECT user_id FROM public.community_posts WHERE id = $1`,
+      `SELECT id, user_id, media_url, media_folder, title
+         FROM public.community_posts
+        WHERE id = $1`,
       [postId]
     );
     if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
@@ -314,26 +487,25 @@ router.patch("/posts/:id", requireAuth, upload.any(), async (req, res) => {
     if (!admin && !owns) return res.status(403).json({ message: "Forbidden" });
 
     const titleRaw = req.body?.title;
-    const title =
+    const newTitle =
       typeof titleRaw !== "undefined" ? String(titleRaw).trim() || null : null;
 
-    const bodyRaw = req.body?.content ?? req.body?.text ?? req.body?.body;
-    const body =
+    const bodyRaw = req.body?.body ?? req.body?.content ?? req.body?.text;
+    const newBody =
       typeof bodyRaw !== "undefined" ? String(bodyRaw).trim() || null : null;
 
     let sets = [];
     let params = [];
 
-    if (title !== null) {
-      params.push(title);
+    if (newTitle !== null) {
+      params.push(newTitle);
       sets.push(`title = $${params.length}`);
     }
-    if (body !== null) {
-      params.push(body);
+    if (newBody !== null) {
+      params.push(newBody);
       sets.push(`body = $${params.length}`);
     }
 
-    // ✅ allow owner OR admin to update is_pinned
     if (typeof req.body?.is_pinned !== "undefined") {
       if (admin || owns) {
         const rawPinned = req.body.is_pinned;
@@ -347,7 +519,6 @@ router.patch("/posts/:id", requireAuth, upload.any(), async (req, res) => {
       }
     }
 
-    // admin-only updates
     if (admin) {
       if (typeof req.body?.visibility !== "undefined") {
         params.push(normalizeVisibility(req.body.visibility));
@@ -366,9 +537,18 @@ router.patch("/posts/:id", requireAuth, upload.any(), async (req, res) => {
       (req.files || []).find((f) => f.fieldname === "media") ||
       (req.files || []).find((f) => f.fieldname === "file") ||
       null;
+
+    // ✅ If uploading a file, ensure media_folder exists (stable forever)
     if (file) {
-      const rel = path.join("community", path.basename(file.path));
-      const mediaUrl = toPublicUrl(rel.replace(/\\/g, "/"));
+      const stableTitle = newTitle ?? cur.rows[0].title;
+      const mf = await ensureMediaFolder({ postId, title: stableTitle });
+
+      const mediaUrl = await uploadCommunityImage({
+        postId,
+        mediaFolder: mf,
+        file,
+      });
+
       params.push(mediaUrl);
       sets.push(`media_url = $${params.length}`);
     }
@@ -483,7 +663,7 @@ router.post("/posts/:id/like", requireAuth, async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* Comments  (same as working version)                                        */
+/* Comments                                                                   */
 /* -------------------------------------------------------------------------- */
 router.get("/posts/:id/comments", optionalAuth, async (req, res) => {
   try {
