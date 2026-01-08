@@ -6,6 +6,7 @@ const authenticate = require("../middleware/authenticate");
 
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { getDurationSeconds } = require("../services/mediaMeta");
 
 // 🔔 Centralized FCM sender (Admin SDK with legacy fallback)
@@ -246,6 +247,87 @@ const PREVIEW_SECONDS_SQL = `
   ) AS free_preview_seconds
 `;
 
+/* -------------------- BUNNY TOKEN AUTH (V2) -------------------- */
+/**
+ * Bunny Token Auth (V2): token = Base64URL( SHA256_RAW( key + path + expires + queryParamsSorted ) )
+ * queryParamsSorted must be "form-encoded style" WITHOUT leading "?" and NOT URL-encoded.
+ * We use token_path so HLS segments within folder work too.
+ * Docs: https://docs.bunny.net/docs/cdn-token-authentication :contentReference[oaicite:1]{index=1}
+ */
+
+const BUNNY_ENABLED =
+  String(process.env.BUNNY_TOKEN_AUTH_ENABLED || "").toLowerCase() === "true";
+
+const BUNNY_KEY = process.env.BUNNY_TOKEN_AUTH_KEY || "";
+const BUNNY_CDN_BASE = process.env.BUNNY_CDN_BASE_URL || "";
+
+function base64UrlNoPad(buf) {
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/\n/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function safeJoinBaseUrl(base, maybeUrl) {
+  if (!maybeUrl) return "";
+  const s = String(maybeUrl);
+  if (/^https?:\/\//i.test(s)) return s;
+  const b = String(base || "").replace(/\/+$/g, "");
+  const p = s.startsWith("/") ? s : `/${s}`;
+  return `${b}${p}`;
+}
+
+function getPathname(u) {
+  try {
+    const url = new URL(u);
+    return url.pathname || "/";
+  } catch {
+    // if it's already a path
+    const s = String(u || "");
+    if (!s) return "/";
+    return s.startsWith("/") ? s : `/${s}`;
+  }
+}
+
+function dirnamePath(p) {
+  // "/a/b/c.m3u8" -> "/a/b/"
+  const clean = String(p || "/");
+  const idx = clean.lastIndexOf("/");
+  if (idx <= 0) return "/";
+  return clean.slice(0, idx + 1);
+}
+
+function bunnySignUrl(inputUrl, { ttlSeconds = 3600, tokenPath = null } = {}) {
+  if (!BUNNY_ENABLED || !BUNNY_KEY || !inputUrl) return inputUrl;
+
+  const absolute = safeJoinBaseUrl(BUNNY_CDN_BASE, inputUrl);
+  const pathname = getPathname(absolute);
+
+  const expires = Math.floor(Date.now() / 1000) + Math.max(30, ttlSeconds);
+
+  // token_path: used so HLS .ts segments under same folder are allowed
+  const tp = tokenPath || dirnamePath(pathname);
+
+  // Parameter data must be appended to the hashable base in sorted key order,
+  // excluding token and expires. We only include token_path.
+  const paramData = `token_path=${tp}`;
+
+  const hashable = `${BUNNY_KEY}${pathname}${expires}${paramData}`;
+  const sha = crypto.createHash("sha256").update(hashable).digest();
+  const token = base64UrlNoPad(sha);
+
+  // Build signed URL
+  // token_path must be URL-encoded in the final URL query
+  const signed = new URL(absolute);
+  signed.searchParams.set("token", token);
+  signed.searchParams.set("expires", String(expires));
+  signed.searchParams.set("token_path", tp); // URLSearchParams will encode
+
+  return signed.toString();
+}
+
 /* -------------------- PUBLIC ROUTES -------------------- */
 
 /**
@@ -298,6 +380,9 @@ router.get("/public/catalog", async (req, res) => {
         (row.category_id != null ? String(row.category_id) : "Videos");
       const title = row.category_name || "Videos";
       if (!map.has(key)) map.set(key, { title, items: [] });
+
+      // IMPORTANT: do not expose a usable full signed URL in catalog list
+      // Keep video_url as-is (or null) - player will request /public/:id anyway.
       map.get(key).items.push(row);
     }
 
@@ -354,6 +439,8 @@ router.get("/public", async (req, res) => {
       LIMIT $${params.length}
     `;
     const r = await db.query(sql, params);
+
+    // Don't sign here (list view). Player page will call /public/:id.
     res.json({ items: r.rows });
   } catch (e) {
     console.error("[GET /videos/public] error:", e);
@@ -364,6 +451,10 @@ router.get("/public", async (req, res) => {
 /**
  * PUBLIC READ (no auth)
  * GET /api/videos/public/:id
+ *
+ * Option A:
+ * - If free_preview_seconds > 0, return a SHORT-LIVED signed URL (good for preview only).
+ * - If free_preview_seconds == 0, DO NOT return video_url (force login to watch).
  */
 router.get("/public/:id", async (req, res) => {
   try {
@@ -371,6 +462,7 @@ router.get("/public/:id", async (req, res) => {
     if (!isDigits(id)) {
       return res.status(400).json({ message: "Invalid id" });
     }
+
     const r = await db.query(
       `
       SELECT
@@ -385,10 +477,36 @@ router.get("/public/:id", async (req, res) => {
        LIMIT 1`,
       [id]
     );
+
     if (r.rowCount === 0) {
       return res.status(404).json({ message: "Not found" });
     }
-    return res.json(r.rows[0]);
+
+    const row = { ...r.rows[0] };
+
+    const previewSeconds = Number(row.free_preview_seconds || 0);
+
+    if (!row.video_url) {
+      row.requires_login = true;
+      return res.json(row);
+    }
+
+    // If preview seconds is 0, require login for any playback.
+    if (!(previewSeconds > 0)) {
+      row.video_url = null;
+      row.requires_login = true;
+      return res.json(row);
+    }
+
+    // Preview token TTL: just enough to cover preview playback + small buffer.
+    // This prevents a long-lived full URL from leaking publicly.
+    const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
+
+    row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: ttl });
+    row.requires_login = true; // still true: preview only
+    row.signed_ttl_seconds = ttl;
+
+    return res.json(row);
   } catch (e) {
     console.error("[GET /videos/public/:id] error:", e);
     return res.status(500).json({ message: "Failed to fetch video" });
@@ -451,6 +569,8 @@ router.get("/", authenticate, async (req, res) => {
 /**
  * AUTH’D READ (owner/admin)
  * GET /api/videos/:id
+ *
+ * Returns a LONGER-LIVED signed URL for full playback.
  */
 router.get("/:id", authenticate, async (req, res) => {
   try {
@@ -473,8 +593,19 @@ router.get("/:id", authenticate, async (req, res) => {
        LIMIT 1`,
       [id]
     );
+
     if (r.rowCount === 0) return res.status(404).json({ message: "Not found" });
-    res.json(r.rows[0]);
+
+    const row = { ...r.rows[0] };
+
+    // Full token TTL for authed playback (6 hours)
+    if (row.video_url) {
+      row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
+      row.signed_ttl_seconds = 6 * 3600;
+      row.requires_login = false;
+    }
+
+    res.json(row);
   } catch (e) {
     console.error("[GET /videos/:id] error:", e);
     res.status(500).json({ message: "Failed to fetch video" });
@@ -703,14 +834,12 @@ router.post("/:id/publish", authenticate, async (req, res) => {
     const title = "New video published";
     const body = video.title || "A new video is available";
 
-    // 👇 what both the bell + FCM will use
     const appPayload = {
       type: "video_published",
       video_id: videoId,
       route: `/watch/${videoId}`,
     };
 
-    /* 1) In-app bell notifications for all users (except uploader) */
     try {
       await db.query(
         `
@@ -738,7 +867,6 @@ router.post("/:id/publish", authenticate, async (req, res) => {
       );
     }
 
-    /* 2) Push notifications (FCM) to all registered tokens (except uploader) */
     try {
       const t = await db.query(
         `
@@ -756,7 +884,7 @@ router.post("/:id/publish", authenticate, async (req, res) => {
         await sendPush(tokens, {
           title,
           body,
-          data: appPayload, // includes video_id + route
+          data: appPayload,
         });
       }
     } catch (e) {

@@ -67,10 +67,12 @@ const devicesRoutes = require("./routes/devices");
 const devEmailRoutes = require("./routes/dev-email");
 const emailsRoutes = require("./routes/emails");
 const channelsRouter = require("./routes/channels");
-const playlistsRouter = require("./routes/playlists"); // ✅ SINGLE SOURCE OF TRUTH
+const playlistsRoutes = require("./routes/playlists");
 const communityRoutes = require("./routes/community");
 const authBridge = require("./middleware/auth-bridge");
 const bunnyStreamRouter = require("./routes/bunnyStream");
+
+const playlistsRouter = require("./routes/playlists");
 
 const {
   stripeWebhookHandler,
@@ -79,8 +81,8 @@ const {
 
 const app = express();
 
-// ✅ Avoid favicon hitting your 404 handler
-app.get("/favicon.ico", (_req, res) => res.status(204).end());
+// ✅ Avoid favicon hitting your 404 handler (and causing swapped-arg bugs elsewhere)
+app.get("/favicon.ico", (req, res) => res.status(204).end());
 
 const server = http.createServer(app);
 
@@ -161,11 +163,14 @@ app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 /**
- * authBridge runs globally (keeps legacy behavior)
+ * NOTE:
+ * authBridge runs globally. If your Facebook OAuth endpoints must be fully public
+ * (popup cannot attach Authorization headers), keep them mounted BEFORE any
+ * strict auth middleware in your facebook route file.
  */
 app.use(authBridge);
 
-app.use((req, _res, next) => {
+app.use((req, res, next) => {
   req.db = db;
   next();
 });
@@ -190,11 +195,12 @@ app.use(
 --------------------------------------------------------- */
 
 // ✅ Provide status endpoint so frontend polling won't 404
-app.get("/api/auth/facebook/status", (_req, res) => {
+app.get("/api/auth/facebook/status", (req, res) => {
+  // You can later wire this to DB tokens (connected true/false).
   res.json({ ok: true, connected: false });
 });
 
-// ✅ Mount facebook routes where frontend expects them
+// ✅ Mount your facebook routes where the frontend expects them
 app.use("/api/auth/facebook", facebookRoutes);
 
 /* --------------------------------------------------------
@@ -202,19 +208,16 @@ app.use("/api/auth/facebook", facebookRoutes);
 --------------------------------------------------------- */
 
 app.use("/api/auth", authRoutes);
-
 app.use("/api/videos", videosRoutes);
 app.use("/api/categories", categoriesRoutes);
-
 app.use("/api/uploads", uploadsRouter);
 app.use("/api/upload", uploadsRouter);
 
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/collections", collectionsRoutes);
-
 app.use("/api/live", liveRoutes);
-app.use("/api/streamcontrol", streamcontrolRoutes); // keep clean single mount
-
+app.use("/api/live", streamcontrolRoutes);
+app.use("/api/streamcontrol", streamcontrolRoutes);
 app.use("/api/site", siteRoutes);
 
 app.use("/api", pricingRoutes);
@@ -228,8 +231,6 @@ if (!IS_LOCAL) {
 
 app.use("/api", accountRoutes);
 app.use("/api/resources", resourcesRoutes);
-
-// public misc routes
 app.use("/api/public", publicRoutes);
 
 app.use("/api/devices", devicesRoutes);
@@ -239,26 +240,17 @@ app.use("/api/emails", emailsRoutes);
 
 app.use("/api", bunnyStreamRouter);
 app.use("/api/channels", channelsRouter);
-
-// ✅ playlists router (admin + public endpoints live here)
-app.use("/api/playlists", playlistsRouter);
-
-// ✅ community
+app.use("/api/playlists", playlistsRoutes);
 app.use("/api/community", communityRoutes);
 
-// ✅ admin routes
 app.use("/api/admin/dashboard", adminDashboardRoutes);
 app.use("/api/admin/calendar", adminCalendarRoutes);
 app.use("/api/admin/resources", adminResourcesRoutes);
 app.use("/api/admin/organize", adminOrganizeRoutes);
 
-/**
- * ✅ Compatibility alias for Catalog.js:
- * Frontend calls:  /api/public/collections?limit=1000
- * We forward it to: /api/playlists/public?limit=1000
- */
 app.use("/api/public/collections", (req, res, next) => {
-  // req.url here is "/?limit=1000" (or "/something?...")
+  // forward to playlists public endpoint:
+  // /api/public/collections?limit=1000  ->  /api/playlists/public?limit=1000
   req.url = "/public" + (req.url || "");
   return playlistsRouter(req, res, next);
 });
