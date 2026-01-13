@@ -104,9 +104,19 @@ const storage = multer.diskStorage({
     cb(null, `${base}-${Date.now()}${ext}`);
   },
 });
+
+/**
+ * ✅ NO LIMIT uploads (application-side)
+ * Multer has no file size limit unless `limits.fileSize` is set.
+ * We keep an OPTIONAL env override:
+ *   UPLOAD_MAX_BYTES=0  -> no limit (default)
+ *   UPLOAD_MAX_BYTES=... -> set a cap if you ever want one
+ */
+const MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 0);
+
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 * 1024 }, // 5GB
+  limits: MAX_BYTES > 0 ? { fileSize: MAX_BYTES } : undefined,
 });
 
 // ---------------------------------------------------------------------------
@@ -481,7 +491,36 @@ router.post(
   authenticate,
   allowUploadRoles,
   attachEntitlements,
-  upload.single("file"),
+
+  // ✅ Wrap multer to return clean JSON errors (and still keep all functions intact)
+  (req, res, next) => {
+    upload.single("file")(req, res, (err) => {
+      if (!err) return next();
+
+      if (err instanceof multer.MulterError) {
+        if (err.code === "LIMIT_FILE_SIZE") {
+          // This would only happen if UPLOAD_MAX_BYTES is set > 0
+          return res.status(413).json({
+            message: "File too large",
+            detail:
+              "This upload exceeds the server limit. Set UPLOAD_MAX_BYTES=0 (or remove it) for no limit.",
+            code: err.code,
+          });
+        }
+        return res.status(400).json({
+          message: "Upload error",
+          detail: err.message,
+          code: err.code,
+        });
+      }
+
+      return res.status(500).json({
+        message: "Upload error",
+        detail: err?.message || "Unknown upload error",
+      });
+    });
+  },
+
   handleUpload
 );
 
@@ -523,6 +562,8 @@ router.get("/__ping", (_req, res) =>
     FORCE_LOCAL,
     prefix: PREFIX,
     bunnyCdnBase: BUNNY_CDN_BASE_URL || null,
+    // helpful debug: shows if you accidentally set a cap
+    uploadMaxBytes: MAX_BYTES > 0 ? MAX_BYTES : null,
   })
 );
 

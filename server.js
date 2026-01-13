@@ -51,6 +51,17 @@ const adminOrganizeRoutes = require("./routes/adminOrganize");
 
 const facebookRoutes = require("./routes/facebook");
 
+const integrationsRoutes = require("./routes/integrations");
+
+// ✅ TUS (optional) – if file doesn't exist yet, don’t crash the server
+let tusRouter = null;
+try {
+  tusRouter = require("./routes/tus");
+} catch (e) {
+  tusRouter = null;
+  console.log("[tus] tus router not found (skipping):", e.message);
+}
+
 // Conditional routes (disabled in local mode)
 let usageRoutes = null;
 let analyticsRoutes = null;
@@ -67,10 +78,11 @@ const devicesRoutes = require("./routes/devices");
 const devEmailRoutes = require("./routes/dev-email");
 const emailsRoutes = require("./routes/emails");
 const channelsRouter = require("./routes/channels");
-const playlistsRouter = require("./routes/playlists"); // ✅ SINGLE SOURCE OF TRUTH
+const playlistsRouter = require("./routes/playlists");
 const communityRoutes = require("./routes/community");
 const authBridge = require("./middleware/auth-bridge");
 const bunnyStreamRouter = require("./routes/bunnyStream");
+const pagesRoutes = require("./routes/pages");
 
 const {
   stripeWebhookHandler,
@@ -157,6 +169,8 @@ app.post(
 /* --------------------------------------------------------
    BODY PARSERS
 --------------------------------------------------------- */
+// ✅ keep JSON limit small for normal API calls; uploads are multipart (multer)
+// so they are NOT affected by this JSON limit.
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -206,6 +220,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/videos", videosRoutes);
 app.use("/api/categories", categoriesRoutes);
 
+// ✅ uploads (no limit on multipart sizes; multer config controls max bytes)
 app.use("/api/uploads", uploadsRouter);
 app.use("/api/upload", uploadsRouter);
 
@@ -251,6 +266,8 @@ app.use("/api/admin/dashboard", adminDashboardRoutes);
 app.use("/api/admin/calendar", adminCalendarRoutes);
 app.use("/api/admin/resources", adminResourcesRoutes);
 app.use("/api/admin/organize", adminOrganizeRoutes);
+app.use("/api/integrations", integrationsRoutes);
+app.use("/api", pagesRoutes);
 
 /**
  * ✅ Compatibility alias for Catalog.js:
@@ -280,6 +297,11 @@ app.use("/me", require("./routes/library"));
 app.use("/api/comments", require("./routes/comments"));
 app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/push", require("./routes/push"));
+
+// ✅ TUS endpoint (only mounts if ./routes/tus exists)
+if (tusRouter) {
+  app.use("/api/uploads/tus", tusRouter);
+}
 
 /* --------------------------------------------------------
    SOCKET.IO CHAT

@@ -967,4 +967,17 @@ router.get("/:id/playlists", async (req, res, next) => {
   }
 });
 
+// GET /api/videos/:id/status
+router.get("/:id/status", authenticate, async (req, res) => {
+  const { id } = req.params;
+  const q = await db.query(
+    `SELECT id, processing_status, processing_error, processing_updated_at
+     FROM videos
+     WHERE id=$1`,
+    [id]
+  );
+  if (!q.rows[0]) return res.status(404).json({ message: "Not found" });
+  res.json(q.rows[0]);
+});
+
 module.exports = router;
