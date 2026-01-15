@@ -2,7 +2,9 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const authenticate = require("../middleware/authenticate");
+
+// ✅ Use your real auth middleware
+const { requireAuth } = require("../middleware/auth");
 
 // Prefer Node 18+ fetch; fallback to node-fetch dynamically.
 const fetch =
@@ -40,7 +42,10 @@ function labelForCode(code) {
   return null;
 }
 
-/* ─────────────────────── DB bootstrap/migration ─────────────────────── */
+/* ─────────────────────── DB bootstrap/migration ───────────────────────
+   IMPORTANT: Do NOT run migrations on every request (can cause locks/hangs).
+   We'll run this ONCE and cache the promise.
+──────────────────────────────────────────────────────────────────────── */
 
 async function ensureTables() {
   // Plans
@@ -88,7 +93,7 @@ async function ensureTables() {
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   `);
 
-  // Helpful indexes
+  // Helpful indexes (safe)
   await db.query(`
     CREATE INDEX IF NOT EXISTS idx_subscriptions_active
       ON subscriptions (user_id)
@@ -121,6 +126,20 @@ async function ensureTables() {
   `);
 }
 
+// ✅ run once per process (prevents request timeouts)
+let __initPromise = null;
+function initOnce() {
+  if (!__initPromise) {
+    __initPromise = ensureTables().catch((e) => {
+      console.error("[subscription] ensureTables failed:", e);
+      // allow retries on next request
+      __initPromise = null;
+      throw e;
+    });
+  }
+  return __initPromise;
+}
+
 /* ───────────────────── internal helpers (exported at bottom) ───────────────────── */
 
 function toPlan(row) {
@@ -150,7 +169,7 @@ function toPlan(row) {
 }
 
 async function getMetrics() {
-  await ensureTables();
+  await initOnce();
   const { rows: activeRows } = await db.query(
     `SELECT COUNT(*)::int AS c FROM subscriptions s WHERE s.canceled_at IS NULL`
   );
@@ -187,7 +206,6 @@ function computePeriodWindow(startedAt, interval, renewsAt) {
   let period_end;
   if (end) period_end = new Date(end);
   else {
-    // fallback: 1 month/year from start
     period_end =
       i === "year"
         ? new Date(
@@ -207,7 +225,6 @@ function computePeriodWindow(startedAt, interval, renewsAt) {
             s.getSeconds()
           );
   }
-  // period_start is one interval before end
   const period_start =
     i === "year"
       ? new Date(
@@ -231,7 +248,7 @@ function computePeriodWindow(startedAt, interval, renewsAt) {
 
 /** Get the active subscription row + normalized code/limits. */
 async function deriveActiveSubscription(userId) {
-  await ensureTables();
+  await initOnce();
   const { rows } = await db.query(
     `
     SELECT
@@ -258,7 +275,6 @@ async function deriveActiveSubscription(userId) {
 
   const interval = row.interval || row.plan_interval || "month";
 
-  // Limits: prefer plan row value; otherwise map by code
   const mappedLimit =
     code === "starter"
       ? 100
@@ -316,7 +332,6 @@ async function getLiveUsageHoursBetween(userId, start, end) {
     );
     return Number(rows[0]?.hours || 0);
   } catch {
-    // If the table doesn't exist yet, treat as 0 used.
     return 0;
   }
 }
@@ -325,7 +340,7 @@ async function getLiveUsageHoursBetween(userId, start, end) {
 
 router.get("/plans", async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const limit = Math.min(1000, Math.max(1, cleanInt(req.query.limit, 100)));
     const q = String(req.query.q || "")
       .trim()
@@ -357,7 +372,7 @@ router.get("/plans", async (req, res) => {
 
 router.get("/plans/:id", async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const { rows } = await db.query(
       `SELECT p.*, 0::int AS total_subscribers, 0::int AS content_count
          FROM subscription_plans p
@@ -372,9 +387,9 @@ router.get("/plans/:id", async (req, res) => {
   }
 });
 
-router.post("/plans", authenticate, async (req, res) => {
+router.post("/plans", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const {
       title,
       description,
@@ -419,9 +434,9 @@ router.post("/plans", authenticate, async (req, res) => {
   }
 });
 
-router.put("/plans/:id", authenticate, async (req, res) => {
+router.put("/plans/:id", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const id = req.params.id;
     const fields = [];
     const params = [];
@@ -466,9 +481,8 @@ router.put("/plans/:id", authenticate, async (req, res) => {
       );
 
     fields.push("updated_at = NOW()");
-    if (!fields.length) return res.status(400).json({ message: "No changes" });
-
     params.push(id);
+
     const { rows } = await db.query(
       `UPDATE subscription_plans SET ${fields.join(
         ", "
@@ -483,9 +497,9 @@ router.put("/plans/:id", authenticate, async (req, res) => {
   }
 });
 
-router.delete("/plans/:id", authenticate, async (req, res) => {
+router.delete("/plans/:id", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     await db.query("DELETE FROM subscription_plans WHERE id=$1", [
       req.params.id,
     ]);
@@ -496,9 +510,9 @@ router.delete("/plans/:id", authenticate, async (req, res) => {
   }
 });
 
-router.post("/plans/:id/duplicate", authenticate, async (req, res) => {
+router.post("/plans/:id/duplicate", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const { rows } = await db.query(
       "SELECT * FROM subscription_plans WHERE id=$1",
       [req.params.id]
@@ -534,9 +548,9 @@ router.post("/plans/:id/duplicate", authenticate, async (req, res) => {
 
 /* ───────────────────── quick flags (back-compat) ───────────────────── */
 
-router.get("/", authenticate, async (req, res) => {
+router.get("/", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const userId = req.user?.id;
     if (!userId) return res.json({ plan: "free" });
 
@@ -548,9 +562,9 @@ router.get("/", authenticate, async (req, res) => {
   }
 });
 
-router.get("/customer", authenticate, async (req, res) => {
+router.get("/customer", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const userId = req.user?.id;
     if (!userId) return res.json({ subscribed: false });
 
@@ -567,9 +581,10 @@ router.get("/customer", authenticate, async (req, res) => {
 
 /* ───────────────────── full details for dashboard (with usage) ───────────────────── */
 
-router.get("/me", authenticate, async (req, res) => {
+router.get("/me", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
+
     const userId = req.user?.id;
     if (!userId) {
       return res.json({ plan: "free", plan_title: "Free", status: "none" });
@@ -580,7 +595,6 @@ router.get("/me", authenticate, async (req, res) => {
       return res.json({ plan: "free", plan_title: "Free", status: "none" });
     }
 
-    // Prefer usage service; fallback to summing within the period using started_at only
     let used = 0;
     try {
       const { getMonthlyUsage } = require("../services/usage");
@@ -599,7 +613,6 @@ router.get("/me", authenticate, async (req, res) => {
         ? Math.max(0, sub.live_hours_limit - used)
         : null;
 
-    // explicit second precision
     const usedSeconds = Math.round(used * 3600);
     const limitSeconds =
       sub.live_hours_limit > 0 ? sub.live_hours_limit * 3600 : null;
@@ -624,7 +637,6 @@ router.get("/me", authenticate, async (req, res) => {
       live_hours_used: +used.toFixed(4),
       live_hours_remaining: remaining,
 
-      // new explicit fields
       live_seconds_used: usedSeconds,
       live_seconds_limit: limitSeconds,
     });
@@ -636,9 +648,9 @@ router.get("/me", authenticate, async (req, res) => {
 
 /* ───────────────────── simple subscribe (test) ───────────────────── */
 
-router.post("/subscribe", authenticate, async (req, res) => {
+router.post("/subscribe", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const userId = req.user?.id;
     const planId = cleanInt(req.body?.plan_id, 0);
     if (!userId) return res.status(401).json({ message: "Unauthorized" });
@@ -652,7 +664,6 @@ router.post("/subscribe", authenticate, async (req, res) => {
     const plan = planRows[0];
     if (!plan) return res.status(404).json({ message: "Plan not found" });
 
-    // end any existing
     await db.query(
       "UPDATE subscriptions SET canceled_at = NOW() WHERE user_id=$1 AND canceled_at IS NULL",
       [userId]
@@ -735,9 +746,9 @@ async function getPayPalSubscription(subId) {
   return resp.json();
 }
 
-router.post("/confirm-paypal", authenticate, async (req, res) => {
+router.post("/confirm-paypal", requireAuth, async (req, res) => {
   try {
-    await ensureTables();
+    await initOnce();
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
@@ -799,7 +810,6 @@ router.post("/confirm-paypal", authenticate, async (req, res) => {
       [userId, plan.id, code, code, human, interval, provider_ref, renews_at]
     );
 
-    // Emails (fire & forget)
     (async () => {
       try {
         const u = await db.query(
@@ -840,7 +850,8 @@ router.post("/confirm-paypal", authenticate, async (req, res) => {
 });
 
 module.exports = router;
-/* expose helpers so other routes (e.g., live) can reuse them if needed */
+
+/* expose helpers so other routes can reuse them if needed */
 module.exports._helpers = {
   deriveActiveSubscription,
   getLiveUsageHoursBetween,

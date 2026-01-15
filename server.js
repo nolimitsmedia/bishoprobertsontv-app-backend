@@ -62,16 +62,19 @@ try {
   console.log("[tus] tus router not found (skipping):", e.message);
 }
 
-// Conditional routes (disabled in local mode)
+// Conditional routes
 let usageRoutes = null;
 let analyticsRoutes = null;
 
+// Usage can remain prod-only if you want
 if (!IS_LOCAL) {
   usageRoutes = require("./routes/usage");
-  analyticsRoutes = require("./routes/analytics");
 } else {
-  console.log("[local-dev] usage & analytics disabled");
+  console.log("[local-dev] usage disabled");
 }
+
+// ✅ Analytics should work in local too (needed for Admin Analytics page)
+analyticsRoutes = require("./routes/analytics");
 
 const publicRoutes = require("./routes/public");
 const devicesRoutes = require("./routes/devices");
@@ -83,6 +86,7 @@ const communityRoutes = require("./routes/community");
 const authBridge = require("./middleware/auth-bridge");
 const bunnyStreamRouter = require("./routes/bunnyStream");
 const pagesRoutes = require("./routes/pages");
+const adminAnalyticsRoutes = require("./routes/adminAnalytics");
 
 const {
   stripeWebhookHandler,
@@ -169,8 +173,6 @@ app.post(
 /* --------------------------------------------------------
    BODY PARSERS
 --------------------------------------------------------- */
-// ✅ keep JSON limit small for normal API calls; uploads are multipart (multer)
-// so they are NOT affected by this JSON limit.
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -203,12 +205,10 @@ app.use(
    FACEBOOK AUTH (Fixes your 404 status)
 --------------------------------------------------------- */
 
-// ✅ Provide status endpoint so frontend polling won't 404
 app.get("/api/auth/facebook/status", (_req, res) => {
   res.json({ ok: true, connected: false });
 });
 
-// ✅ Mount facebook routes where frontend expects them
 app.use("/api/auth/facebook", facebookRoutes);
 
 /* --------------------------------------------------------
@@ -236,10 +236,13 @@ app.use("/api", pricingRoutes);
 app.use("/api", checkoutRoutes);
 app.use("/api/demo", demoRoutes);
 
-if (!IS_LOCAL) {
+// ✅ usage stays prod-only
+if (!IS_LOCAL && usageRoutes) {
   app.use("/api/usage", usageRoutes);
-  app.use("/api/analytics", analyticsRoutes);
 }
+
+// ✅ analytics always enabled (fixes 404 in local)
+app.use("/api/analytics", analyticsRoutes);
 
 app.use("/api", accountRoutes);
 app.use("/api/resources", resourcesRoutes);
@@ -268,6 +271,7 @@ app.use("/api/admin/resources", adminResourcesRoutes);
 app.use("/api/admin/organize", adminOrganizeRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api", pagesRoutes);
+app.use("/api/admin/analytics", adminAnalyticsRoutes);
 
 /**
  * ✅ Compatibility alias for Catalog.js:
@@ -275,7 +279,6 @@ app.use("/api", pagesRoutes);
  * We forward it to: /api/playlists/public?limit=1000
  */
 app.use("/api/public/collections", (req, res, next) => {
-  // req.url here is "/?limit=1000" (or "/something?...")
   req.url = "/public" + (req.url || "");
   return playlistsRouter(req, res, next);
 });
@@ -347,12 +350,10 @@ io.on("connection", (socket) => {
    ERRORS
 --------------------------------------------------------- */
 
-// ✅ Proper 404 handler (correct arg order)
 app.use("/api", (req, res) => {
   res.status(404).json({ ok: false, error: "Not found" });
 });
 
-// ✅ Proper error handler signature (must include next)
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ ok: false, error: "Server error" });
