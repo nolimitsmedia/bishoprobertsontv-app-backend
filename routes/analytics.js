@@ -20,73 +20,96 @@ async function getAnalyticsSchema() {
     `
     SELECT column_name
     FROM information_schema.columns
-    WHERE table_name = 'analytics_events'
+    WHERE table_schema='public'
+      AND table_name='analytics_events'
   `
   );
 
   const cols = new Set((r.rows || []).map((x) => x.column_name));
+  const has = (c) => cols.has(c);
 
-  // event type column
-  const typeCol = cols.has("event_type")
-    ? "event_type"
-    : cols.has("type")
-    ? "type"
-    : null;
-
-  // time column
-  const timeCol = cols.has("created_at")
-    ? "created_at"
-    : cols.has("occurred_at")
-    ? "occurred_at"
-    : null;
-
-  // user identity column (IMPORTANT: don't assume user_id exists)
-  const userCol = cols.has("user_id")
-    ? "user_id"
-    : cols.has("member_id")
-    ? "member_id"
-    : cols.has("account_id")
-    ? "account_id"
-    : null;
-
-  // video column (some schemas use different names)
-  const videoCol = cols.has("video_id")
-    ? "video_id"
-    : cols.has("vod_id")
-    ? "vod_id"
-    : null;
-
-  // position/duration
-  const positionCol = cols.has("position_sec")
-    ? "position_sec"
-    : cols.has("position_seconds")
-    ? "position_seconds"
-    : null;
-
-  const durationCol = cols.has("duration_sec")
-    ? "duration_sec"
-    : cols.has("duration_seconds")
-    ? "duration_seconds"
-    : null;
-
-  const hasPage = cols.has("page");
-  const hasMeta = cols.has("meta");
-  const anonCol = cols.has("anon_id") ? "anon_id" : null;
-
-  __analyticsSchema = {
+  const schema = {
     cols,
-    typeCol,
-    timeCol,
-    userCol,
-    videoCol,
-    positionCol,
-    durationCol,
-    hasPage,
-    hasMeta,
-    anonCol,
+
+    // type columns (some schemas have one or both)
+    hasType: has("type"),
+    hasEventType: has("event_type"),
+
+    // time columns
+    hasCreatedAt: has("created_at"),
+    hasOccurredAt: has("occurred_at"),
+
+    // user identity columns
+    hasUserId: has("user_id"),
+    hasMemberId: has("member_id"),
+    hasAccountId: has("account_id"),
+
+    // anon
+    hasAnonId: has("anon_id"),
+
+    // video id columns
+    hasVideoId: has("video_id"),
+    hasVodId: has("vod_id"),
+
+    // position/duration columns
+    posCol: has("position_sec")
+      ? "position_sec"
+      : has("position_seconds")
+      ? "position_seconds"
+      : null,
+    durCol: has("duration_sec")
+      ? "duration_sec"
+      : has("duration_seconds")
+      ? "duration_seconds"
+      : null,
+
+    hasPage: has("page"),
+    hasMeta: has("meta"),
   };
 
-  return __analyticsSchema;
+  schema.typeExpr =
+    schema.hasType && schema.hasEventType
+      ? "COALESCE(type, event_type)"
+      : schema.hasType
+      ? "type"
+      : schema.hasEventType
+      ? "event_type"
+      : null;
+
+  schema.timeExpr =
+    schema.hasCreatedAt && schema.hasOccurredAt
+      ? "COALESCE(created_at, occurred_at)"
+      : schema.hasCreatedAt
+      ? "created_at"
+      : schema.hasOccurredAt
+      ? "occurred_at"
+      : null;
+
+  schema.userExpr =
+    schema.hasUserId || schema.hasMemberId || schema.hasAccountId
+      ? `COALESCE(${schema.hasUserId ? "user_id" : "NULL"},
+               ${schema.hasMemberId ? "member_id" : "NULL"},
+               ${schema.hasAccountId ? "account_id" : "NULL"})`
+      : null;
+
+  schema.videoExpr =
+    schema.hasVideoId && schema.hasVodId
+      ? "COALESCE(video_id, vod_id)"
+      : schema.hasVideoId
+      ? "video_id"
+      : schema.hasVodId
+      ? "vod_id"
+      : null;
+
+  __analyticsSchema = schema;
+  return schema;
+}
+
+function getActorId(req) {
+  const actor = req.user || req.admin || null;
+  return (
+    actor?.id ?? actor?.user_id ?? actor?.member_id ?? actor?.account_id ?? null
+  );
 }
 
 // quick dev helper
@@ -101,24 +124,22 @@ router.post("/event", requireAuth, async (req, res) => {
   try {
     const s = await getAnalyticsSchema();
 
-    if (!s.typeCol) {
+    if (!s.typeExpr) {
       return res.status(500).json({
         ok: false,
-        error: "analytics_events missing event_type/type column",
+        error: "analytics_events missing type/event_type column",
       });
     }
-    if (!s.timeCol) {
+    if (!s.timeExpr) {
       return res.status(500).json({
         ok: false,
         error: "analytics_events missing created_at/occurred_at column",
       });
     }
 
-    // auth objects may differ (req.user, req.admin, etc.)
-    const actor = req.user || req.admin || null;
-    const actorId = actor?.id ?? actor?.user_id ?? actor?.member_id ?? null;
+    const actorId = getActorId(req);
 
-    if (!actorId && !s.anonCol) {
+    if (!actorId && !s.hasAnonId) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
@@ -132,7 +153,6 @@ router.post("/event", requireAuth, async (req, res) => {
       anon_id,
     } = req.body || {};
 
-    // Accept these; anything else falls back to *_progress
     const allowed = new Set([
       // VOD
       "video_play",
@@ -143,50 +163,79 @@ router.post("/event", requireAuth, async (req, res) => {
       "live_progress",
       "live_leave",
     ]);
-    const et = allowed.has(event_type) ? event_type : "video_progress";
+    const et = allowed.has(event_type) ? event_type : null;
+    if (!et) {
+      return res.status(400).json({ ok: false, error: "Invalid event_type" });
+    }
+
+    // For video_* events we require a video id (this prevents "Top Videos only shows one item" bugs)
+    const isVideoEvent = et.startsWith("video_");
+    if (isVideoEvent && (video_id == null || video_id === "")) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "video_id is required for video events" });
+    }
 
     const pos = clampInt(position_seconds, 0, 24 * 60 * 60);
     const dur = clampInt(duration_seconds, 0, 24 * 60 * 60);
 
-    // Build insert dynamically ONLY for existing columns
     const cols = [];
     const vals = [];
     const params = [];
 
-    // user identity
-    if (s.userCol && actorId != null) {
-      cols.push(s.userCol);
-      vals.push(`$${(params.push(actorId), params.length)}`);
-    } else if (s.anonCol) {
-      // fall back to anon_id if available
-      cols.push(s.anonCol);
+    // ---- identity ----
+    if (actorId != null) {
+      if (s.hasUserId) {
+        cols.push("user_id");
+        vals.push(`$${(params.push(actorId), params.length)}`);
+      } else if (s.hasMemberId) {
+        cols.push("member_id");
+        vals.push(`$${(params.push(actorId), params.length)}`);
+      } else if (s.hasAccountId) {
+        cols.push("account_id");
+        vals.push(`$${(params.push(actorId), params.length)}`);
+      } else if (s.hasAnonId) {
+        cols.push("anon_id");
+        vals.push(`$${(params.push(anon_id || null), params.length)}`);
+      }
+    } else if (s.hasAnonId) {
+      cols.push("anon_id");
       vals.push(`$${(params.push(anon_id || null), params.length)}`);
     }
 
-    // video id (optional for live)
-    if (s.videoCol) {
-      const vid =
-        video_id == null || video_id === ""
-          ? null
-          : Number.isFinite(Number(video_id))
-          ? Number(video_id)
-          : String(video_id);
+    // ---- video id ----
+    const vid =
+      video_id == null || video_id === ""
+        ? null
+        : Number.isFinite(Number(video_id))
+        ? Number(video_id)
+        : String(video_id);
 
-      cols.push(s.videoCol);
+    if (s.hasVideoId) {
+      cols.push("video_id");
+      vals.push(`$${(params.push(vid), params.length)}`);
+    } else if (s.hasVodId) {
+      cols.push("vod_id");
       vals.push(`$${(params.push(vid), params.length)}`);
     }
 
-    // event type
-    cols.push(s.typeCol);
-    vals.push(`$${(params.push(et), params.length)}`);
+    // ---- write BOTH type columns when both exist ----
+    if (s.hasType) {
+      cols.push("type");
+      vals.push(`$${(params.push(et), params.length)}`);
+    }
+    if (s.hasEventType) {
+      cols.push("event_type");
+      vals.push(`$${(params.push(et), params.length)}`);
+    }
 
     // position/duration
-    if (s.positionCol) {
-      cols.push(s.positionCol);
+    if (s.posCol) {
+      cols.push(s.posCol);
       vals.push(`$${(params.push(pos), params.length)}`);
     }
-    if (s.durationCol) {
-      cols.push(s.durationCol);
+    if (s.durCol) {
+      cols.push(s.durCol);
       vals.push(`$${(params.push(dur), params.length)}`);
     }
 
@@ -197,17 +246,20 @@ router.post("/event", requireAuth, async (req, res) => {
     }
     if (s.hasMeta) {
       cols.push("meta");
-      vals.push(
-        `$${
-          (params.push(meta && typeof meta === "object" ? meta : {}),
-          params.length)
-        }`
-      );
+      // ensure jsonb/json storage works reliably
+      const cleanMeta = meta && typeof meta === "object" ? meta : {};
+      vals.push(`$${(params.push(cleanMeta), params.length)}::jsonb`);
     }
 
-    // time
-    cols.push(s.timeCol);
-    vals.push("NOW()");
+    // ---- write BOTH time columns when both exist ----
+    if (s.hasCreatedAt) {
+      cols.push("created_at");
+      vals.push("NOW()");
+    }
+    if (s.hasOccurredAt) {
+      cols.push("occurred_at");
+      vals.push("NOW()");
+    }
 
     await db.query(
       `INSERT INTO analytics_events (${cols.join(", ")})
@@ -222,7 +274,7 @@ router.post("/event", requireAuth, async (req, res) => {
   }
 });
 
-// ---------- GET /api/analytics/summary?days=30&ping_seconds=15 ----------
+// ---------- GET /api/analytics/summary?days=30&ping_seconds=15&dedupe_plays=1 ----------
 router.get("/summary", requireAuth, async (req, res) => {
   try {
     const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
@@ -231,51 +283,88 @@ router.get("/summary", requireAuth, async (req, res) => {
       Math.min(60, Number(req.query.ping_seconds || 15))
     );
 
+    // default: dedupe plays (same user + same video + same day counts as 1 play)
+    const dedupePlays = String(req.query.dedupe_plays ?? "1") !== "0";
+
     const s = await getAnalyticsSchema();
 
-    if (!s.typeCol) {
+    if (!s.typeExpr) {
       return res.status(500).json({
         ok: false,
-        error: "analytics_events missing event_type/type column",
+        error: "analytics_events missing type/event_type column",
       });
     }
-    if (!s.timeCol) {
+    if (!s.timeExpr) {
       return res.status(500).json({
         ok: false,
         error: "analytics_events missing created_at/occurred_at column",
       });
     }
 
-    const typeCol = s.typeCol;
-    const timeCol = s.timeCol;
-    const userCol = s.userCol; // may be null
-    const videoCol = s.videoCol; // may be null
+    const typeExpr = s.typeExpr;
+    const timeExpr = s.timeExpr;
 
-    // If we don't have a user column, unique_viewers becomes 0
-    const uniqueExpr = userCol
-      ? `COUNT(DISTINCT ${userCol})::bigint`
+    const uniqueExpr = s.userExpr
+      ? `COUNT(DISTINCT ${s.userExpr})::bigint`
       : `0::bigint`;
 
-    // Build top videos CTE only if videoCol exists
-    const topVideosCTE = videoCol
+    const hasDuration = !!s.durCol;
+
+    // ✅ Prefer meta.delta_seconds when available; fallback to pingSeconds
+    const metaDeltaExpr = s.hasMeta
+      ? `NULLIF((meta->>'delta_seconds')::int, 0)`
+      : `NULL`;
+
+    // plays expression: dedupe if we can identify user + video
+    const playsExpr =
+      dedupePlays && s.userExpr && s.videoExpr
+        ? `COUNT(DISTINCT (${s.userExpr}, ${s.videoExpr}, date_trunc('day', ${timeExpr}))) FILTER (WHERE ${typeExpr}='video_play')::bigint`
+        : `COUNT(*) FILTER (WHERE ${typeExpr}='video_play')::bigint`;
+
+    const topPlaysExpr =
+      dedupePlays && s.userExpr && s.videoExpr
+        ? `COUNT(DISTINCT (${s.userExpr}, ${s.videoExpr}, date_trunc('day', ${timeExpr}))) FILTER (WHERE ${typeExpr}='video_play')::bigint`
+        : `COUNT(*) FILTER (WHERE ${typeExpr}='video_play')::bigint`;
+
+    const topVideosCTE = s.videoExpr
       ? `
       , top_videos AS (
         SELECT
-          b.${videoCol} AS video_id,
-          COUNT(*) FILTER (WHERE b.${typeCol}='video_play')::bigint AS plays,
+          ${s.videoExpr} AS video_id,
+          ${topPlaysExpr} AS plays,
           ${
-            userCol ? `COUNT(DISTINCT b.${userCol})::bigint` : `0::bigint`
+            s.userExpr ? `COUNT(DISTINCT ${s.userExpr})::bigint` : `0::bigint`
           } AS unique_viewers,
-          (COUNT(*) FILTER (WHERE b.${typeCol}='video_progress')::bigint * $2::bigint) AS watch_seconds
+
+          -- watch time: sum delta_seconds if present; else assume pingSeconds per progress
+          SUM(
+            CASE
+              WHEN ${typeExpr}='video_progress'
+                THEN COALESCE(${metaDeltaExpr}, $2::int)
+              ELSE 0
+            END
+          )::bigint AS watch_seconds,
+
+          ${
+            hasDuration
+              ? `SUM(${s.durCol}) FILTER (WHERE ${typeExpr}='video_complete')::bigint AS complete_duration_seconds`
+              : `0::bigint AS complete_duration_seconds`
+          }
         FROM base b
-        WHERE b.${videoCol} IS NOT NULL
-        GROUP BY b.${videoCol}
+        WHERE ${s.videoExpr} IS NOT NULL
+        GROUP BY ${s.videoExpr}
         ORDER BY watch_seconds DESC, plays DESC
         LIMIT 10
       ),
       top_with_video AS (
         SELECT
-          t.*,
+          t.video_id,
+          t.plays,
+          t.unique_viewers,
+          CASE
+            WHEN t.watch_seconds > 0 THEN t.watch_seconds
+            ELSE COALESCE(t.complete_duration_seconds,0)
+          END AS watch_seconds,
           v.title,
           COALESCE(
             (to_jsonb(v)->>'thumbnail_url'),
@@ -293,8 +382,8 @@ router.get("/summary", requireAuth, async (req, res) => {
       `
       : "";
 
-    const topVideosSelect = videoCol
-      ? `(SELECT json_agg(top_with_video) FROM top_with_video) AS top_videos`
+    const topVideosSelect = s.videoExpr
+      ? `(SELECT COALESCE(json_agg(top_with_video), '[]'::json) FROM top_with_video) AS top_videos`
       : `('[]'::json) AS top_videos`;
 
     const r = await db.query(
@@ -302,25 +391,39 @@ router.get("/summary", requireAuth, async (req, res) => {
       WITH base AS (
         SELECT *
         FROM analytics_events
-        WHERE ${timeCol} >= NOW() - ($1::int * INTERVAL '1 day')
+        WHERE ${timeExpr} >= NOW() - ($1::int * INTERVAL '1 day')
       ),
       counts AS (
-        SELECT ${typeCol} AS type, COUNT(*)::bigint AS n
+        SELECT ${typeExpr} AS type, COUNT(*)::bigint AS n
         FROM base
-        GROUP BY ${typeCol}
+        GROUP BY ${typeExpr}
         ORDER BY n DESC
       ),
       totals AS (
         SELECT
-          COUNT(*) FILTER (WHERE ${typeCol}='video_play')::bigint AS plays,
+          ${playsExpr} AS plays,
           ${uniqueExpr} AS unique_viewers,
-          COUNT(*) FILTER (WHERE ${typeCol}='video_progress')::bigint AS progress_events,
-          COUNT(*) FILTER (WHERE ${typeCol}='video_complete')::bigint AS completions
+          COUNT(*) FILTER (WHERE ${typeExpr}='video_progress')::bigint AS progress_events,
+
+          SUM(
+            CASE
+              WHEN ${typeExpr}='video_progress'
+                THEN COALESCE(${metaDeltaExpr}, $2::int)
+              ELSE 0
+            END
+          )::bigint AS watch_seconds_from_progress,
+
+          COUNT(*) FILTER (WHERE ${typeExpr}='video_complete')::bigint AS completions
+          ${
+            hasDuration
+              ? `, SUM(${s.durCol}) FILTER (WHERE ${typeExpr}='video_complete')::bigint AS complete_duration_seconds`
+              : `, 0::bigint AS complete_duration_seconds`
+          }
         FROM base
       )
       ${topVideosCTE}
       SELECT
-        (SELECT json_agg(counts) FROM counts) AS counts,
+        (SELECT COALESCE(json_agg(counts), '[]'::json) FROM counts) AS counts,
         (SELECT row_to_json(totals) FROM totals) AS totals,
         ${topVideosSelect}
       `,
@@ -332,15 +435,29 @@ router.get("/summary", requireAuth, async (req, res) => {
       plays: 0,
       unique_viewers: 0,
       progress_events: 0,
+      watch_seconds_from_progress: 0,
       completions: 0,
+      complete_duration_seconds: 0,
     };
 
-    const watchSeconds = Number(totals.progress_events || 0) * pingSeconds;
+    const watchSecondsFromProgress = Number(
+      totals.watch_seconds_from_progress || 0
+    );
+
+    const completeDurationSeconds = Number(
+      totals.complete_duration_seconds || 0
+    );
+
+    const watchSeconds =
+      watchSecondsFromProgress > 0
+        ? watchSecondsFromProgress
+        : completeDurationSeconds;
 
     res.json({
       ok: true,
       days,
       ping_seconds: pingSeconds,
+      dedupe_plays: dedupePlays,
       watch_seconds: watchSeconds,
       watch_hours: watchSeconds / 3600,
       totals: {
@@ -360,14 +477,22 @@ router.get("/summary", requireAuth, async (req, res) => {
             : 0,
       },
       counts: row.counts || [],
-      top_videos: row.top_videos || [],
+      top_videos: (row.top_videos || []).map((x) => ({
+        ...x,
+        watch_seconds: Number(x.watch_seconds || 0),
+      })),
       schema: {
-        type_col: s.typeCol,
-        time_col: s.timeCol,
-        user_col: s.userCol,
-        video_col: s.videoCol,
-        position_col: s.positionCol,
-        duration_col: s.durationCol,
+        has_type: s.hasType,
+        has_event_type: s.hasEventType,
+        has_created_at: s.hasCreatedAt,
+        has_occurred_at: s.hasOccurredAt,
+        user_expr: s.userExpr,
+        video_expr: s.videoExpr,
+        type_expr: s.typeExpr,
+        time_expr: s.timeExpr,
+        pos_col: s.posCol,
+        dur_col: s.durCol,
+        has_meta: s.hasMeta,
       },
     });
   } catch (err) {
@@ -382,28 +507,28 @@ router.get("/live", requireAuth, async (req, res) => {
     const minutes = Math.max(1, Math.min(180, Number(req.query.minutes || 10)));
     const s = await getAnalyticsSchema();
 
-    if (!s.typeCol || !s.timeCol) {
+    if (!s.typeExpr || !s.timeExpr) {
       return res.status(500).json({
         ok: false,
         error: "analytics_events missing required columns",
       });
     }
 
-    const typeCol = s.typeCol;
-    const timeCol = s.timeCol;
+    const typeExpr = s.typeExpr;
+    const timeExpr = s.timeExpr;
 
     const r = await db.query(
       `
       WITH base AS (
         SELECT *
         FROM analytics_events
-        WHERE ${timeCol} >= NOW() - ($1::int * INTERVAL '1 minute')
-          AND ${typeCol} IN ('live_open','live_progress','live_leave')
+        WHERE ${timeExpr} >= NOW() - ($1::int * INTERVAL '1 minute')
+          AND ${typeExpr} IN ('live_open','live_progress','live_leave')
       )
       SELECT
-        COUNT(*) FILTER (WHERE ${typeCol}='live_open')::bigint AS live_open,
-        COUNT(*) FILTER (WHERE ${typeCol}='live_progress')::bigint AS live_progress,
-        COUNT(*) FILTER (WHERE ${typeCol}='live_leave')::bigint AS live_leave
+        COUNT(*) FILTER (WHERE ${typeExpr}='live_open')::bigint AS live_open,
+        COUNT(*) FILTER (WHERE ${typeExpr}='live_progress')::bigint AS live_progress,
+        COUNT(*) FILTER (WHERE ${typeExpr}='live_leave')::bigint AS live_leave
       FROM base
       `,
       [minutes]

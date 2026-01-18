@@ -183,7 +183,7 @@ router.post("/create", authenticate, createPlaylist);
 router.post("/", authenticate, createPlaylist);
 
 /* =========================================================
-   ✔ FIXED ORDER — /me MUST COME BEFORE /:idOrSlug
+   ✔ FIXED ORDER — special routes MUST COME BEFORE /:idOrSlug
 ========================================================= */
 
 // GET /api/playlists/me
@@ -216,6 +216,81 @@ router.get("/me", authenticate, async (req, res) => {
   } catch (e) {
     console.error("[GET /playlists/me] error:", e);
     res.status(500).json({ message: "Failed to fetch playlists" });
+  }
+});
+
+/* =========================================================
+   ✅ MISSING ENDPOINT #1
+   GET /api/playlists/my
+   Alias of /me (your frontend expects /my)
+========================================================= */
+router.get("/my", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const sql = `
+      SELECT
+        p.id,
+        p.title,
+        COALESCE(p.slug, LOWER(REPLACE(p.title, ' ', '-'))) AS slug,
+        p.description,
+        p.thumbnail_url,
+        p.visibility,
+        p.featured_category_id,
+        p.created_at,
+        COUNT(pv.video_id)::int AS item_count,
+        COUNT(pv.video_id)::int AS video_count
+      FROM playlists p
+      LEFT JOIN playlist_videos pv ON pv.playlist_id = p.id
+      WHERE p.created_by = $1
+      GROUP BY p.id
+      ORDER BY p.created_at DESC
+      LIMIT 200
+    `;
+
+    const { rows } = await db.query(sql, [userId]);
+    res.json({ items: rows });
+  } catch (e) {
+    console.error("[GET /playlists/my] error:", e);
+    res.status(500).json({ message: "Failed to fetch playlists" });
+  }
+});
+
+/* =========================================================
+   ✅ MISSING ENDPOINT #2
+   GET /api/playlists/by-video/:videoId
+   Returns ONLY the current user's playlist memberships
+   so checkboxes reflect real membership.
+========================================================= */
+router.get("/by-video/:videoId", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { videoId } = req.params;
+
+    const vId = Number(videoId);
+    if (!Number.isFinite(vId)) {
+      return res.status(400).json({ message: "Invalid videoId" });
+    }
+
+    const r = await db.query(
+      `
+      SELECT pv.playlist_id AS id
+      FROM playlist_videos pv
+      JOIN playlists p ON p.id = pv.playlist_id
+      WHERE p.created_by = $1
+        AND pv.video_id = $2
+      `,
+      [userId, vId]
+    );
+
+    res.json({
+      ok: true,
+      video_id: vId,
+      playlist_ids: r.rows.map((x) => String(x.id)),
+    });
+  } catch (e) {
+    console.error("[GET /playlists/by-video/:videoId] error:", e);
+    res.status(500).json({ message: "Failed to load video membership" });
   }
 });
 
@@ -484,7 +559,9 @@ router.delete("/:id/videos/:videoId", authenticate, async (req, res) => {
 });
 
 /* =========================================================
-   VIDEO MEMBERSHIP HELPERS
+   VIDEO MEMBERSHIP HELPERS (kept for backward compatibility)
+   NOTE: These return ALL playlists containing a video (not scoped).
+   Your VideoView should use /by-video/:videoId for checkbox membership.
 ========================================================= */
 router.get("/for-video/:videoId", authenticate, async (req, res) => {
   try {
