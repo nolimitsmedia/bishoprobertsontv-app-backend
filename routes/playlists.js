@@ -23,7 +23,7 @@ async function ensureFavorites(userId) {
       WHERE created_by = $1 AND LOWER(title) = 'favorites'
       ORDER BY id ASC
       LIMIT 1`,
-    [userId]
+    [userId],
   );
   if (q.rowCount) return q.rows[0];
 
@@ -31,7 +31,7 @@ async function ensureFavorites(userId) {
     `INSERT INTO playlists (title, slug, visibility, created_by, description)
      VALUES ($1, $2, 'private', $3, $4)
      RETURNING *`,
-    ["Favorites", slugify("Favorites"), userId, "Your saved videos"]
+    ["Favorites", slugify("Favorites"), userId, "Your saved videos"],
   );
   return rows[0];
 }
@@ -40,13 +40,50 @@ function shortRand() {
   return Math.random().toString(36).slice(2, 6);
 }
 
+function isDigits(x) {
+  return typeof x === "string" && /^\d+$/.test(x);
+}
+
+/* =====================================================================
+   PUBLIC RULES (Option A):
+   - Public endpoints MUST NEVER return unpublished/unlisted playlists.
+   - We treat "published playlist" as: playlists.visibility = 'public'
+   - Unlisted is fully unreachable publicly (even by direct link).
+   - Playlist item counts are based on PUBLIC videos only:
+       v.is_published = TRUE AND v.visibility <> 'unlisted'
+===================================================================== */
+
+const PUBLIC_VIDEO_WHERE = `
+  v.is_published = TRUE
+  AND COALESCE(v.visibility, 'public') <> 'unlisted'
+`;
+
+const PUBLIC_PLAYLIST_WHERE = `
+  p.visibility = 'public'
+`;
+
 /* =========================================================
    PUBLIC LIST
+   GET /api/playlists/public
+   - Returns ONLY published playlists (visibility='public')
+   - Counts ONLY published videos
+   - nonempty defaults to true (hide playlists with 0 published videos)
 ========================================================= */
 router.get("/public", async (req, res) => {
   try {
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 24, 200));
     const nonempty = req.query.nonempty === "0" ? false : true;
+    const search = (req.query.search || "").trim();
+
+    const params = [];
+    let p = 1;
+
+    let where = `WHERE ${PUBLIC_PLAYLIST_WHERE}`;
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (p.title ILIKE $${p} OR p.description ILIKE $${p})`;
+      p++;
+    }
 
     const sql = `
       SELECT
@@ -57,20 +94,27 @@ router.get("/public", async (req, res) => {
         p.thumbnail_url,
         p.visibility,
         p.featured_category_id,
+        cat.name AS featured_category_name,
+        cat.slug AS featured_category_slug,
         p.created_at,
-        COUNT(pv.video_id)::int AS item_count,
-        COUNT(pv.video_id)::int AS video_count
+        COUNT(v.id)::int AS item_count,
+        COUNT(v.id)::int AS video_count
       FROM playlists p
+      LEFT JOIN categories cat ON cat.id = p.featured_category_id
       LEFT JOIN playlist_videos pv ON pv.playlist_id = p.id
-      WHERE
-        (p.visibility IN ('public','unlisted') OR p.featured_category_id IS NOT NULL)
-      GROUP BY p.id
-      ${nonempty ? "HAVING COUNT(pv.video_id) > 0" : ""}
+      LEFT JOIN videos v
+        ON v.id = pv.video_id
+       AND ${PUBLIC_VIDEO_WHERE}
+      ${where}
+      GROUP BY p.id, cat.name, cat.slug
+      ${nonempty ? "HAVING COUNT(v.id) > 0" : ""}
       ORDER BY p.created_at DESC
-      LIMIT $1
+      LIMIT $${p}
     `;
 
-    const { rows } = await db.query(sql, [limit]);
+    params.push(limit);
+
+    const { rows } = await db.query(sql, params);
     res.json({ items: rows });
   } catch (e) {
     console.error("[GET /playlists/public] error:", e);
@@ -80,11 +124,14 @@ router.get("/public", async (req, res) => {
 
 /* =========================================================
    PUBLIC DETAIL
+   GET /api/playlists/public/:idOrSlug
+   - 404 if not published (must be visibility='public')
+   - 404 if it has 0 published videos (keeps public clean)
 ========================================================= */
 router.get("/public/:idOrSlug", async (req, res) => {
   try {
     const { idOrSlug } = req.params;
-    const isId = /^\d+$/.test(idOrSlug);
+    const isId = isDigits(idOrSlug);
 
     const p = await db.query(
       `
@@ -96,16 +143,33 @@ router.get("/public/:idOrSlug", async (req, res) => {
         p.thumbnail_url,
         p.visibility,
         p.featured_category_id,
-        p.created_at
+        cat.name AS featured_category_name,
+        cat.slug AS featured_category_slug,
+        p.created_at,
+        (
+          SELECT COUNT(*)::int
+          FROM playlist_videos pv2
+          JOIN videos v2 ON v2.id = pv2.video_id
+          WHERE pv2.playlist_id = p.id
+            AND ${PUBLIC_VIDEO_WHERE.replace(/v\./g, "v2.")}
+        ) AS video_count
       FROM playlists p
+      LEFT JOIN categories cat ON cat.id = p.featured_category_id
       WHERE ${isId ? "p.id = $1" : "p.slug = $1"}
-        AND (p.visibility IN ('public','unlisted') OR p.featured_category_id IS NOT NULL)
-      LIMIT 1`,
-      [idOrSlug]
+        AND ${PUBLIC_PLAYLIST_WHERE}
+      LIMIT 1
+      `,
+      [idOrSlug],
     );
 
-    if (p.rowCount === 0) return res.status(404).json({ message: "Not found" });
+    if (!p.rowCount) return res.status(404).json({ message: "Not found" });
+
     const playlist = p.rows[0];
+
+    // Keep direct links clean too (no empty "published" playlists)
+    if (!(Number(playlist.video_count || 0) > 0)) {
+      return res.status(404).json({ message: "Not found" });
+    }
 
     const vids = await db.query(
       `
@@ -114,9 +178,10 @@ router.get("/public/:idOrSlug", async (req, res) => {
       JOIN videos v ON v.id = pv.video_id
       LEFT JOIN categories c ON c.id = v.category_id
       WHERE pv.playlist_id = $1
-        AND v.is_published = TRUE
-      ORDER BY pv.sort_index ASC NULLS LAST, pv.added_at ASC NULLS LAST`,
-      [playlist.id]
+        AND ${PUBLIC_VIDEO_WHERE}
+      ORDER BY pv.sort_index ASC NULLS LAST, pv.added_at ASC NULLS LAST
+      `,
+      [playlist.id],
     );
 
     res.json({ ...playlist, videos: vids.rows });
@@ -160,7 +225,8 @@ async function createPlaylist(req, res) {
       `
       INSERT INTO playlists (title, slug, description, thumbnail_url, visibility, featured_category_id, created_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *`,
+      RETURNING *
+      `,
       [
         title,
         finalSlug,
@@ -169,7 +235,7 @@ async function createPlaylist(req, res) {
         visibility,
         featured_category_id ?? null,
         req.user?.id || null,
-      ]
+      ],
     );
 
     res.json(rows[0]);
@@ -183,7 +249,7 @@ router.post("/create", authenticate, createPlaylist);
 router.post("/", authenticate, createPlaylist);
 
 /* =========================================================
-   ✔ FIXED ORDER — special routes MUST COME BEFORE /:idOrSlug
+   SPECIAL ROUTES MUST COME BEFORE /:idOrSlug (AUTH)
 ========================================================= */
 
 // GET /api/playlists/me
@@ -219,11 +285,7 @@ router.get("/me", authenticate, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ MISSING ENDPOINT #1
-   GET /api/playlists/my
-   Alias of /me (your frontend expects /my)
-========================================================= */
+// GET /api/playlists/my (alias)
 router.get("/my", authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -256,12 +318,7 @@ router.get("/my", authenticate, async (req, res) => {
   }
 });
 
-/* =========================================================
-   ✅ MISSING ENDPOINT #2
-   GET /api/playlists/by-video/:videoId
-   Returns ONLY the current user's playlist memberships
-   so checkboxes reflect real membership.
-========================================================= */
+// GET /api/playlists/by-video/:videoId (scoped to current user)
 router.get("/by-video/:videoId", authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -280,7 +337,7 @@ router.get("/by-video/:videoId", authenticate, async (req, res) => {
       WHERE p.created_by = $1
         AND pv.video_id = $2
       `,
-      [userId, vId]
+      [userId, vId],
     );
 
     res.json({
@@ -291,6 +348,45 @@ router.get("/by-video/:videoId", authenticate, async (req, res) => {
   } catch (e) {
     console.error("[GET /playlists/by-video/:videoId] error:", e);
     res.status(500).json({ message: "Failed to load video membership" });
+  }
+});
+
+/* =========================================================
+   VIDEO MEMBERSHIP HELPERS (back-compat)
+   NOTE: These return ALL playlists containing a video (not scoped).
+   IMPORTANT: Must be BEFORE /:idOrSlug
+========================================================= */
+router.get("/for-video/:videoId", authenticate, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const r = await db.query(
+      `SELECT pv.playlist_id AS id
+       FROM playlist_videos pv
+       JOIN playlists p ON p.id = pv.playlist_id
+       WHERE pv.video_id = $1`,
+      [videoId],
+    );
+    res.json({ items: r.rows.map((x) => x.id) });
+  } catch (e) {
+    console.error("[GET /playlists/for-video/:videoId] error:", e);
+    res.status(500).json({ message: "Failed to load video membership" });
+  }
+});
+
+router.get("/videos/:videoId", authenticate, async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const r = await db.query(
+      `SELECT pv.playlist_id AS id
+       FROM playlist_videos pv
+       JOIN playlists p ON p.id = pv.playlist_id
+       WHERE pv.video_id = $1`,
+      [videoId],
+    );
+    res.json({ playlist_ids: r.rows.map((x) => String(x.id)) });
+  } catch (e) {
+    console.error("[GET /playlists/videos/:videoId] error:", e);
+    res.status(500).json({ message: "Failed to fetch video playlists" });
   }
 });
 
@@ -338,7 +434,8 @@ router.get("/", authenticate, async (req, res) => {
       ${sqlWhere}
       GROUP BY p.id
       ORDER BY p.created_at DESC
-      LIMIT 200`;
+      LIMIT 200
+    `;
 
     const { rows } = await db.query(sql, params);
     res.json({ playlists: rows, items: rows });
@@ -349,16 +446,16 @@ router.get("/", authenticate, async (req, res) => {
 });
 
 /* =========================================================
-   DETAIL — MUST ALWAYS BE LAST (for GET routes)
+   DETAIL (AUTH) — MUST BE AFTER special routes
 ========================================================= */
 router.get("/:idOrSlug", authenticate, async (req, res) => {
   try {
     const { idOrSlug } = req.params;
-    const isId = /^\d+$/.test(idOrSlug);
+    const isId = isDigits(idOrSlug);
 
     const cur = await db.query(
       `SELECT * FROM playlists WHERE ${isId ? "id = $1" : "slug = $1"} LIMIT 1`,
-      [idOrSlug]
+      [idOrSlug],
     );
     if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
 
@@ -378,8 +475,9 @@ router.get("/:idOrSlug", authenticate, async (req, res) => {
       JOIN videos v ON v.id = pv.video_id
       LEFT JOIN categories c ON c.id = v.category_id
       WHERE pv.playlist_id = $1
-      ORDER BY pv.sort_index ASC NULLS LAST, pv.added_at ASC NULLS LAST`,
-      [playlist.id]
+      ORDER BY pv.sort_index ASC NULLS LAST, pv.added_at ASC NULLS LAST
+      `,
+      [playlist.id],
     );
 
     playlist.video_count = vids.rowCount || 0;
@@ -417,6 +515,7 @@ router.put("/:id", authenticate, async (req, res) => {
 
     if ("title" in req.body && req.body.title != null)
       push("title", req.body.title);
+
     if ("slug" in req.body) {
       const finalSlug =
         req.body.slug ??
@@ -424,12 +523,16 @@ router.put("/:id", authenticate, async (req, res) => {
         slugify(req.body.title || row.title || "playlist");
       push("slug", finalSlug);
     }
+
     if ("description" in req.body)
       push("description", req.body.description ?? null);
+
     if ("thumbnail_url" in req.body)
       push("thumbnail_url", req.body.thumbnail_url ?? null);
+
     if ("visibility" in req.body)
       push("visibility", req.body.visibility ?? "public");
+
     if ("featured_category_id" in req.body) {
       push("featured_category_id", req.body.featured_category_id ?? null);
     }
@@ -442,7 +545,8 @@ router.put("/:id", authenticate, async (req, res) => {
       UPDATE playlists
       SET ${fields.join(", ")}
       WHERE id = $1
-      RETURNING *`;
+      RETURNING *
+    `;
 
     const r = await db.query(sql, params);
     res.json(r.rows[0]);
@@ -461,7 +565,7 @@ router.delete("/:id", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT created_by FROM playlists WHERE id = $1",
-      [id]
+      [id],
     );
     if (cur.rowCount === 0)
       return res.status(404).json({ message: "Not found" });
@@ -495,7 +599,7 @@ router.post("/:id/videos", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT created_by FROM playlists WHERE id = $1",
-      [id]
+      [id],
     );
     if (cur.rowCount === 0)
       return res.status(404).json({ message: "Not found" });
@@ -509,7 +613,7 @@ router.post("/:id/videos", authenticate, async (req, res) => {
 
     const max = await db.query(
       "SELECT COALESCE(MAX(sort_index), -1) AS m FROM playlist_videos WHERE playlist_id = $1",
-      [id]
+      [id],
     );
 
     const next = (max.rows[0]?.m ?? -1) + 1;
@@ -518,7 +622,7 @@ router.post("/:id/videos", authenticate, async (req, res) => {
       `INSERT INTO playlist_videos (playlist_id, video_id, sort_index, added_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (playlist_id, video_id) DO NOTHING`,
-      [id, video_id, next]
+      [id, video_id, next],
     );
 
     res.json({ ok: true, sort_index: next });
@@ -534,7 +638,7 @@ router.delete("/:id/videos/:videoId", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT created_by FROM playlists WHERE id = $1",
-      [id]
+      [id],
     );
     if (cur.rowCount === 0)
       return res.status(404).json({ message: "Not found" });
@@ -548,7 +652,7 @@ router.delete("/:id/videos/:videoId", authenticate, async (req, res) => {
 
     await db.query(
       "DELETE FROM playlist_videos WHERE playlist_id = $1 AND video_id = $2",
-      [id, videoId]
+      [id, videoId],
     );
 
     res.json({ ok: true });
@@ -559,46 +663,10 @@ router.delete("/:id/videos/:videoId", authenticate, async (req, res) => {
 });
 
 /* =========================================================
-   VIDEO MEMBERSHIP HELPERS (kept for backward compatibility)
-   NOTE: These return ALL playlists containing a video (not scoped).
-   Your VideoView should use /by-video/:videoId for checkbox membership.
-========================================================= */
-router.get("/for-video/:videoId", authenticate, async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const r = await db.query(
-      `SELECT pv.playlist_id AS id
-       FROM playlist_videos pv
-       JOIN playlists p ON p.id = pv.playlist_id
-       WHERE pv.video_id = $1`,
-      [videoId]
-    );
-    res.json({ items: r.rows.map((x) => x.id) });
-  } catch (e) {
-    console.error("[GET /playlists/for-video/:videoId]", e);
-    res.status(500).json({ message: "Failed to load video membership" });
-  }
-});
-
-router.get("/videos/:videoId", authenticate, async (req, res) => {
-  try {
-    const { videoId } = req.params;
-    const r = await db.query(
-      `SELECT pv.playlist_id AS id
-         FROM playlist_videos pv
-         JOIN playlists p ON p.id = pv.playlist_id
-        WHERE pv.video_id = $1`,
-      [videoId]
-    );
-    res.json({ playlist_ids: r.rows.map((x) => String(x.id)) });
-  } catch (e) {
-    console.error("[GET /playlists/videos/:videoId]", e);
-    res.status(500).json({ message: "Failed to fetch video playlists" });
-  }
-});
-
-/* =========================================================
    SHARE / UNSHARE / CASCADE
+   NOTE: Your public endpoints now require visibility='public' ONLY.
+   So "share" still sets public, but "unlisted" should not be used
+   for anything public-facing anymore.
 ========================================================= */
 
 router.post("/:id/share", authenticate, async (req, res) => {
@@ -607,7 +675,7 @@ router.post("/:id/share", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT * FROM playlists WHERE id = $1 LIMIT 1",
-      [id]
+      [id],
     );
     if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
 
@@ -625,7 +693,7 @@ router.post("/:id/share", authenticate, async (req, res) => {
          SET slug=$1, visibility='public', updated_at=NOW()
        WHERE id=$2
        RETURNING *`,
-      [minted, id]
+      [minted, id],
     );
 
     res.json(rows[0]);
@@ -641,7 +709,7 @@ router.post("/:id/unshare", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT * FROM playlists WHERE id = $1 LIMIT 1",
-      [id]
+      [id],
     );
     if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
 
@@ -656,7 +724,7 @@ router.post("/:id/unshare", authenticate, async (req, res) => {
          SET slug=NULL, visibility='private', updated_at=NOW()
        WHERE id=$1
        RETURNING *`,
-      [id]
+      [id],
     );
 
     res.json(rows[0]);
@@ -676,7 +744,7 @@ router.post("/:id/share-cascade", authenticate, async (req, res) => {
 
     const cur = await client.query(
       "SELECT * FROM playlists WHERE id = $1 LIMIT 1",
-      [id]
+      [id],
     );
     if (!cur.rowCount) {
       client.release();
@@ -701,14 +769,14 @@ router.post("/:id/share-cascade", authenticate, async (req, res) => {
          SET slug=$1, visibility='public', updated_at=NOW()
        WHERE id=$2
        RETURNING *`,
-      [minted, id]
+      [minted, id],
     );
 
     const updatedPlaylist = pRes.rows[0];
 
     const vids = await client.query(
       `SELECT pv.video_id FROM playlist_videos pv WHERE pv.playlist_id = $1`,
-      [id]
+      [id],
     );
 
     const videoIds = vids.rows.map((r) => r.video_id);
@@ -720,7 +788,7 @@ router.post("/:id/share-cascade", authenticate, async (req, res) => {
                 published_at = COALESCE(published_at, NOW()),
                 visibility = $1
           WHERE id = ANY($2::int[])`,
-        [VIDEO_VISIBILITY, videoIds]
+        [VIDEO_VISIBILITY, videoIds],
       );
     }
 
@@ -756,10 +824,9 @@ router.put("/:id/reorder", authenticate, async (req, res) => {
   }
 
   try {
-    // confirm playlist exists and user can edit it
     const cur = await db.query(
       "SELECT created_by FROM playlists WHERE id = $1",
-      [playlistId]
+      [playlistId],
     );
 
     if (!cur.rowCount) {
@@ -773,7 +840,6 @@ router.put("/:id/reorder", authenticate, async (req, res) => {
 
     await db.query("BEGIN");
 
-    // update sort_index in playlist_videos
     for (let index = 0; index < videoIds.length; index++) {
       const videoId = videoIds[index];
 
@@ -783,8 +849,8 @@ router.put("/:id/reorder", authenticate, async (req, res) => {
            SET sort_index = $1
          WHERE playlist_id = $2
            AND video_id = $3
-      `,
-        [index, playlistId, videoId]
+        `,
+        [index, playlistId, videoId],
       );
     }
 
@@ -798,7 +864,7 @@ router.put("/:id/reorder", authenticate, async (req, res) => {
   } catch (e) {
     try {
       await db.query("ROLLBACK");
-    } catch (ignore) {}
+    } catch {}
 
     console.error("[PUT /playlists/:id/reorder] error:", e);
     return res.status(500).json({ message: "Failed to reorder playlist" });

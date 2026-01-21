@@ -29,7 +29,7 @@ router.get("/public", async (req, res) => {
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(
       Math.max(parseInt(req.query.limit || "50", 10), 1),
-      200
+      200,
     );
     const offset = (page - 1) * limit;
     const search = (req.query.search || "").trim();
@@ -71,7 +71,7 @@ router.get("/public", async (req, res) => {
       ORDER BY c.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
       `,
-      params
+      params,
     );
 
     const count = await db.query(
@@ -80,7 +80,7 @@ router.get("/public", async (req, res) => {
       FROM collections c
       ${where}
       `,
-      params
+      params,
     );
 
     res.json({
@@ -117,7 +117,7 @@ router.get("/public/:idOrSlug", async (req, res) => {
       WHERE (c.id::text = $1 OR c.slug = $1)
       LIMIT 1
       `,
-      [key]
+      [key],
     );
 
     if (!q.rows[0]) return res.status(404).json({ message: "Not found" });
@@ -144,7 +144,7 @@ router.get("/public/:idOrSlug/videos", async (req, res) => {
 
     const c = await db.query(
       `SELECT id FROM collections WHERE (id::text = $1 OR slug = $1) LIMIT 1`,
-      [key]
+      [key],
     );
     if (!c.rows[0]) return res.status(404).json({ message: "Not found" });
 
@@ -160,7 +160,7 @@ router.get("/public/:idOrSlug/videos", async (req, res) => {
         AND v.visibility <> 'unlisted'
       ORDER BY cv.position ASC, v.created_at DESC
       `,
-      [collectionId]
+      [collectionId],
     );
 
     res.json(rows.rows);
@@ -182,7 +182,7 @@ router.get("/", authenticate, async (req, res) => {
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const limit = Math.min(
       Math.max(parseInt(req.query.limit || "50", 10), 1),
-      200
+      200,
     );
     const offset = (page - 1) * limit;
     const search = (req.query.search || "").trim();
@@ -207,12 +207,12 @@ router.get("/", authenticate, async (req, res) => {
        GROUP BY c.id
        ORDER BY c.created_at DESC
        LIMIT ${limit} OFFSET ${offset}`,
-      params
+      params,
     );
 
     const count = await db.query(
       `SELECT COUNT(*)::int AS total FROM collections ${whereSql}`,
-      params
+      params,
     );
 
     res.json({ items: rows.rows, total: count.rows[0].total, page, limit });
@@ -227,7 +227,7 @@ router.get("/:id", authenticate, async (req, res) => {
   try {
     const q = await db.query(
       `SELECT * FROM collections WHERE id = $1 LIMIT 1`,
-      [req.params.id]
+      [req.params.id],
     );
     if (!q.rows[0]) return res.status(404).json({ message: "Not found" });
     res.json(q.rows[0]);
@@ -246,7 +246,7 @@ router.get("/:id/videos", authenticate, async (req, res) => {
        JOIN videos v ON v.id = cv.video_id
        WHERE cv.collection_id = $1
        ORDER BY cv.position ASC, v.created_at DESC`,
-      [req.params.id]
+      [req.params.id],
     );
     res.json(rows.rows);
   } catch (err) {
@@ -264,7 +264,7 @@ router.post("/", authenticate, async (req, res) => {
     const ins = await db.query(
       `INSERT INTO collections(title, slug, description)
        VALUES ($1, $2, $3) RETURNING *`,
-      [title, slug ? slugify(slug) : slugify(title), description || null]
+      [title, slug ? slugify(slug) : slugify(title), description || null],
     );
     res.json(ins.rows[0]);
   } catch (err) {
@@ -289,7 +289,7 @@ router.put("/:id", authenticate, async (req, res) => {
         slug ? slugify(slug) : null,
         description ?? null,
         req.params.id,
-      ]
+      ],
     );
     if (!q.rows[0]) return res.status(404).json({ message: "Not found" });
     res.json(q.rows[0]);
@@ -304,7 +304,7 @@ router.delete("/:id", authenticate, async (req, res) => {
   try {
     const del = await db.query(
       `DELETE FROM collections WHERE id = $1 RETURNING id`,
-      [req.params.id]
+      [req.params.id],
     );
     if (!del.rows[0]) return res.status(404).json({ message: "Not found" });
     res.json({ message: "Deleted", id: del.rows[0].id });
@@ -324,7 +324,7 @@ router.post("/:id/videos", authenticate, async (req, res) => {
     const cur = await db.query(
       `SELECT COALESCE(MAX(position), 0)+1 AS pos
        FROM collection_videos WHERE collection_id = $1`,
-      [req.params.id]
+      [req.params.id],
     );
     const pos = cur.rows[0].pos || 1;
 
@@ -332,7 +332,7 @@ router.post("/:id/videos", authenticate, async (req, res) => {
       `INSERT INTO collection_videos (collection_id, video_id, position)
        VALUES ($1, $2, $3)
        ON CONFLICT (collection_id, video_id) DO NOTHING`,
-      [req.params.id, video_id, pos]
+      [req.params.id, video_id, pos],
     );
     res.json({ message: "Added", position: pos });
   } catch (err) {
@@ -346,7 +346,7 @@ router.delete("/:id/videos/:video_id", authenticate, async (req, res) => {
   try {
     await db.query(
       `DELETE FROM collection_videos WHERE collection_id = $1 AND video_id = $2`,
-      [req.params.id, req.params.video_id]
+      [req.params.id, req.params.video_id],
     );
     res.json({ message: "Removed" });
   } catch (err) {
@@ -366,7 +366,7 @@ router.put("/:id/reorder", authenticate, async (req, res) => {
       await db.query(
         `UPDATE collection_videos SET position = $1
          WHERE collection_id = $2 AND video_id = $3`,
-        [i + 1, req.params.id, video_ids[i]]
+        [i + 1, req.params.id, video_ids[i]],
       );
     }
     res.json({ message: "Reordered" });
