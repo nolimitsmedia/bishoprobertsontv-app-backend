@@ -8,29 +8,15 @@ const { FileStore } = require("@tus/file-store");
 const router = express.Router();
 
 const tusUploadDir = path.join(__dirname, "..", "tus_uploads");
-if (!fs.existsSync(tusUploadDir)) {
+if (!fs.existsSync(tusUploadDir))
   fs.mkdirSync(tusUploadDir, { recursive: true });
-}
 
-/**
- * Mounted at: /api/uploads/tus  (in server.js)
- * So tus "path" should be "/" relative to this mount.
- */
 const tusServer = new Server({
   path: "/",
   datastore: new FileStore({ directory: tusUploadDir }),
 });
 
-/**
- * ✅ Avoid any wildcard strings like "*" or "/*"
- * Just forward all requests that reach this router.
- */
-router.use((req, res) => {
-  // Fast preflight response
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-
-  // tus-node-server handles the request/response
-  return tusServer.handle(req, res);
-});
+// Important: tus uses its own request handling
+router.all("/*", (req, res) => tusServer.handle(req, res));
 
 module.exports = router;

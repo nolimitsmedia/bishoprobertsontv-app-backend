@@ -11,6 +11,24 @@ const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const db = require("../db");
 
+// ---------------------------------------------------------------------------
+//  Preflight safety (belt + suspenders)
+//  - Browser will send OPTIONS before POST (especially when Authorization header is used)
+//  - We answer 204 fast so OPTIONS never accidentally hits auth/multer
+// ---------------------------------------------------------------------------
+router.options(["/", "/video", "/presign", "/__ping", "/__cors"], (_req, res) =>
+  res.sendStatus(204),
+);
+
+// Optional debug endpoint: confirms what origin is hitting this router
+router.get("/__cors", (req, res) => {
+  res.json({
+    ok: true,
+    origin: req.headers.origin || null,
+    method: req.method,
+  });
+});
+
 // --- Auth: allow both user and admin to upload -----------------------------
 const authenticate = require("../middleware/authenticate");
 function allowUploadRoles(req, res, next) {
@@ -83,7 +101,7 @@ const BUNNY_STORAGE_HOST =
   process.env.BUNNY_STORAGE_HOST || "storage.bunnycdn.com";
 const BUNNY_CDN_BASE_URL = (process.env.BUNNY_CDN_BASE_URL || "").replace(
   /\/+$/,
-  ""
+  "",
 );
 
 // ---------------------------------------------------------------------------
@@ -138,10 +156,6 @@ function safeKind(k) {
 }
 
 // Category-aware key builder
-// Folder structure:
-//   {PREFIX}/{kind}/{category}/{uid}/base-ts-rand.ext
-// Example:
-//   app/videos/sermons/u_123/my-message-1731612345-abcd12.mp4
 function keyFor(user, kind, originalName, category) {
   const ext = path.extname(originalName || "").toLowerCase();
   const base = slugify(path.basename(originalName || "upload", ext));
@@ -199,7 +213,7 @@ async function insertVideoRow({
       created_by,
       key || null,
       provider,
-    ]
+    ],
   );
   return ins.rows[0] || null;
 }
@@ -217,7 +231,7 @@ async function putToWasabi(localPath, key, contentType) {
       Key: key,
       Body: fs.createReadStream(localPath),
       ContentType: contentType || "application/octet-stream",
-      ACL: "public-read", // remove if you want private objects
+      ACL: "public-read",
     },
     queueSize: 4,
     partSize: 8 * 1024 * 1024,
@@ -249,7 +263,6 @@ async function putToBunny(localPath, key, contentType) {
       "Content-Type": contentType || "application/octet-stream",
     },
     body: stream,
-    // Required for streaming request bodies in Node's fetch
     duplex: "half",
   });
 
@@ -259,7 +272,7 @@ async function putToBunny(localPath, key, contentType) {
       bodyText = await resp.text();
     } catch (_) {}
     throw new Error(
-      `Bunny upload failed: ${resp.status} ${resp.statusText} ${bodyText}`
+      `Bunny upload failed: ${resp.status} ${resp.statusText} ${bodyText}`,
     );
   }
 
@@ -275,7 +288,7 @@ async function handleUpload(req, res) {
   if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
   try {
-    req.socket.setTimeout(0); // prevent timeout on long transfers
+    req.socket.setTimeout(0);
   } catch {}
 
   const localPath = req.file.path;
@@ -307,6 +320,7 @@ async function handleUpload(req, res) {
   if (kind === "videos") {
     const quotaMw = checkQuota("storage_hours_total", () => durationHours);
     let blocked = false;
+
     await new Promise((resolve) => {
       quotaMw(req, res, () => resolve());
       res.once("finish", () => {
@@ -314,11 +328,12 @@ async function handleUpload(req, res) {
         resolve();
       });
     });
+
     if (blocked) {
       try {
         fs.unlinkSync(localPath);
       } catch {}
-      return; // response already sent by checkQuota
+      return;
     }
   }
 
@@ -333,12 +348,10 @@ async function handleUpload(req, res) {
 
       const out = await putToBunny(localPath, key, ContentType);
 
-      // cleanup temp file
       try {
         fs.unlinkSync(localPath);
       } catch {}
 
-      // 4) Record usage (videos only)
       if (kind === "videos" && durationHours > 0 && req.user?.id) {
         await addUsage(req.user.id, "storage_hours_total", durationHours, {
           reason: "upload",
@@ -350,7 +363,6 @@ async function handleUpload(req, res) {
         });
       }
 
-      // 5) Optionally create a videos row
       let createdVideo = null;
       if (kind === "videos" && shouldCreateVideo(req)) {
         createdVideo = await insertVideoRow({
@@ -376,7 +388,7 @@ async function handleUpload(req, res) {
       });
     }
 
-    // Wasabi (legacy path) -----------------------------------------
+    // Wasabi (legacy path)
     if (useWasabi) {
       const key = keyFor(req.user, kind, originalName, category);
       const ContentType =
@@ -386,7 +398,6 @@ async function handleUpload(req, res) {
 
       const out = await putToWasabi(localPath, key, ContentType);
 
-      // cleanup temp file
       try {
         fs.unlinkSync(localPath);
       } catch {}
@@ -427,7 +438,7 @@ async function handleUpload(req, res) {
       });
     }
 
-    // Local mode: already saved to /uploads by Multer ----------------
+    // Local mode: already saved to /uploads by Multer
     const filename = path.basename(localPath);
     const url = `/uploads/${filename}`;
 
@@ -492,14 +503,13 @@ router.post(
   allowUploadRoles,
   attachEntitlements,
 
-  // ✅ Wrap multer to return clean JSON errors (and still keep all functions intact)
+  // Wrap multer to return clean JSON errors
   (req, res, next) => {
     upload.single("file")(req, res, (err) => {
       if (!err) return next();
 
       if (err instanceof multer.MulterError) {
         if (err.code === "LIMIT_FILE_SIZE") {
-          // This would only happen if UPLOAD_MAX_BYTES is set > 0
           return res.status(413).json({
             message: "File too large",
             detail:
@@ -521,7 +531,7 @@ router.post(
     });
   },
 
-  handleUpload
+  handleUpload,
 );
 
 // --------- OPTIONAL: presign (Wasabi only; Bunny not supported) ------------
@@ -548,7 +558,7 @@ router.post("/presign", authenticate, allowUploadRoles, async (req, res) => {
     ContentType: contentType,
     ACL: "public-read",
   });
-  const url = await getSignedUrl(s3, cmd, { expiresIn: 60 * 10 }); // 10 min
+  const url = await getSignedUrl(s3, cmd, { expiresIn: 60 * 10 });
   const publicUrl = `${WASABI_PUBLIC_BASE}/${WASABI_BUCKET}/${key}`;
   res.json({ url, key, publicUrl, kind });
 });
@@ -562,9 +572,8 @@ router.get("/__ping", (_req, res) =>
     FORCE_LOCAL,
     prefix: PREFIX,
     bunnyCdnBase: BUNNY_CDN_BASE_URL || null,
-    // helpful debug: shows if you accidentally set a cap
     uploadMaxBytes: MAX_BYTES > 0 ? MAX_BYTES : null,
-  })
+  }),
 );
 
 module.exports = router;

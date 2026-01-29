@@ -50,8 +50,8 @@ const adminResourcesRoutes = require("./routes/adminResources");
 const adminOrganizeRoutes = require("./routes/adminOrganize");
 
 const facebookRoutes = require("./routes/facebook");
-
 const integrationsRoutes = require("./routes/integrations");
+const bunnyDirectRoutes = require("./routes/bunnyDirect");
 
 // ✅ TUS (optional) – if file doesn't exist yet, don’t crash the server
 let tusRouter = null;
@@ -102,11 +102,14 @@ const server = http.createServer(app);
 
 /* --------------------------------------------------------
    CORS — GitHub Pages + Render + Localhost
+   FIXES:
+   - Allow x-access-token (and other custom headers)
+   - Proper OPTIONS handling without path-to-regexp crashes
 --------------------------------------------------------- */
 
 const baseOrigins = (
   process.env.CLIENT_ORIGIN ||
-  "http://localhost:5001,https://nolimitsmedia.github.io,https://nolimitsmedia.github.io/bishoprobertsontv-app"
+  "http://localhost:5001,https://nolimitsmedia.github.io"
 )
   .split(",")
   .map((s) => s.trim())
@@ -120,28 +123,65 @@ const extraOrigins = [
   "https://bishoprobertsontv-app.onrender.com",
 ].filter(Boolean);
 
+// Normalize (remove trailing slash)
 const configuredOrigins = Array.from(
-  new Set([...baseOrigins, ...extraOrigins])
+  new Set(
+    [...baseOrigins, ...extraOrigins].map((o) => String(o).replace(/\/$/, "")),
+  ),
 );
 
 function isAllowedOrigin(origin) {
   if (!origin) return true; // allow curl/postman/no-origin
-  if (configuredOrigins.includes(origin)) return true;
-  if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return true;
+  const o = String(origin).replace(/\/$/, "");
+  if (configuredOrigins.includes(o)) return true;
+  if (/^https?:\/\/localhost(:\d+)?$/.test(o)) return true;
   return false;
 }
 
 console.log(`[server] CORS allowed origins: ${configuredOrigins.join(", ")}`);
 
+const corsOptions = {
+  origin: (origin, cb) => {
+    const ok = isAllowedOrigin(origin);
+    if (!ok) {
+      console.log(`[CORS BLOCKED] origin=${origin}`);
+      // IMPORTANT: return false (don’t throw), so browser gets a clean response
+      return cb(null, false);
+    }
+    return cb(null, true);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
+  // ✅ MUST include x-access-token (your login preflight was blocked)
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-access-token",
+    "x-direct-upload-token",
+    "x-upload-token",
+    "X-Requested-With",
+  ],
+
+  // Some clients send this; harmless to allow
+  exposedHeaders: ["Content-Length", "Content-Range", "Content-Disposition"],
+
+  optionsSuccessStatus: 204,
+};
+
 app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: (origin, cb) =>
-      isAllowedOrigin(origin) ? cb(null, true) : cb(new Error("Not allowed")),
-    credentials: true,
-  })
-);
+// ✅ Apply CORS once
+app.use(cors(corsOptions));
+
+// ✅ Preflight for any route (NO app.options("*") to avoid path-to-regexp issues)
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    // Ensure CORS headers are present
+    return cors(corsOptions)(req, res, () => res.sendStatus(204));
+  }
+  next();
+});
 
 /* --------------------------------------------------------
    SOCKET.IO CORS
@@ -167,7 +207,7 @@ app.post(
   (req, res) => {
     req.rawBody = req.body;
     return stripeWebhookHandler(req, res);
-  }
+  },
 );
 
 /* --------------------------------------------------------
@@ -195,10 +235,10 @@ app.use(
     setHeaders: (res) => {
       res.setHeader(
         "Cache-Control",
-        "public, max-age=600, stale-while-revalidate=600"
+        "public, max-age=600, stale-while-revalidate=600",
       );
     },
-  })
+  }),
 );
 
 /* --------------------------------------------------------
@@ -236,6 +276,8 @@ app.use("/api", pricingRoutes);
 app.use("/api", checkoutRoutes);
 app.use("/api/demo", demoRoutes);
 
+app.use("/api/uploads/bunny", bunnyDirectRoutes);
+
 // ✅ usage stays prod-only
 if (!IS_LOCAL && usageRoutes) {
   app.use("/api/usage", usageRoutes);
@@ -256,6 +298,7 @@ app.use("/dev", devEmailRoutes);
 app.use("/api/emails", emailsRoutes);
 
 app.use("/api", bunnyStreamRouter);
+
 app.use("/api/channels", channelsRouter);
 
 // ✅ playlists router (admin + public endpoints live here)
@@ -325,7 +368,7 @@ io.on("connection", (socket) => {
         `INSERT INTO live_chat_messages (event_id, user_id, name, message)
          VALUES ($1,$2,$3,$4)
          RETURNING id, created_at`,
-        [eventId, userId || null, name || socket.data.name || "Guest", message]
+        [eventId, userId || null, name || socket.data.name || "Guest", message],
       );
 
       const msg = {
