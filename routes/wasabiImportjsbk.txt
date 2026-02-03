@@ -1,0 +1,246 @@
+// server-api/routes/wasabiImport.js
+const express = require("express");
+const router = express.Router();
+const crypto = require("crypto");
+const { S3Client, ListObjectsV2Command } = require("@aws-sdk/client-s3");
+
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
+}
+
+function normPrefix(p) {
+  if (!p) return "";
+  return p.endsWith("/") ? p : `${p}/`;
+}
+
+function isMp4(key = "") {
+  return key.toLowerCase().endsWith(".mp4");
+}
+function isPng(key = "") {
+  return key.toLowerCase().endsWith(".png");
+}
+
+function basenameNoExt(key = "") {
+  const file = key.split("/").pop() || "";
+  const dot = file.lastIndexOf(".");
+  return dot > 0 ? file.slice(0, dot) : file;
+}
+
+function buildPublicUrl({ endpoint, bucket, key }) {
+  // Wasabi style: https://s3.us-east-1.wasabisys.com/<bucket>/<key>
+  const base = String(endpoint).replace(/\/+$/, "");
+  return `${base}/${bucket}/${encodeURIComponent(key).replace(/%2F/g, "/")}`;
+}
+
+function stableIdFrom(bucket, key) {
+  // Useful if you want deterministic IDs / de-dupe keys
+  return crypto.createHash("sha1").update(`${bucket}:${key}`).digest("hex");
+}
+
+function getS3() {
+  const endpoint = mustEnv("WASABI_ENDPOINT");
+  const region = process.env.WASABI_REGION || "us-east-1";
+
+  return new S3Client({
+    region,
+    endpoint,
+    credentials: {
+      accessKeyId: mustEnv("WASABI_ACCESS_KEY_ID"),
+      secretAccessKey: mustEnv("WASABI_SECRET_ACCESS_KEY"),
+    },
+    forcePathStyle: true, // important for many S3-compatible providers
+  });
+}
+
+/**
+ * GET /api/admin/wasabi/preview?prefix=drm
+ * Shows a quick count & sample keys without writing to DB.
+ */
+router.get("/preview", async (req, res) => {
+  try {
+    const s3 = getS3();
+    const bucket = mustEnv("WASABI_BUCKET");
+    const endpoint = mustEnv("WASABI_ENDPOINT");
+    const prefix = normPrefix(req.query.prefix || "drm");
+
+    let token = undefined;
+    let mp4Count = 0;
+    let pngCount = 0;
+    const sample = [];
+
+    do {
+      const r = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          ContinuationToken: token,
+          MaxKeys: 1000,
+        }),
+      );
+
+      const items = r.Contents || [];
+      for (const it of items) {
+        const key = it.Key || "";
+        if (!key) continue;
+
+        if (isMp4(key)) mp4Count += 1;
+        else if (isPng(key)) pngCount += 1;
+
+        if (sample.length < 25 && (isMp4(key) || isPng(key))) {
+          sample.push({
+            key,
+            size: it.Size || 0,
+            lastModified: it.LastModified || null,
+            url: buildPublicUrl({ endpoint, bucket, key }),
+          });
+        }
+      }
+
+      token = r.IsTruncated ? r.NextContinuationToken : undefined;
+    } while (token);
+
+    return res.json({
+      ok: true,
+      bucket,
+      prefix,
+      counts: { mp4: mp4Count, png: pngCount },
+      sample,
+    });
+  } catch (e) {
+    console.error("[wasabiImport] preview error:", e);
+    return res
+      .status(500)
+      .json({ ok: false, message: e.message || "Server error" });
+  }
+});
+
+/**
+ * POST /api/admin/wasabi/import
+ * Body: { prefix: "drm", dryRun?: boolean }
+ *
+ * Writes videos into DB, idempotent (skips existing by storage_key).
+ */
+router.post("/import", async (req, res) => {
+  try {
+    const db = req.db;
+    const s3 = getS3();
+
+    const bucket = mustEnv("WASABI_BUCKET");
+    const endpoint = mustEnv("WASABI_ENDPOINT");
+    const prefix = normPrefix((req.body && req.body.prefix) || "drm");
+    const dryRun = !!(req.body && req.body.dryRun);
+
+    // 1) List objects
+    let token = undefined;
+    const mp4s = [];
+    const pngs = [];
+
+    do {
+      const r = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          ContinuationToken: token,
+          MaxKeys: 1000,
+        }),
+      );
+
+      for (const it of r.Contents || []) {
+        const key = it.Key || "";
+        if (!key) continue;
+        if (isMp4(key)) mp4s.push({ key, size: it.Size || 0 });
+        else if (isPng(key)) pngs.push({ key, size: it.Size || 0 });
+      }
+
+      token = r.IsTruncated ? r.NextContinuationToken : undefined;
+    } while (token);
+
+    // 2) Build thumbnail map by basename
+    const pngByBase = new Map();
+    for (const p of pngs) {
+      pngByBase.set(basenameNoExt(p.key).toLowerCase(), p.key);
+    }
+
+    // 3) Insert videos (idempotent by storage_key)
+    // IMPORTANT: adapt these column names to YOUR schema.
+    // If you don't have these columns yet, I can generate a migration.
+    const results = {
+      scanned: { mp4: mp4s.length, png: pngs.length },
+      inserted: 0,
+      skipped: 0,
+      examples: [],
+    };
+
+    for (const v of mp4s) {
+      const storageKey = v.key;
+      const base = basenameNoExt(storageKey);
+      const thumbKey = pngByBase.get(base.toLowerCase()) || null;
+
+      const videoUrl = buildPublicUrl({ endpoint, bucket, key: storageKey });
+      const thumbUrl = thumbKey
+        ? buildPublicUrl({ endpoint, bucket, key: thumbKey })
+        : null;
+
+      if (dryRun) {
+        if (results.examples.length < 12) {
+          results.examples.push({
+            title_guess: base,
+            storage_key: storageKey,
+            source_url: videoUrl,
+            thumbnail_url: thumbUrl,
+          });
+        }
+        continue;
+      }
+
+      // Skip if exists
+      const exists = await db.query(
+        `SELECT id FROM videos WHERE storage_provider = 'wasabi' AND storage_key = $1 LIMIT 1`,
+        [storageKey],
+      );
+      if (exists.rowCount > 0) {
+        results.skipped += 1;
+        continue;
+      }
+
+      // Insert
+      const ins = await db.query(
+        `
+        INSERT INTO videos
+          (title, storage_provider, storage_bucket, storage_key, source_url, thumbnail_url, visibility, is_published, created_at, updated_at)
+        VALUES
+          ($1, 'wasabi', $2, $3, $4, $5, 'private', FALSE, now(), now())
+        RETURNING id
+        `,
+        [
+          base, // title
+          bucket, // storage_bucket
+          storageKey, // storage_key
+          videoUrl, // source_url
+          thumbUrl, // thumbnail_url
+        ],
+      );
+
+      results.inserted += 1;
+
+      if (results.examples.length < 12) {
+        results.examples.push({
+          id: ins.rows[0].id,
+          title: base,
+          storage_key: storageKey,
+        });
+      }
+    }
+
+    return res.json({ ok: true, ...results, dryRun });
+  } catch (e) {
+    console.error("[wasabiImport] import error:", e);
+    return res
+      .status(500)
+      .json({ ok: false, message: e.message || "Server error" });
+  }
+});
+
+module.exports = router;

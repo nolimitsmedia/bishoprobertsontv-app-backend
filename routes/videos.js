@@ -62,7 +62,7 @@ function resolveDurationSeconds(body = {}) {
     body.duration_min != null
   ) {
     const m = num(
-      body.duration_minutes ?? body.duration_mins ?? body.duration_min
+      body.duration_minutes ?? body.duration_mins ?? body.duration_min,
     );
     const s = Math.round(m * 60);
     return Number.isFinite(s) && s > 0 ? s : null;
@@ -210,7 +210,7 @@ function mergeJson(a, b) {
 async function assertOwnerOrAdmin(videoId, user) {
   const q = await db.query(
     "SELECT id, created_by FROM videos WHERE id=$1 LIMIT 1",
-    [videoId]
+    [videoId],
   );
   if (q.rowCount === 0) return { ok: false, status: 404 };
   const row = q.rows[0];
@@ -475,7 +475,7 @@ router.get("/public/:id", async (req, res) => {
        WHERE v.id = $1
          AND v.is_published = TRUE
        LIMIT 1`,
-      [id]
+      [id],
     );
 
     if (r.rowCount === 0) {
@@ -555,7 +555,7 @@ router.get("/", authenticate, async (req, res) => {
       FROM videos v
       LEFT JOIN categories c ON c.id = v.category_id
       ${where}
-      ORDER BY v.created_at DESC
+      ORDER BY COALESCE(v.published_at, v.created_at) DESC
       LIMIT $${params.length}
     `;
     const r = await db.query(sql, params);
@@ -591,7 +591,7 @@ router.get("/:id", authenticate, async (req, res) => {
        LEFT JOIN categories c ON c.id = v.category_id
        WHERE v.id = $1
        LIMIT 1`,
-      [id]
+      [id],
     );
 
     if (r.rowCount === 0) return res.status(404).json({ message: "Not found" });
@@ -648,8 +648,8 @@ router.post("/", authenticate, async (req, res) => {
     const published_at = base.published_at
       ? new Date(base.published_at)
       : is_published
-      ? new Date()
-      : null;
+        ? new Date()
+        : null;
 
     // Try to detect duration
     let durationSeconds = resolveDurationSeconds(req.body);
@@ -681,7 +681,7 @@ router.post("/", authenticate, async (req, res) => {
         published_at,
         JSON.stringify(md),
         req.user?.id || null,
-      ]
+      ],
     );
 
     res.json(r.rows[0]);
@@ -712,7 +712,7 @@ router.put("/:id", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT metadata, video_url FROM videos WHERE id=$1 FOR UPDATE",
-      [id]
+      [id],
     );
     if (cur.rowCount === 0) {
       await db.query("ROLLBACK");
@@ -783,7 +783,7 @@ router.put("/:id", authenticate, async (req, res) => {
     vals.push(id);
 
     const sql = `UPDATE videos SET ${sets.join(
-      ", "
+      ", ",
     )} WHERE id = $${i} RETURNING *`;
 
     const r = await db.query(sql, vals);
@@ -821,7 +821,7 @@ router.post("/:id/publish", authenticate, async (req, res) => {
            published_at = COALESCE(published_at, NOW())
        WHERE id = $1
        RETURNING id, title, created_by`,
-      [id]
+      [id],
     );
     if (!rows.length) {
       return res.status(404).json({ message: "Not found" });
@@ -858,12 +858,12 @@ router.post("/:id/publish", authenticate, async (req, res) => {
         WHERE u.id IS NOT NULL
           AND ($5::int IS NULL OR u.id <> $5)
       `,
-        [title, body, videoId, `/watch/${videoId}`, uploaderId]
+        [title, body, videoId, `/watch/${videoId}`, uploaderId],
       );
     } catch (err) {
       console.warn(
         "[notifications] insert on publish failed:",
-        err?.message || err
+        err?.message || err,
       );
     }
 
@@ -876,7 +876,7 @@ router.post("/:id/publish", authenticate, async (req, res) => {
           AND token <> ''
           AND ($1::int IS NULL OR user_id <> $1)
       `,
-        [uploaderId]
+        [uploaderId],
       );
       const tokens = t.rows.map((r) => r.token).filter(Boolean);
 
@@ -915,7 +915,7 @@ router.post("/:id/unpublish", authenticate, async (req, res) => {
        SET is_published = FALSE
        WHERE id = $1
        RETURNING *`,
-      [id]
+      [id],
     );
     if (!rows.length) return res.status(404).json({ message: "Not found" });
     res.json(rows[0]);
@@ -974,7 +974,7 @@ router.get("/:id/status", authenticate, async (req, res) => {
     `SELECT id, processing_status, processing_error, processing_updated_at
      FROM videos
      WHERE id=$1`,
-    [id]
+    [id],
   );
   if (!q.rows[0]) return res.status(404).json({ message: "Not found" });
   res.json(q.rows[0]);

@@ -1,6 +1,6 @@
 // server-api/server.js
 require("dotenv").config();
-
+console.log("[boot] server.js path:", __filename);
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -83,10 +83,14 @@ const emailsRoutes = require("./routes/emails");
 const channelsRouter = require("./routes/channels");
 const playlistsRouter = require("./routes/playlists");
 const communityRoutes = require("./routes/community");
+// const authBridge = require("./middleware/auth-bridge");
 const authBridge = require("./middleware/auth-bridge");
 const bunnyStreamRouter = require("./routes/bunnyStream");
 const pagesRoutes = require("./routes/pages");
 const adminAnalyticsRoutes = require("./routes/adminAnalytics");
+const adminUsersRoutes = require("./routes/adminUsers");
+const adminWasabiImport = require("./routes/adminWasabiImport");
+const adminWasabi = require("./routes/adminWasabi");
 
 const {
   stripeWebhookHandler,
@@ -219,6 +223,7 @@ app.use(express.urlencoded({ extended: true }));
 /**
  * authBridge runs globally (keeps legacy behavior)
  */
+
 app.use(authBridge);
 
 app.use((req, _res, next) => {
@@ -315,6 +320,10 @@ app.use("/api/admin/organize", adminOrganizeRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api", pagesRoutes);
 app.use("/api/admin/analytics", adminAnalyticsRoutes);
+app.use("/api/admin/users", adminUsersRoutes);
+app.use("/api/admin/wasabi", require("./routes/wasabiImport"));
+// app.use("/api/admin/wasabi", adminWasabiImport);
+// app.use("/api/admin/wasabi", adminWasabi);
 
 /**
  * ✅ Compatibility alias for Catalog.js:
