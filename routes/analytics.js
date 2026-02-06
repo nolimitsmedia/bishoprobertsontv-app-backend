@@ -22,7 +22,7 @@ async function getAnalyticsSchema() {
     FROM information_schema.columns
     WHERE table_schema='public'
       AND table_name='analytics_events'
-  `
+  `,
   );
 
   const cols = new Set((r.rows || []).map((x) => x.column_name));
@@ -55,13 +55,13 @@ async function getAnalyticsSchema() {
     posCol: has("position_sec")
       ? "position_sec"
       : has("position_seconds")
-      ? "position_seconds"
-      : null,
+        ? "position_seconds"
+        : null,
     durCol: has("duration_sec")
       ? "duration_sec"
       : has("duration_seconds")
-      ? "duration_seconds"
-      : null,
+        ? "duration_seconds"
+        : null,
 
     hasPage: has("page"),
     hasMeta: has("meta"),
@@ -71,19 +71,19 @@ async function getAnalyticsSchema() {
     schema.hasType && schema.hasEventType
       ? "COALESCE(type, event_type)"
       : schema.hasType
-      ? "type"
-      : schema.hasEventType
-      ? "event_type"
-      : null;
+        ? "type"
+        : schema.hasEventType
+          ? "event_type"
+          : null;
 
   schema.timeExpr =
     schema.hasCreatedAt && schema.hasOccurredAt
       ? "COALESCE(created_at, occurred_at)"
       : schema.hasCreatedAt
-      ? "created_at"
-      : schema.hasOccurredAt
-      ? "occurred_at"
-      : null;
+        ? "created_at"
+        : schema.hasOccurredAt
+          ? "occurred_at"
+          : null;
 
   schema.userExpr =
     schema.hasUserId || schema.hasMemberId || schema.hasAccountId
@@ -96,10 +96,10 @@ async function getAnalyticsSchema() {
     schema.hasVideoId && schema.hasVodId
       ? "COALESCE(video_id, vod_id)"
       : schema.hasVideoId
-      ? "video_id"
-      : schema.hasVodId
-      ? "vod_id"
-      : null;
+        ? "video_id"
+        : schema.hasVodId
+          ? "vod_id"
+          : null;
 
   __analyticsSchema = schema;
   return schema;
@@ -208,8 +208,8 @@ router.post("/event", requireAuth, async (req, res) => {
       video_id == null || video_id === ""
         ? null
         : Number.isFinite(Number(video_id))
-        ? Number(video_id)
-        : String(video_id);
+          ? Number(video_id)
+          : String(video_id);
 
     if (s.hasVideoId) {
       cols.push("video_id");
@@ -264,7 +264,7 @@ router.post("/event", requireAuth, async (req, res) => {
     await db.query(
       `INSERT INTO analytics_events (${cols.join(", ")})
        VALUES (${vals.join(", ")})`,
-      params
+      params,
     );
 
     res.json({ ok: true });
@@ -280,7 +280,7 @@ router.get("/summary", requireAuth, async (req, res) => {
     const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
     const pingSeconds = Math.max(
       5,
-      Math.min(60, Number(req.query.ping_seconds || 15))
+      Math.min(60, Number(req.query.ping_seconds || 15)),
     );
 
     // default: dedupe plays (same user + same video + same day counts as 1 play)
@@ -427,7 +427,7 @@ router.get("/summary", requireAuth, async (req, res) => {
         (SELECT row_to_json(totals) FROM totals) AS totals,
         ${topVideosSelect}
       `,
-      [days, pingSeconds]
+      [days, pingSeconds],
     );
 
     const row = r.rows[0] || {};
@@ -441,11 +441,11 @@ router.get("/summary", requireAuth, async (req, res) => {
     };
 
     const watchSecondsFromProgress = Number(
-      totals.watch_seconds_from_progress || 0
+      totals.watch_seconds_from_progress || 0,
     );
 
     const completeDurationSeconds = Number(
-      totals.complete_duration_seconds || 0
+      totals.complete_duration_seconds || 0,
     );
 
     const watchSeconds =
@@ -468,7 +468,7 @@ router.get("/summary", requireAuth, async (req, res) => {
           Number(totals.plays || 0) > 0
             ? Math.round(
                 (Number(totals.completions || 0) / Number(totals.plays || 0)) *
-                  100
+                  100,
               )
             : 0,
         avg_watch_seconds_per_play:
@@ -531,7 +531,7 @@ router.get("/live", requireAuth, async (req, res) => {
         COUNT(*) FILTER (WHERE ${typeExpr}='live_leave')::bigint AS live_leave
       FROM base
       `,
-      [minutes]
+      [minutes],
     );
 
     const row = r.rows[0] || {};
