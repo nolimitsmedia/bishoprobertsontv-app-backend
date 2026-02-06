@@ -262,6 +262,7 @@ app.use("/api/auth/facebook", facebookRoutes);
 
 app.use("/api/auth", authRoutes);
 
+app.use("/api/videos", require("./routes/videoPlaybackUrl"));
 app.use("/api/videos", videosRoutes);
 app.use("/api/categories", categoriesRoutes);
 
@@ -322,6 +323,9 @@ app.use("/api", pagesRoutes);
 app.use("/api/admin/analytics", adminAnalyticsRoutes);
 app.use("/api/admin/users", adminUsersRoutes);
 app.use("/api/admin/wasabi", require("./routes/wasabiImport"));
+// app.use("/api/storage", require("./routes/storage"));
+app.use("/api/admin/storage", require("./routes/storage"));
+app.use("/api/admin/import-jobs", require("./routes/importJobs"));
 // app.use("/api/admin/wasabi", adminWasabiImport);
 // app.use("/api/admin/wasabi", adminWasabi);
 

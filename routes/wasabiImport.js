@@ -2,7 +2,6 @@
 const express = require("express");
 const router = express.Router();
 const axios = require("axios");
-const { Readable, PassThrough } = require("stream");
 
 const {
   S3Client,
@@ -73,6 +72,7 @@ function bunnyEnabled() {
 }
 
 function encodePath(path = "") {
+  // encode each segment so spaces/special chars don't break the URL
   return String(path)
     .split("/")
     .filter(Boolean)
@@ -81,10 +81,10 @@ function encodePath(path = "") {
 }
 
 function bunnyConfig() {
-  const zone = mustEnv("BUNNY_STORAGE_ZONE");
-  const apiKey = mustEnv("BUNNY_STORAGE_API_KEY"); // Storage API key (zone password)
+  const zone = mustEnv("BUNNY_STORAGE_ZONE"); // Storage zone name (username)
+  const apiKey = mustEnv("BUNNY_STORAGE_API_KEY"); // Storage zone password (API)
   const host = mustEnv("BUNNY_STORAGE_HOST"); // e.g. ny.storage.bunnycdn.com
-  const cdnBase = mustEnv("BUNNY_CDN_BASE_URL"); // e.g. https://xxx.b-cdn.net/
+  const cdnBase = mustEnv("BUNNY_CDN_BASE_URL"); // e.g. https://xxx.b-cdn.net
   const basePath = mustEnv("BUNNY_STORAGE_BASE_PATH"); // e.g. bishoprobertsontv/videos/archives/u_33
 
   const cleanBasePath = String(basePath)
@@ -103,55 +103,93 @@ function bunnyConfig() {
   };
 }
 
-async function bunnyHead({ destPath }) {
+/**
+ * Bunny "verify" via GET Range (more reliable than HEAD).
+ * - If AccessKey is valid but file missing: usually 404
+ * - If file exists: 206 (Partial Content) or 200
+ * - If key invalid: 401
+ */
+async function bunnyGetRange({ destPath }) {
   const { apiKey, putBase } = bunnyConfig();
   const url = `${putBase}/${encodePath(destPath)}`;
 
   const r = await axios.request({
-    method: "HEAD",
+    method: "GET",
     url,
-    headers: { AccessKey: apiKey },
+    headers: {
+      AccessKey: apiKey,
+      Range: "bytes=0-0",
+    },
+    responseType: "arraybuffer",
     validateStatus: () => true,
-    timeout: 30000,
+    timeout: 15000,
+    maxRedirects: 0,
   });
 
   return r;
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+/**
+ * Verify Bunny stored the object (with retries).
+ * We consider success if we get 200 or 206.
+ * If we repeatedly get 404, we keep retrying briefly (propagation).
+ * If we get 401, we fail immediately (invalid AccessKey).
+ */
+async function verifyBunnyStored({ destPath, expectedSize = 0 }) {
+  const attempts = 8;
+  const delaysMs = [250, 500, 900, 1300, 1800, 2500, 3200, 4000];
 
-async function bunnyVerifyWithRetry(destPath, attempts = 6) {
   for (let i = 0; i < attempts; i++) {
-    const headResp = await bunnyHead({ destPath });
+    const r = await bunnyGetRange({ destPath });
 
-    if (headResp.status === 200) return headResp;
-
-    // 401 = wrong key; retries won't help
-    if (headResp.status === 401) {
+    if (r.status === 401) {
       throw new Error(
-        `Bunny verify failed (HEAD 401) – invalid BUNNY_STORAGE_API_KEY for ${destPath}`,
+        `Bunny verify failed (401) – Bunny rejected AccessKey for ${destPath}`,
       );
     }
 
-    // allow time for storage propagation / eventual consistency
-    await sleep(800 + i * 600);
+    if (r.status === 200 || r.status === 206) {
+      // Optional size check (best-effort)
+      // For 206, Bunny may send Content-Range like "bytes 0-0/12345"
+      const cr = r.headers?.["content-range"];
+      let totalFromRange = 0;
+      if (cr && typeof cr === "string" && cr.includes("/")) {
+        const total = cr.split("/").pop();
+        totalFromRange = Number(total) || 0;
+      }
+      const contentLen = Number(r.headers?.["content-length"] || 0);
+
+      const totalSize =
+        totalFromRange || (contentLen === 1 ? expectedSize : contentLen) || 0;
+
+      if (expectedSize && totalFromRange && totalFromRange !== expectedSize) {
+        throw new Error(
+          `Bunny size mismatch (expected ${expectedSize}, got ${totalFromRange}) for ${destPath}`,
+        );
+      }
+
+      return { ok: true, size: totalSize };
+    }
+
+    // 404 means not found (might be propagation) — retry a few times
+    if (r.status === 404) {
+      const wait = delaysMs[i] || 1000;
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      continue;
+    }
+
+    // Other statuses are unexpected; fail fast
+    throw new Error(`Bunny verify failed (status ${r.status}) for ${destPath}`);
   }
 
-  const last = await bunnyHead({ destPath });
-  throw new Error(`Bunny verify failed (HEAD ${last.status}) for ${destPath}`);
+  throw new Error(
+    `Bunny verify failed (not found after retries) for ${destPath}`,
+  );
 }
 
 /**
  * Stream-copy: Wasabi -> Bunny Storage
  * Returns: { destPath, cdnUrl, uploadedBytes }
- *
- * Fixes:
- * - Converts AWS/web streams to Node Readable (prevents axios hanging)
- * - Adds progress logging every ~100MB
- * - Adds a long but finite timeout for large uploads (prevents forever-stuck)
- * - Adds verify retry loop
  */
 async function copyWasabiToBunny({ s3, bucket, key }) {
   const { apiKey, cdnBase, basePath, putBase } = bunnyConfig();
@@ -160,63 +198,31 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
   const destPath = `${basePath}/${filename}`;
   const cdnUrl = `${cdnBase}/${destPath}`;
 
-  console.log("[wasabiImport] head wasabi:", key);
-
+  // Read metadata first (size/type)
   const head = await s3.send(
     new HeadObjectCommand({ Bucket: bucket, Key: key }),
   );
   const contentType = head.ContentType || "video/mp4";
   const contentLength = Number(head.ContentLength || 0);
 
-  console.log(
-    "[wasabiImport] getobject wasabi:",
-    key,
-    "contentLength=",
-    contentLength,
-  );
-
   const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  let stream = obj.Body;
+  const stream = obj.Body;
   if (!stream) throw new Error("Wasabi GetObject returned empty Body stream");
 
-  // Ensure Node.js Readable (axios is happiest with Node streams)
-  if (typeof stream.pipe !== "function") {
-    // For web streams
-    stream = Readable.fromWeb(stream);
-  }
-
-  // Tee stream for progress logging (every ~100MB)
-  let uploaded = 0;
-  const tee = new PassThrough();
-  tee.on("data", (chunk) => {
-    uploaded += chunk.length;
-    if (uploaded % (100 * 1024 * 1024) < chunk.length) {
-      console.log(
-        `[wasabiImport] uploading ${filename}: ${Math.round(uploaded / (1024 * 1024))}MB` +
-          (contentLength
-            ? ` / ${Math.round(contentLength / (1024 * 1024))}MB`
-            : ""),
-      );
-    }
-  });
-
-  // Important: pipe AFTER listeners are attached
-  stream.pipe(tee);
-
   const putUrl = `${putBase}/${encodePath(destPath)}`;
-  console.log("[wasabiImport] uploading to bunny:", putUrl);
 
-  const putResp = await axios.put(putUrl, tee, {
+  // Upload stream to Bunny Storage
+  const putResp = await axios.put(putUrl, stream, {
     headers: {
       AccessKey: apiKey,
       "Content-Type": contentType,
       ...(contentLength ? { "Content-Length": contentLength } : {}),
     },
-    // Large transfers can take minutes; don't let it hang forever if the socket stalls.
-    timeout: 2 * 60 * 60 * 1000, // 2 hours
+    timeout: 2 * 60 * 60 * 1000, // 2 hours (prevents infinite hang)
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
     validateStatus: () => true,
+    maxRedirects: 0,
   });
 
   const okCodes = new Set([200, 201, 204]);
@@ -231,28 +237,59 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
     );
   }
 
-  console.log("[wasabiImport] upload finished status:", putResp.status);
-  console.log("[wasabiImport] verifying bunny head:", destPath);
+  // Verify via GET Range (reliable)
+  const v = await verifyBunnyStored({ destPath, expectedSize: contentLength });
 
-  // Verify it exists (retry helps avoid temporary inconsistencies)
-  const headResp = await bunnyVerifyWithRetry(destPath);
-
-  const bunnySize = Number(headResp.headers?.["content-length"] || 0);
-  if (contentLength && bunnySize && bunnySize !== contentLength) {
-    throw new Error(
-      `Bunny size mismatch (wasabi=${contentLength}, bunny=${bunnySize})`,
-    );
-  }
-
-  console.log(
-    "[wasabiImport] verified bunny OK:",
+  return {
     destPath,
-    "size=",
-    bunnySize || contentLength || 0,
-  );
-
-  return { destPath, cdnUrl, uploadedBytes: bunnySize || contentLength || 0 };
+    cdnUrl,
+    uploadedBytes: v.size || contentLength || 0,
+  };
 }
+
+/* =========================================================
+   Health Check
+========================================================= */
+/**
+ * GET /api/admin/wasabi/bunny-health
+ * We verify AccessKey validity by requesting a NON-EXISTENT file.
+ * - Valid AccessKey: usually 404
+ * - Invalid AccessKey: 401
+ */
+router.get("/bunny-health", async (req, res) => {
+  try {
+    const cfg = bunnyConfig();
+    const keyLen = cfg.apiKey.length;
+    const keyPreview = `${cfg.apiKey.slice(0, 4)}...${cfg.apiKey.slice(-4)}`;
+
+    const fake = `${cfg.basePath}/__healthcheck__does_not_exist__.txt`;
+    const r = await bunnyGetRange({ destPath: fake });
+
+    return res.json({
+      ok: true,
+      zone: cfg.zone,
+      host: cfg.host,
+      putBase: cfg.putBase,
+      basePath: cfg.basePath,
+      keyLen,
+      keyPreview,
+      testedPath: fake,
+      testedUrl: `${cfg.putBase}/${encodePath(fake)}`,
+      status: r.status,
+      note:
+        r.status === 401
+          ? "401 = Bunny rejected AccessKey (wrong Storage password/API key)."
+          : r.status === 404
+            ? "404 = AccessKey accepted (file missing as expected). ✅"
+            : `Status ${r.status} = AccessKey accepted, but response differs from expected.`,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      message: e.message || "health check failed",
+    });
+  }
+});
 
 /* =========================================================
    Routes
@@ -260,7 +297,6 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
 
 /**
  * GET /api/admin/wasabi/objects?prefix=drm&type=mp4&limit=50&cursor=...&q=...
- * ✅ This is what your AdminWasabiImport UI calls.
  */
 router.get("/objects", async (req, res) => {
   try {
@@ -271,7 +307,7 @@ router.get("/objects", async (req, res) => {
     const prefix = normPrefix(
       req.query.prefix || process.env.WASABI_IMPORT_PREFIX || "drm",
     );
-    const type = String(req.query.type || "mp4").toLowerCase(); // "mp4" or "png" or "all"
+    const type = String(req.query.type || "mp4").toLowerCase();
     const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
     const q = String(req.query.q || "")
       .trim()
@@ -292,11 +328,9 @@ router.get("/objects", async (req, res) => {
       const key = it.Key || "";
       if (!key) continue;
 
-      // filter by type
       if (type === "mp4" && !isMp4(key)) continue;
       if (type === "png" && !isPng(key)) continue;
 
-      // filter by search q (filename only)
       if (q) {
         const file = (key.split("/").pop() || "").toLowerCase();
         if (!file.includes(q)) continue;
@@ -387,9 +421,8 @@ router.get("/preview", async (req, res) => {
 
 /**
  * POST /api/admin/wasabi/import
- * ✅ Copies each selected MP4 from Wasabi -> Bunny Storage,
- * ✅ verifies Bunny stored it,
- * ✅ then inserts a DB row using Bunny CDN URL.
+ * Copies MP4 from Wasabi -> Bunny Storage,
+ * then inserts DB row using Bunny CDN URL.
  */
 router.post("/import", async (req, res) => {
   let didBegin = false;
@@ -534,54 +567,6 @@ router.post("/import", async (req, res) => {
     return res
       .status(500)
       .json({ ok: false, message: e.message || "Server error" });
-  }
-});
-
-// GET /api/admin/wasabi/bunny-health
-router.get("/bunny-health", async (req, res) => {
-  try {
-    const cfg = bunnyConfig();
-
-    // IMPORTANT: do NOT return the key, just length + a short prefix
-    const keyLen = cfg.apiKey.length;
-    const keyPreview = `${cfg.apiKey.slice(0, 4)}...${cfg.apiKey.slice(-4)}`;
-
-    // Try a HEAD against the base path folder (or root if you prefer)
-    const testPath = cfg.basePath; // e.g. bishoprobertsontv/videos/archives/u_33
-    const url = `${cfg.putBase}/${encodePath(testPath)}/`;
-
-    const r = await axios.request({
-      method: "HEAD",
-      url,
-      headers: { AccessKey: cfg.apiKey },
-      validateStatus: () => true,
-      timeout: 15000,
-    });
-
-    return res.json({
-      ok: true,
-      zone: cfg.zone,
-      host: cfg.host,
-      putBase: cfg.putBase,
-      basePath: cfg.basePath,
-      keyLen,
-      keyPreview,
-      headStatus: r.status,
-      headHeaders: {
-        "content-length": r.headers?.["content-length"],
-        "content-type": r.headers?.["content-type"],
-      },
-      urlTested: url,
-      note:
-        r.status === 401
-          ? "401 means Bunny did not accept AccessKey (wrong key or key not being read correctly)."
-          : "Non-401 means the key is being accepted (404/403 can still be okay if folder doesn't exist).",
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      message: e.message || "health check failed",
-    });
   }
 });
 
