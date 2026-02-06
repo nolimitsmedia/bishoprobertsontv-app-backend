@@ -104,29 +104,61 @@ router.get("/videos", async (req, res) => {
 ========================================================== */
 router.get("/playlists", async (req, res) => {
   try {
-    const limit = Math.min(Number(req.query.limit || 24), 100);
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 24, 200));
+    const search = String(req.query.search || "").trim();
+    const nonempty = req.query.nonempty === "0" ? false : true;
 
-    const sql = `
-      SELECT c.id,
-             c.title,
-             c.slug,
-             c.thumbnail_url,
-             c.created_at,
-             COUNT(cv.video_id) AS video_count,
-             COALESCE(SUM(v.duration_seconds),0)::int AS duration_total
-      FROM collections c
-      LEFT JOIN collection_videos cv ON cv.collection_id = c.id
-      LEFT JOIN videos v ON v.id = cv.video_id
-      WHERE LOWER(COALESCE(c.type,'')) = 'playlist'
-        AND (c.visibility IS NULL OR c.visibility = 'public')
-      GROUP BY c.id
-      ORDER BY c.created_at DESC
-      LIMIT $1
+    const params = [];
+    let idx = 1;
+
+    // Match your rules in playlists.js
+    const PUBLIC_VIDEO_WHERE = `
+      v.is_published = TRUE
+      AND COALESCE(v.visibility, 'public') <> 'unlisted'
     `;
 
-    const r = await db.query(sql, [limit]);
+    let where = `WHERE p.visibility = 'public'`;
 
-    const items = r.rows.map((p) => fixPlaylistUrls(req, p));
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (p.title ILIKE $${idx} OR p.description ILIKE $${idx})`;
+      idx++;
+    }
+
+    params.push(limit);
+
+    const sql = `
+      SELECT
+        p.id,
+        p.title,
+        COALESCE(p.slug, LOWER(REPLACE(p.title, ' ', '-'))) AS slug,
+        p.description,
+        p.thumbnail_url,
+        p.visibility,
+        p.featured_category_id,
+        cat.name AS featured_category_name,
+        cat.slug AS featured_category_slug,
+        p.created_at,
+        COUNT(v.id)::int AS video_count,
+        COUNT(v.id)::int AS item_count,
+        COALESCE(SUM(v.duration_seconds),0)::int AS duration_total
+      FROM playlists p
+      LEFT JOIN categories cat ON cat.id = p.featured_category_id
+      LEFT JOIN playlist_videos pv ON pv.playlist_id = p.id
+      LEFT JOIN videos v
+        ON v.id = pv.video_id
+       AND ${PUBLIC_VIDEO_WHERE}
+      ${where}
+      GROUP BY p.id, cat.name, cat.slug
+      ${nonempty ? "HAVING COUNT(v.id) > 0" : ""}
+      ORDER BY p.created_at DESC
+      LIMIT $${idx}
+    `;
+
+    const r = await db.query(sql, params);
+
+    // Keep URL fixing behavior consistent
+    const items = (r.rows || []).map((p) => fixPlaylistUrls(req, p));
 
     res.json({ items });
   } catch (e) {
