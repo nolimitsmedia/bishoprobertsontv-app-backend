@@ -229,6 +229,52 @@ function isDigits(x) {
   return typeof x === "string" && /^\d+$/.test(x);
 }
 
+/** ✅ Robust date parsing for published_at
+ * Fix: treat "YYYY-MM-DD" as a DATE (local midnight), not as UTC string parsing.
+ * This prevents off-by-one/day drift in some timezones.
+ */
+function parseDateInput(v) {
+  if (v === undefined) return undefined; // not provided
+  if (v === null || v === "") return null;
+
+  // Date object passthrough
+  if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) return "__invalid__";
+    return v;
+  }
+
+  // timestamp (ms)
+  if (typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v))) {
+    const ms = Number(v);
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) return "__invalid__";
+    return d;
+  }
+
+  const s = String(v).trim();
+
+  // ✅ "YYYY-MM-DD" => local midnight (avoid UTC parsing quirks)
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    const yyyy = Number(m[1]);
+    const mm = Number(m[2]);
+    const dd = Number(m[3]);
+
+    if (mm < 1 || mm > 12) return "__invalid__";
+    const dim = new Date(yyyy, mm, 0).getDate();
+    if (dd < 1 || dd > dim) return "__invalid__";
+
+    const d = new Date(yyyy, mm - 1, dd, 0, 0, 0, 0); // local midnight
+    if (Number.isNaN(d.getTime())) return "__invalid__";
+    return d;
+  }
+
+  // ISO / other strings
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return "__invalid__";
+  return d;
+}
+
 /* ---------- SQL helper: safe preview seconds from column OR metadata ---------- */
 const PREVIEW_SECONDS_SQL = `
   GREATEST(0,
@@ -252,7 +298,6 @@ const PREVIEW_SECONDS_SQL = `
  * Bunny Token Auth (V2): token = Base64URL( SHA256_RAW( key + path + expires + queryParamsSorted ) )
  * queryParamsSorted must be "form-encoded style" WITHOUT leading "?" and NOT URL-encoded.
  * We use token_path so HLS segments within folder work too.
- * Docs: https://docs.bunny.net/docs/cdn-token-authentication :contentReference[oaicite:1]{index=1}
  */
 
 const BUNNY_ENABLED =
@@ -284,7 +329,6 @@ function getPathname(u) {
     const url = new URL(u);
     return url.pathname || "/";
   } catch {
-    // if it's already a path
     const s = String(u || "");
     if (!s) return "/";
     return s.startsWith("/") ? s : `/${s}`;
@@ -292,7 +336,6 @@ function getPathname(u) {
 }
 
 function dirnamePath(p) {
-  // "/a/b/c.m3u8" -> "/a/b/"
   const clean = String(p || "/");
   const idx = clean.lastIndexOf("/");
   if (idx <= 0) return "/";
@@ -306,34 +349,23 @@ function bunnySignUrl(inputUrl, { ttlSeconds = 3600, tokenPath = null } = {}) {
   const pathname = getPathname(absolute);
 
   const expires = Math.floor(Date.now() / 1000) + Math.max(30, ttlSeconds);
-
-  // token_path: used so HLS .ts segments under same folder are allowed
   const tp = tokenPath || dirnamePath(pathname);
-
-  // Parameter data must be appended to the hashable base in sorted key order,
-  // excluding token and expires. We only include token_path.
   const paramData = `token_path=${tp}`;
 
   const hashable = `${BUNNY_KEY}${pathname}${expires}${paramData}`;
   const sha = crypto.createHash("sha256").update(hashable).digest();
   const token = base64UrlNoPad(sha);
 
-  // Build signed URL
-  // token_path must be URL-encoded in the final URL query
   const signed = new URL(absolute);
   signed.searchParams.set("token", token);
   signed.searchParams.set("expires", String(expires));
-  signed.searchParams.set("token_path", tp); // URLSearchParams will encode
+  signed.searchParams.set("token_path", tp);
 
   return signed.toString();
 }
 
 /* -------------------- PUBLIC ROUTES -------------------- */
 
-/**
- * PUBLIC CATALOG SECTIONS
- * GET /api/videos/public/catalog
- */
 router.get("/public/catalog", async (req, res) => {
   try {
     const { search, only_free, limit = 200 } = req.query;
@@ -372,17 +404,13 @@ router.get("/public/catalog", async (req, res) => {
     `;
     const r = await db.query(sql, params);
 
-    // group into sections
-    const map = new Map(); // key => { title, items: [] }
+    const map = new Map();
     for (const row of r.rows) {
       const key =
         row.category_name ||
         (row.category_id != null ? String(row.category_id) : "Videos");
       const title = row.category_name || "Videos";
       if (!map.has(key)) map.set(key, { title, items: [] });
-
-      // IMPORTANT: do not expose a usable full signed URL in catalog list
-      // Keep video_url as-is (or null) - player will request /public/:id anyway.
       map.get(key).items.push(row);
     }
 
@@ -395,10 +423,6 @@ router.get("/public/catalog", async (req, res) => {
   }
 });
 
-/**
- * PUBLIC LIST (flat)
- * GET /api/videos/public
- */
 router.get("/public", async (req, res) => {
   try {
     const { search, category_id, only_free, limit = 50 } = req.query;
@@ -440,7 +464,6 @@ router.get("/public", async (req, res) => {
     `;
     const r = await db.query(sql, params);
 
-    // Don't sign here (list view). Player page will call /public/:id.
     res.json({ items: r.rows });
   } catch (e) {
     console.error("[GET /videos/public] error:", e);
@@ -448,14 +471,6 @@ router.get("/public", async (req, res) => {
   }
 });
 
-/**
- * PUBLIC READ (no auth)
- * GET /api/videos/public/:id
- *
- * Option A:
- * - If free_preview_seconds > 0, return a SHORT-LIVED signed URL (good for preview only).
- * - If free_preview_seconds == 0, DO NOT return video_url (force login to watch).
- */
 router.get("/public/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -483,7 +498,6 @@ router.get("/public/:id", async (req, res) => {
     }
 
     const row = { ...r.rows[0] };
-
     const previewSeconds = Number(row.free_preview_seconds || 0);
 
     if (!row.video_url) {
@@ -491,19 +505,15 @@ router.get("/public/:id", async (req, res) => {
       return res.json(row);
     }
 
-    // If preview seconds is 0, require login for any playback.
     if (!(previewSeconds > 0)) {
       row.video_url = null;
       row.requires_login = true;
       return res.json(row);
     }
 
-    // Preview token TTL: just enough to cover preview playback + small buffer.
-    // This prevents a long-lived full URL from leaking publicly.
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
-
     row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: ttl });
-    row.requires_login = true; // still true: preview only
+    row.requires_login = true;
     row.signed_ttl_seconds = ttl;
 
     return res.json(row);
@@ -515,10 +525,6 @@ router.get("/public/:id", async (req, res) => {
 
 /* -------------------- AUTH’D ROUTES -------------------- */
 
-/**
- * AUTH’D LIST
- * GET /api/videos
- */
 router.get("/", authenticate, async (req, res) => {
   try {
     const { search, category_id, status = "all", limit = 50 } = req.query;
@@ -566,12 +572,6 @@ router.get("/", authenticate, async (req, res) => {
   }
 });
 
-/**
- * AUTH’D READ (owner/admin)
- * GET /api/videos/:id
- *
- * Returns a LONGER-LIVED signed URL for full playback.
- */
 router.get("/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
@@ -598,7 +598,6 @@ router.get("/:id", authenticate, async (req, res) => {
 
     const row = { ...r.rows[0] };
 
-    // Full token TTL for authed playback (6 hours)
     if (row.video_url) {
       row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
       row.signed_ttl_seconds = 6 * 3600;
@@ -612,10 +611,6 @@ router.get("/:id", authenticate, async (req, res) => {
   }
 });
 
-/**
- * AUTH’D CREATE
- * POST /api/videos
- */
 router.post("/", authenticate, async (req, res) => {
   try {
     const base = pick(req.body, [
@@ -643,15 +638,21 @@ router.post("/", authenticate, async (req, res) => {
     const is_premium = base.is_premium === undefined ? true : !!base.is_premium;
     const previewSeconds = coerceNonNegInt(base.free_preview_seconds, 0);
 
+    // ✅ FIX: use parseDateInput here too (handles YYYY-MM-DD + ISO safely)
     const is_published =
       base.is_published === undefined ? false : !!base.is_published;
-    const published_at = base.published_at
-      ? new Date(base.published_at)
-      : is_published
-        ? new Date()
-        : null;
 
-    // Try to detect duration
+    let published_at = null;
+    if (base.published_at !== undefined) {
+      const d = parseDateInput(base.published_at);
+      if (d === "__invalid__") {
+        return res.status(400).json({ message: "Invalid published_at" });
+      }
+      published_at = d;
+    } else {
+      published_at = is_published ? new Date() : null;
+    }
+
     let durationSeconds = resolveDurationSeconds(req.body);
     if (durationSeconds == null) {
       durationSeconds = await detectDurationFromUrlMaybeLocal(base.video_url);
@@ -691,10 +692,6 @@ router.post("/", authenticate, async (req, res) => {
   }
 });
 
-/**
- * AUTH’D UPDATE (owner/admin)
- * PUT /api/videos/:id
- */
 router.put("/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
@@ -707,7 +704,6 @@ router.put("/:id", authenticate, async (req, res) => {
       return res.status(perm.status).json({ message: "Forbidden" });
     }
 
-    // Start transaction
     await db.query("BEGIN");
 
     const cur = await db.query(
@@ -756,15 +752,19 @@ router.put("/:id", authenticate, async (req, res) => {
         sets.push(`${k} = $${i++}`);
         vals.push(!!v);
       } else if (k === "published_at") {
+        const d = parseDateInput(v);
+        if (d === "__invalid__") {
+          await db.query("ROLLBACK");
+          return res.status(400).json({ message: "Invalid published_at" });
+        }
         sets.push(`${k} = $${i++}`);
-        vals.push(v ? new Date(v) : null);
+        vals.push(d);
       } else {
         sets.push(`${k} = $${i++}`);
         vals.push(v === undefined ? null : v);
       }
     }
 
-    // duration_seconds: explicit OR auto-detect
     let maybeDur = resolveDurationSeconds(req.body);
     if (maybeDur == null) {
       const newUrl = base.video_url !== undefined ? base.video_url : currentUrl;
@@ -775,11 +775,9 @@ router.put("/:id", authenticate, async (req, res) => {
       vals.push(maybeDur);
     }
 
-    // Metadata JSON
     sets.push(`metadata = $${i++}`);
     vals.push(JSON.stringify(mergedMd));
 
-    // WHERE id=$i
     vals.push(id);
 
     const sql = `UPDATE videos SET ${sets.join(
@@ -799,10 +797,6 @@ router.put("/:id", authenticate, async (req, res) => {
   }
 });
 
-/**
- * AUTH’D PUBLISH
- * POST /api/videos/:id/publish
- */
 router.post("/:id/publish", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
@@ -815,13 +809,32 @@ router.post("/:id/publish", authenticate, async (req, res) => {
       return res.status(perm.status).json({ message: "Forbidden" });
     }
 
+    // ✅ FIX: allow client to pass published_at (optional) so Publish won't overwrite chosen date.
+    // If provided, we validate and persist it. If not provided, keep old behavior.
+    let setPublishedAtSql = "published_at = COALESCE(published_at, NOW())";
+    const vals = [id];
+    const incoming = req.body?.published_at;
+
+    if (incoming !== undefined) {
+      const d = parseDateInput(incoming);
+      if (d === "__invalid__") {
+        return res.status(400).json({ message: "Invalid published_at" });
+      }
+      // if null => clear; else set to provided date/time
+      vals.push(d);
+      setPublishedAtSql = "published_at = COALESCE($2, NOW())";
+      // NOTE: If caller sends a real Date, COALESCE($2, NOW()) becomes that date.
+      // If caller sends null, COALESCE(null, NOW()) becomes now (publish moment).
+      // This keeps "Publish with no date" working naturally while supporting a chosen date.
+    }
+
     const { rows } = await db.query(
       `UPDATE videos
        SET is_published = TRUE,
-           published_at = COALESCE(published_at, NOW())
+           ${setPublishedAtSql}
        WHERE id = $1
        RETURNING id, title, created_by`,
-      [id],
+      vals,
     );
     if (!rows.length) {
       return res.status(404).json({ message: "Not found" });
@@ -898,10 +911,6 @@ router.post("/:id/publish", authenticate, async (req, res) => {
   }
 });
 
-/**
- * AUTH’D UNPUBLISH
- * POST /api/videos/:id/unpublish
- */
 router.post("/:id/unpublish", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
@@ -925,10 +934,6 @@ router.post("/:id/unpublish", authenticate, async (req, res) => {
   }
 });
 
-/**
- * AUTH’D DELETE (owner/admin)
- * DELETE /api/videos/:id
- */
 router.delete("/:id", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
@@ -945,12 +950,9 @@ router.delete("/:id", authenticate, async (req, res) => {
   }
 });
 
-/**
- * GET /api/videos/:id/playlists
- */
 router.get("/:id/playlists", async (req, res, next) => {
   try {
-    const { id } = req.params; // video id
+    const { id } = req.params;
     if (!isDigits(id)) return res.status(400).json({ message: "Invalid id" });
 
     const q = `
@@ -967,7 +969,6 @@ router.get("/:id/playlists", async (req, res, next) => {
   }
 });
 
-// GET /api/videos/:id/status
 router.get("/:id/status", authenticate, async (req, res) => {
   const { id } = req.params;
   const q = await db.query(
