@@ -20,10 +20,55 @@ function mustEnv(name) {
   return v;
 }
 
+/**
+ * Normalizes a prefix/folder (NOT adding trailing slash).
+ * - trims
+ * - removes leading slashes
+ * - collapses multiple slashes
+ * - removes trailing slashes
+ */
 function normPrefix(p) {
   if (!p) return "";
-  const x = String(p).trim().replace(/^\/+/, "");
-  return x.endsWith("/") ? x : `${x}/`;
+  let x = String(p).trim();
+
+  // Remove leading slashes
+  x = x.replace(/^\/+/, "");
+
+  // Collapse multiple slashes
+  x = x.replace(/\/{2,}/g, "/");
+
+  // Remove trailing slashes
+  x = x.replace(/\/+$/, "");
+
+  return x;
+}
+
+/**
+ * Resolve the effective prefix.
+ * Rules:
+ * - Prefer UI prefix (req.query.prefix) if provided (non-empty after trim).
+ * - Otherwise fall back to ENV WASABI_IMPORT_PREFIX.
+ * - Auto-collapse duplicate top folder: "drm/drm" => "drm"
+ * - Return "" to list whole bucket.
+ * - If non-empty, ensure trailing slash for S3 Prefix matching.
+ */
+function resolveWasabiPrefix(uiPrefixRaw) {
+  const ui = normPrefix(uiPrefixRaw);
+  const env = normPrefix(process.env.WASABI_IMPORT_PREFIX || "");
+
+  let finalPrefix = ui || env;
+
+  // Auto-collapse: "x/x" -> "x" (fixes drm/drm confusion)
+  const m = finalPrefix.match(/^([^/]+)\/\1(?:\/|$)/);
+  if (m && m[1]) {
+    finalPrefix = finalPrefix.replace(new RegExp(`^${m[1]}/${m[1]}`), m[1]);
+  }
+
+  finalPrefix = normPrefix(finalPrefix);
+
+  if (!finalPrefix) return "";
+
+  return finalPrefix.endsWith("/") ? finalPrefix : `${finalPrefix}/`;
 }
 
 function isMp4(key = "") {
@@ -72,7 +117,6 @@ function bunnyEnabled() {
 }
 
 function encodePath(path = "") {
-  // encode each segment so spaces/special chars don't break the URL
   return String(path)
     .split("/")
     .filter(Boolean)
@@ -81,11 +125,11 @@ function encodePath(path = "") {
 }
 
 function bunnyConfig() {
-  const zone = mustEnv("BUNNY_STORAGE_ZONE"); // Storage zone name (username)
-  const apiKey = mustEnv("BUNNY_STORAGE_API_KEY"); // Storage zone password (API)
-  const host = mustEnv("BUNNY_STORAGE_HOST"); // e.g. ny.storage.bunnycdn.com
-  const cdnBase = mustEnv("BUNNY_CDN_BASE_URL"); // e.g. https://xxx.b-cdn.net
-  const basePath = mustEnv("BUNNY_STORAGE_BASE_PATH"); // e.g. bishoprobertsontv/videos/archives/u_33
+  const zone = mustEnv("BUNNY_STORAGE_ZONE");
+  const apiKey = mustEnv("BUNNY_STORAGE_API_KEY");
+  const host = mustEnv("BUNNY_STORAGE_HOST");
+  const cdnBase = mustEnv("BUNNY_CDN_BASE_URL");
+  const basePath = mustEnv("BUNNY_STORAGE_BASE_PATH");
 
   const cleanBasePath = String(basePath)
     .replace(/^\/+/, "")
@@ -103,12 +147,6 @@ function bunnyConfig() {
   };
 }
 
-/**
- * Bunny "verify" via GET Range (more reliable than HEAD).
- * - If AccessKey is valid but file missing: usually 404
- * - If file exists: 206 (Partial Content) or 200
- * - If key invalid: 401
- */
 async function bunnyGetRange({ destPath }) {
   const { apiKey, putBase } = bunnyConfig();
   const url = `${putBase}/${encodePath(destPath)}`;
@@ -129,12 +167,6 @@ async function bunnyGetRange({ destPath }) {
   return r;
 }
 
-/**
- * Verify Bunny stored the object (with retries).
- * We consider success if we get 200 or 206.
- * If we repeatedly get 404, we keep retrying briefly (propagation).
- * If we get 401, we fail immediately (invalid AccessKey).
- */
 async function verifyBunnyStored({ destPath, expectedSize = 0 }) {
   const attempts = 8;
   const delaysMs = [250, 500, 900, 1300, 1800, 2500, 3200, 4000];
@@ -149,8 +181,6 @@ async function verifyBunnyStored({ destPath, expectedSize = 0 }) {
     }
 
     if (r.status === 200 || r.status === 206) {
-      // Optional size check (best-effort)
-      // For 206, Bunny may send Content-Range like "bytes 0-0/12345"
       const cr = r.headers?.["content-range"];
       let totalFromRange = 0;
       if (cr && typeof cr === "string" && cr.includes("/")) {
@@ -171,14 +201,12 @@ async function verifyBunnyStored({ destPath, expectedSize = 0 }) {
       return { ok: true, size: totalSize };
     }
 
-    // 404 means not found (might be propagation) — retry a few times
     if (r.status === 404) {
       const wait = delaysMs[i] || 1000;
       await new Promise((resolve) => setTimeout(resolve, wait));
       continue;
     }
 
-    // Other statuses are unexpected; fail fast
     throw new Error(`Bunny verify failed (status ${r.status}) for ${destPath}`);
   }
 
@@ -187,10 +215,6 @@ async function verifyBunnyStored({ destPath, expectedSize = 0 }) {
   );
 }
 
-/**
- * Stream-copy: Wasabi -> Bunny Storage
- * Returns: { destPath, cdnUrl, uploadedBytes }
- */
 async function copyWasabiToBunny({ s3, bucket, key }) {
   const { apiKey, cdnBase, basePath, putBase } = bunnyConfig();
 
@@ -198,7 +222,6 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
   const destPath = `${basePath}/${filename}`;
   const cdnUrl = `${cdnBase}/${destPath}`;
 
-  // Read metadata first (size/type)
   const head = await s3.send(
     new HeadObjectCommand({ Bucket: bucket, Key: key }),
   );
@@ -211,14 +234,13 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
 
   const putUrl = `${putBase}/${encodePath(destPath)}`;
 
-  // Upload stream to Bunny Storage
   const putResp = await axios.put(putUrl, stream, {
     headers: {
       AccessKey: apiKey,
       "Content-Type": contentType,
       ...(contentLength ? { "Content-Length": contentLength } : {}),
     },
-    timeout: 2 * 60 * 60 * 1000, // 2 hours (prevents infinite hang)
+    timeout: 2 * 60 * 60 * 1000,
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
     validateStatus: () => true,
@@ -237,7 +259,6 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
     );
   }
 
-  // Verify via GET Range (reliable)
   const v = await verifyBunnyStored({ destPath, expectedSize: contentLength });
 
   return {
@@ -250,12 +271,6 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
 /* =========================================================
    Health Check
 ========================================================= */
-/**
- * GET /api/admin/wasabi/bunny-health
- * We verify AccessKey validity by requesting a NON-EXISTENT file.
- * - Valid AccessKey: usually 404
- * - Invalid AccessKey: 401
- */
 router.get("/bunny-health", async (req, res) => {
   try {
     const cfg = bunnyConfig();
@@ -304,52 +319,95 @@ router.get("/objects", async (req, res) => {
     const bucket = mustEnv("WASABI_BUCKET");
     const endpoint = mustEnv("WASABI_ENDPOINT");
 
-    const prefix = normPrefix(
-      req.query.prefix || process.env.WASABI_IMPORT_PREFIX || "drm",
-    );
+    const prefix = resolveWasabiPrefix(req.query.prefix);
     const type = String(req.query.type || "mp4").toLowerCase();
+
+    // "limit" is how many MATCHING items we want to return (mp4)
     const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+
     const q = String(req.query.q || "")
       .trim()
       .toLowerCase();
-    const cursor = String(req.query.cursor || "");
+    let token = String(req.query.cursor || "") || undefined;
 
-    const cmd = new ListObjectsV2Command({
-      Bucket: bucket,
-      Prefix: prefix,
-      MaxKeys: limit,
-      ...(cursor ? { ContinuationToken: cursor } : {}),
-    });
-
-    const r = await s3.send(cmd);
     const items = [];
 
-    for (const it of r.Contents || []) {
-      const key = it.Key || "";
-      if (!key) continue;
+    // Safety: avoid scanning forever if bucket is huge and mp4s are rare
+    // 30 pages * 1000 keys = up to 30k keys scanned worst-case
+    const MAX_PAGES = 30;
 
-      if (type === "mp4" && !isMp4(key)) continue;
-      if (type === "png" && !isPng(key)) continue;
+    // We'll fetch in larger chunks to reduce round trips
+    const PAGE_SIZE = 1000;
 
-      if (q) {
-        const file = (key.split("/").pop() || "").toLowerCase();
-        if (!file.includes(q)) continue;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const r = await s3.send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          MaxKeys: PAGE_SIZE,
+          ...(token ? { ContinuationToken: token } : {}),
+        }),
+      );
+
+      for (const it of r.Contents || []) {
+        const key = it.Key || "";
+        if (!key) continue;
+
+        // type filter
+        if (type === "mp4" && !isMp4(key)) continue;
+        if (type === "png" && !isPng(key)) continue;
+
+        // search filter
+        if (q) {
+          const file = (key.split("/").pop() || "").toLowerCase();
+          if (!file.includes(q)) continue;
+        }
+
+        items.push({
+          key,
+          size: it.Size || 0,
+          lastModified: it.LastModified || null,
+          url: buildWasabiUrl({ endpoint, bucket, key }),
+        });
+
+        if (items.length >= limit) break;
       }
 
-      items.push({
-        key,
-        size: it.Size || 0,
-        lastModified: it.LastModified || null,
-        url: buildWasabiUrl({ endpoint, bucket, key }),
-      });
+      // If we have enough matching items, return now,
+      // and set next_cursor to continue from the current token (if any).
+      if (items.length >= limit) {
+        return res.json({
+          ok: true,
+          bucket,
+          prefix,
+          items,
+          next_cursor: r.IsTruncated ? r.NextContinuationToken : null,
+        });
+      }
+
+      // No more results in bucket
+      if (!r.IsTruncated) {
+        return res.json({
+          ok: true,
+          bucket,
+          prefix,
+          items,
+          next_cursor: null,
+        });
+      }
+
+      // Continue scanning
+      token = r.NextContinuationToken;
     }
 
+    // If we scanned many pages but still didn't hit limit, return what we found.
     return res.json({
       ok: true,
       bucket,
       prefix,
       items,
-      next_cursor: r.IsTruncated ? r.NextContinuationToken : null,
+      next_cursor: token || null,
+      warning: "Reached scan limit while searching for matching files.",
     });
   } catch (e) {
     console.error("[wasabiImport] objects error:", e);
@@ -367,7 +425,9 @@ router.get("/preview", async (req, res) => {
     const s3 = getS3();
     const bucket = mustEnv("WASABI_BUCKET");
     const endpoint = mustEnv("WASABI_ENDPOINT");
-    const prefix = normPrefix(req.query.prefix || "drm");
+
+    // ✅ fixed: use same resolver as /objects
+    const prefix = resolveWasabiPrefix(req.query.prefix);
 
     let token = undefined;
     let mp4Count = 0;
@@ -436,7 +496,7 @@ router.post("/import", async (req, res) => {
       });
     }
 
-    bunnyConfig(); // fail fast if missing env
+    bunnyConfig();
 
     const db = req.db;
     const s3 = getS3();
@@ -505,7 +565,6 @@ router.post("/import", async (req, res) => {
           key,
         });
 
-        // de-dupe by Bunny URL
         const dup = await db.query(
           `SELECT id FROM videos WHERE video_url = $1 LIMIT 1`,
           [cdnUrl],
