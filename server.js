@@ -302,6 +302,7 @@ app.use("/api/devices", devicesRoutes);
 
 app.use("/dev", devEmailRoutes);
 app.use("/api/emails", emailsRoutes);
+app.use("/api/admin/email", require("./routes/adminEmail"));
 
 app.use("/api", bunnyStreamRouter);
 
@@ -414,6 +415,17 @@ app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ ok: false, error: "Server error" });
 });
+
+// ✅ Email worker
+try {
+  const { startEmailWorker } = require("./workers/emailWorker");
+  startEmailWorker(db, {
+    intervalMs: 2500,
+    batchSize: 25,
+  });
+} catch (e) {
+  console.log("[emailWorker] not started:", e.message);
+}
 
 /* --------------------------------------------------------
    START

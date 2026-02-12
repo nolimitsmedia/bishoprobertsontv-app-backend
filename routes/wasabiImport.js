@@ -31,13 +31,8 @@ function normPrefix(p) {
   if (!p) return "";
   let x = String(p).trim();
 
-  // Remove leading slashes
   x = x.replace(/^\/+/, "");
-
-  // Collapse multiple slashes
   x = x.replace(/\/{2,}/g, "/");
-
-  // Remove trailing slashes
   x = x.replace(/\/+$/, "");
 
   return x;
@@ -67,7 +62,6 @@ function resolveWasabiPrefix(uiPrefixRaw) {
   finalPrefix = normPrefix(finalPrefix);
 
   if (!finalPrefix) return "";
-
   return finalPrefix.endsWith("/") ? finalPrefix : `${finalPrefix}/`;
 }
 
@@ -147,6 +141,9 @@ function bunnyConfig() {
   };
 }
 
+/**
+ * Bunny "verify" via GET Range (more reliable than HEAD).
+ */
 async function bunnyGetRange({ destPath }) {
   const { apiKey, putBase } = bunnyConfig();
   const url = `${putBase}/${encodePath(destPath)}`;
@@ -154,10 +151,7 @@ async function bunnyGetRange({ destPath }) {
   const r = await axios.request({
     method: "GET",
     url,
-    headers: {
-      AccessKey: apiKey,
-      Range: "bytes=0-0",
-    },
+    headers: { AccessKey: apiKey, Range: "bytes=0-0" },
     responseType: "arraybuffer",
     validateStatus: () => true,
     timeout: 15000,
@@ -215,6 +209,11 @@ async function verifyBunnyStored({ destPath, expectedSize = 0 }) {
   );
 }
 
+/**
+ * Stream-copy: Wasabi -> Bunny Storage
+ * NOTE: PUT to same destPath overwrites existing Bunny object (replacement behavior).
+ * Returns: { destPath, cdnUrl, uploadedBytes }
+ */
 async function copyWasabiToBunny({ s3, bucket, key }) {
   const { apiKey, cdnBase, basePath, putBase } = bunnyConfig();
 
@@ -265,6 +264,7 @@ async function copyWasabiToBunny({ s3, bucket, key }) {
     destPath,
     cdnUrl,
     uploadedBytes: v.size || contentLength || 0,
+    contentLength,
   };
 }
 
@@ -322,7 +322,7 @@ router.get("/objects", async (req, res) => {
     const prefix = resolveWasabiPrefix(req.query.prefix);
     const type = String(req.query.type || "mp4").toLowerCase();
 
-    // "limit" is how many MATCHING items we want to return (mp4)
+    // "limit" is how many MATCHING items we want to return
     const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
 
     const q = String(req.query.q || "")
@@ -333,10 +333,7 @@ router.get("/objects", async (req, res) => {
     const items = [];
 
     // Safety: avoid scanning forever if bucket is huge and mp4s are rare
-    // 30 pages * 1000 keys = up to 30k keys scanned worst-case
     const MAX_PAGES = 30;
-
-    // We'll fetch in larger chunks to reduce round trips
     const PAGE_SIZE = 1000;
 
     for (let page = 0; page < MAX_PAGES; page++) {
@@ -353,11 +350,9 @@ router.get("/objects", async (req, res) => {
         const key = it.Key || "";
         if (!key) continue;
 
-        // type filter
         if (type === "mp4" && !isMp4(key)) continue;
         if (type === "png" && !isPng(key)) continue;
 
-        // search filter
         if (q) {
           const file = (key.split("/").pop() || "").toLowerCase();
           if (!file.includes(q)) continue;
@@ -373,8 +368,6 @@ router.get("/objects", async (req, res) => {
         if (items.length >= limit) break;
       }
 
-      // If we have enough matching items, return now,
-      // and set next_cursor to continue from the current token (if any).
       if (items.length >= limit) {
         return res.json({
           ok: true,
@@ -385,7 +378,6 @@ router.get("/objects", async (req, res) => {
         });
       }
 
-      // No more results in bucket
       if (!r.IsTruncated) {
         return res.json({
           ok: true,
@@ -396,11 +388,9 @@ router.get("/objects", async (req, res) => {
         });
       }
 
-      // Continue scanning
       token = r.NextContinuationToken;
     }
 
-    // If we scanned many pages but still didn't hit limit, return what we found.
     return res.json({
       ok: true,
       bucket,
@@ -426,7 +416,6 @@ router.get("/preview", async (req, res) => {
     const bucket = mustEnv("WASABI_BUCKET");
     const endpoint = mustEnv("WASABI_ENDPOINT");
 
-    // ✅ fixed: use same resolver as /objects
     const prefix = resolveWasabiPrefix(req.query.prefix);
 
     let token = undefined;
@@ -481,8 +470,14 @@ router.get("/preview", async (req, res) => {
 
 /**
  * POST /api/admin/wasabi/import
- * Copies MP4 from Wasabi -> Bunny Storage,
- * then inserts DB row using Bunny CDN URL.
+ *
+ * Client request: avoid duplicates.
+ * ✅ Supports mode:
+ *   - mode="skip" (default): if already exists, skip + report as skipped duplicate
+ *   - mode="replace": overwrite Bunny object (same path) AND update existing DB row
+ *
+ * Body:
+ *  { keys: [...], visibility, category_id?, default_title_mode?, mode? }
  */
 router.post("/import", async (req, res) => {
   let didBegin = false;
@@ -496,7 +491,7 @@ router.post("/import", async (req, res) => {
       });
     }
 
-    bunnyConfig();
+    bunnyConfig(); // fail fast if missing env
 
     const db = req.db;
     const s3 = getS3();
@@ -516,8 +511,13 @@ router.post("/import", async (req, res) => {
 
     const titleMode = String(body.default_title_mode || "filename_no_ext");
 
-    if (!keys.length)
+    // ✅ NEW: import mode (skip vs replace)
+    const mode = String(body.mode || "skip").toLowerCase();
+    const allowReplace = mode === "replace";
+
+    if (!keys.length) {
       return res.status(400).json({ ok: false, message: "No keys provided." });
+    }
 
     const mp4Keys = keys.filter((k) => isMp4(k));
     if (!mp4Keys.length) {
@@ -529,8 +529,9 @@ router.post("/import", async (req, res) => {
     const results = {
       ok: true,
       dryRun,
+      mode: allowReplace ? "replace" : "skip",
       selected: mp4Keys.length,
-      imported: 0,
+      imported: 0, // counts imports + replacements as "imported" so UI stays simple
       skipped: 0,
       errors: 0,
       details: [],
@@ -544,43 +545,81 @@ router.post("/import", async (req, res) => {
         const filename = safeFilenameFromKey(key);
         const title = titleMode === "filename" ? filename : titleFromKey(key);
 
-        if (dryRun) {
-          const { cdnBase, basePath } = bunnyConfig();
-          const destPath = `${basePath}/${filename}`;
-          const cdnUrl = `${cdnBase}/${destPath}`;
+        // Compute expected Bunny dest/cdn without touching network (useful for dup checks)
+        const cfg = bunnyConfig();
+        const destPath = `${cfg.basePath}/${filename}`;
+        const cdnUrl = `${cfg.cdnBase}/${destPath}`;
 
+        if (dryRun) {
           results.details.push({
             key,
             status: "dryRun",
             title,
             bunny_path: destPath,
             video_url: cdnUrl,
+            wouldReplace: allowReplace,
           });
           continue;
         }
 
-        const { cdnUrl, destPath, uploadedBytes } = await copyWasabiToBunny({
-          s3,
-          bucket,
-          key,
-        });
-
-        const dup = await db.query(
+        // Check existing DB row FIRST (fast), so we can label replace/skips.
+        // We still upload in replace mode (overwrite Bunny).
+        const existing = await db.query(
           `SELECT id FROM videos WHERE video_url = $1 LIMIT 1`,
           [cdnUrl],
         );
-        if (dup.rowCount > 0) {
+
+        if (existing.rowCount > 0 && !allowReplace) {
           results.skipped++;
           results.details.push({
             key,
             status: "skipped",
-            reason: "duplicate",
+            reason: "already_imported",
+            id: existing.rows?.[0]?.id || null,
             video_url: cdnUrl,
             bunny_path: destPath,
           });
           continue;
         }
 
+        // Upload to Bunny (PUT to same path overwrites = replacement behavior)
+        const { uploadedBytes } = await copyWasabiToBunny({
+          s3,
+          bucket,
+          key,
+        });
+
+        if (existing.rowCount > 0 && allowReplace) {
+          // ✅ Replace in DB: update the same row instead of creating a new one
+          const existingId = existing.rows[0].id;
+
+          const upd = await db.query(
+            `
+            UPDATE videos
+            SET
+              title = $1,
+              category_id = COALESCE($2, category_id),
+              visibility = $3,
+              updated_at = now()
+            WHERE id = $4
+            RETURNING id
+          `,
+            [title, category_id, vis, existingId],
+          );
+
+          results.imported++;
+          results.details.push({
+            key,
+            status: "replaced",
+            id: upd.rows?.[0]?.id || existingId,
+            video_url: cdnUrl,
+            bunny_path: destPath,
+            bytes: uploadedBytes,
+          });
+          continue;
+        }
+
+        // Fresh insert
         const ins = await db.query(
           `
           INSERT INTO videos
