@@ -165,6 +165,8 @@ const corsOptions = {
     "x-direct-upload-token",
     "x-upload-token",
     "X-Requested-With",
+    "Cache-Control",
+    "Pragma",
   ],
 
   // Some clients send this; harmless to allow
@@ -270,6 +272,14 @@ app.use("/api/categories", categoriesRoutes);
 app.use("/api/uploads", uploadsRouter);
 app.use("/api/upload", uploadsRouter);
 
+// ✅ Page-builder uploads (/api/uploads/pages)
+// Use Bunny Storage when enabled; otherwise fall back to local /uploads/pages.
+if (String(process.env.USE_BUNNY_STORAGE || "").toLowerCase() === "true") {
+  app.use("/api/uploads", require("./routes/uploadsPagesBunny"));
+} else {
+  app.use("/api/uploads", require("./routes/uploadsPages"));
+}
+
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/collections", collectionsRoutes);
 
@@ -307,6 +317,9 @@ app.use("/api/admin/email", require("./routes/adminEmail"));
 app.use("/api", bunnyStreamRouter);
 
 app.use("/api/channels", channelsRouter);
+
+app.use("/api/pages", require("./routes/pagesPublic"));
+app.use("/api/admin/pages", require("./routes/adminPages"));
 
 // ✅ playlists router (admin + public endpoints live here)
 app.use("/api/playlists", playlistsRouter);

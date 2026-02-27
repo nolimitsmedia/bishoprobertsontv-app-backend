@@ -1,712 +1,720 @@
 // server-api/routes/channels.js
 const express = require("express");
 const router = express.Router();
-const db = require("../db");
-const authenticate = require("../middleware/authenticate");
+const pool = require("../db");
 
-/* --------------------------- tiny utils --------------------------- */
+// Built-in slugify (no dependency)
+const slugify = (s = "") =>
+  String(s)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "")
+    .slice(0, 80) || "page";
 
-const q = (strings, ...values) =>
-  strings.reduce((acc, s, i) => acc + s + (values[i] ?? ""), "");
-
-function slugify(s) {
-  return (
-    String(s || "")
-      .toLowerCase()
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)+/g, "")
-      .slice(0, 80) || "channel"
-  );
-}
-
-async function columnExists(table, column) {
-  const { rows } = await db.query(
-    `SELECT 1
-       FROM information_schema.columns
-      WHERE table_schema='public' AND table_name=$1 AND column_name=$2
-      LIMIT 1`,
-    [table, column]
-  );
-  return rows.length > 0;
-}
-
-async function ownerColName() {
-  if (await columnExists("channels", "owner_user_id")) return "owner_user_id";
-  return "owner_id";
-}
-
-async function ensureChannelOwnerColumns() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS channels (
-      id             SERIAL PRIMARY KEY,
-      owner_user_id  INTEGER,
-      owner_id       INTEGER,
-      title          TEXT NOT NULL DEFAULT '',
-      slug           TEXT NOT NULL,
-      about          TEXT,
-      theme_color    TEXT,
-      text_color     TEXT,
-      hero_image_url TEXT,
-      avatar_url     TEXT,
-      website        TEXT,
-      youtube        TEXT,
-      facebook       TEXT,
-      twitter        TEXT,
-      instagram      TEXT,
-      tiktok         TEXT,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await db.query(
-    `ALTER TABLE channels ADD COLUMN IF NOT EXISTS owner_user_id INTEGER`
-  );
-  await db.query(
-    `ALTER TABLE channels ADD COLUMN IF NOT EXISTS owner_id INTEGER`
-  );
-
-  await db.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE schemaname='public' AND indexname='channels_slug_lower_uniq'
-      ) THEN
-        CREATE UNIQUE INDEX channels_slug_lower_uniq ON channels ((LOWER(slug)));
-      END IF;
-    END$$;
-  `);
-
-  await db.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (SELECT 1 FROM information_schema.columns
-                 WHERE table_schema='public' AND table_name='channels' AND column_name='owner_user_id') THEN
-        UPDATE channels SET owner_user_id = owner_id WHERE owner_user_id IS NULL AND owner_id IS NOT NULL;
-
-        IF EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_schema='public' AND table_name='channels' AND column_name='created_by') THEN
-          UPDATE channels SET owner_user_id = created_by WHERE owner_user_id IS NULL AND created_by IS NOT NULL;
-        END IF;
-
-        IF EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_schema='public' AND table_name='channels' AND column_name='user_id') THEN
-          UPDATE channels SET owner_user_id = user_id WHERE owner_user_id IS NULL AND user_id IS NOT NULL;
-        END IF;
-      END IF;
-    END$$;
-  `);
-
-  await db.query(`
-    UPDATE channels SET owner_id = owner_user_id
-     WHERE owner_id IS NULL AND owner_user_id IS NOT NULL;
-  `);
-}
-
-async function ensureChannelPagesTables() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS channel_pages (
-      id           SERIAL PRIMARY KEY,
-      channel_id   INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-      page_slug    TEXT NOT NULL,
-      title        TEXT NOT NULL DEFAULT '',
-      blocks       JSONB NOT NULL DEFAULT '[]'::jsonb,
-      is_home      BOOLEAN NOT NULL DEFAULT false,
-      sort_order   INTEGER NOT NULL DEFAULT 0,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await db.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='channel_pages'
-          AND column_name='blocks' AND data_type <> 'jsonb'
-      ) THEN
-        ALTER TABLE channel_pages
-          ALTER COLUMN blocks TYPE JSONB USING
-          CASE
-            WHEN blocks IS NULL THEN '[]'::jsonb
-            WHEN pg_typeof(blocks)::text = 'jsonb' THEN blocks
-            ELSE COALESCE(blocks::jsonb, '[]'::jsonb)
-          END;
-      END IF;
-    END$$;
-  `);
-
-  await db.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE schemaname='public' AND indexname='channel_pages_slug_unique'
-      ) THEN
-        CREATE UNIQUE INDEX channel_pages_slug_unique
-          ON channel_pages (channel_id, (LOWER(page_slug)));
-      END IF;
-    END$$;
-  `);
-}
-
-async function ensureTables() {
-  await ensureChannelOwnerColumns();
-  await ensureChannelPagesTables();
-}
-
-async function uniqueSlug(base) {
-  const b = slugify(base);
-  let candidate = b;
-  let n = 2;
-  while (true) {
-    const { rows } = await db.query(
-      `SELECT 1 FROM channels WHERE LOWER(slug)=LOWER($1) LIMIT 1`,
-      [candidate]
-    );
-    if (rows.length === 0) return candidate;
-    candidate = `${b}-${n++}`;
+// Require user for owner endpoints (authBridge puts req.user)
+function requireUser(req, res, next) {
+  if (!req.user || !req.user.id) {
+    return res.status(401).json({ ok: false, error: "auth_required" });
   }
+  next();
 }
 
-function pick(obj, keys) {
-  const out = {};
-  for (const k of keys) if (obj[k] !== undefined) out[k] = obj[k];
-  return out;
-}
+/* ------------------------------- helpers ------------------------------- */
 
-/* --------------------------- Studio: channel CRUD --------------------------- */
+const isIntLike = (v) =>
+  typeof v === "string" && /^\d+$/.test((v || "").trim());
 
-// GET /api/channels/me
-router.get("/me", authenticate, async (req, res) => {
-  try {
-    await ensureTables();
-    const ownerCol = await ownerColName();
-    const { rows } = await db.query(
-      q`SELECT * FROM channels WHERE ${ownerCol} = $1 LIMIT 1`,
-      [req.user.id]
+async function getChannelByKey(client, keyRaw) {
+  const key = String(keyRaw || "").trim();
+  if (!key) return null;
+
+  // case-insensitive slug
+  {
+    const { rows } = await client.query(
+      `SELECT * FROM channels WHERE lower(slug) = lower($1) LIMIT 1`,
+      [key]
     );
-    if (!rows[0]) return res.status(404).json({ message: "Not found" });
-    res.json(rows[0]);
+    if (rows[0]) return rows[0];
+  }
+
+  if (isIntLike(key)) {
+    const { rows } = await client.query(
+      `SELECT * FROM channels WHERE id = $1 LIMIT 1`,
+      [Number(key)]
+    );
+    if (rows[0]) return rows[0];
+  }
+  return null;
+}
+
+// Convert whatever is stored into a V2 document shape
+function normalizeBlocks(input) {
+  // already V2?
+  if (input && typeof input === "object" && input.version === 2) return input;
+
+  // builder saves { blocks: [...] }
+  const arr =
+    (input && Array.isArray(input.blocks) && input.blocks) ||
+    (Array.isArray(input) ? input : null);
+
+  if (arr) return { version: 2, root: arr };
+  return null; // nothing published/draft
+}
+
+function pagePublicFields(row) {
+  return {
+    id: row.id,
+    channel_id: row.channel_id,
+    slug: row.slug || row.page_slug,
+    title: row.title,
+    kind: row.kind,
+    nav_order: row.nav_order,
+    sort_order: row.sort_order,
+    is_visible: row.is_visible,
+    is_home: row.is_home,
+    is_published: row.is_published,
+  };
+}
+
+async function getChannelPages(client, channelId) {
+  const q = `
+    SELECT id, channel_id, slug, page_slug, title, kind,
+           nav_order, sort_order, is_visible, is_home, is_published,
+           blocks,
+           content_draft,
+           content_published,
+           meta,
+           published_html,
+           created_at, updated_at, published_at
+      FROM channel_pages
+     WHERE channel_id = $1
+  ORDER BY COALESCE(nav_order, sort_order, 0), id
+  `;
+  const { rows } = await client.query(q, [channelId]);
+  return rows;
+}
+
+/* ----------------------------- PUBLIC API ------------------------------ */
+
+/**
+ * Aggregated: /api/channels/p/:key
+ * { ok, channel, pages: [{...minimal, blocks: {version:2, root:[...]}}] }
+ */
+router.get("/p/:key", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ch = await getChannelByKey(client, req.params.key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const rows = await getChannelPages(client, ch.id);
+
+    const pages = rows.map((r) => {
+      // Prefer published; fall back to legacy/draft
+      const doc =
+        normalizeBlocks(r.content_published) ||
+        normalizeBlocks(r.blocks) ||
+        normalizeBlocks(r.content_draft) ||
+        null;
+
+      return { ...pagePublicFields(r), blocks: doc };
+    });
+
+    res.json({ ok: true, channel: ch, pages });
   } catch (e) {
-    console.error("[GET /channels/me] error:", e);
-    res.status(500).json({ message: "Failed to load channel" });
+    console.error("[channels] GET /p/:key error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-// POST /api/channels/me/ensure
-router.post("/me/ensure", authenticate, async (req, res) => {
+/**
+ * Public: /api/channels/public/:key
+ * { ok, channel }
+ */
+router.get("/public/:key", async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
-
-    const ownerCol = await ownerColName();
-    const existing = await db.query(
-      q`SELECT * FROM channels WHERE ${ownerCol}=$1 LIMIT 1`,
-      [req.user.id]
-    );
-    if (existing.rows[0]) return res.json(existing.rows[0]);
-
-    const base =
-      req.body?.slug ||
-      req.body?.title ||
-      req.user?.name ||
-      (req.user?.email ? req.user.email.split("@")[0] : "channel");
-    const slug = await uniqueSlug(base);
-    const title =
-      req.body?.title ||
-      (req.user?.name ? `${req.user.name}'s Channel` : "My Channel");
-
-    const hasOwnerUserId = await columnExists("channels", "owner_user_id");
-    const hasOwnerId = await columnExists("channels", "owner_id");
-    const hasVisibility = await columnExists("channels", "visibility");
-
-    const cols = [];
-    const vals = [];
-
-    if (hasOwnerUserId) {
-      cols.push("owner_user_id");
-      vals.push(req.user.id);
-    }
-    if (hasOwnerId) {
-      cols.push("owner_id");
-      vals.push(req.user.id);
-    }
-
-    cols.push(
-      "title",
-      "slug",
-      "about",
-      "theme_color",
-      "text_color",
-      "hero_image_url",
-      "avatar_url",
-      "website",
-      "youtube",
-      "facebook",
-      "twitter",
-      "instagram",
-      "tiktok"
-    );
-    vals.push(
-      title,
-      slug,
-      "",
-      "",
-      "",
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    );
-
-    if (hasVisibility) {
-      cols.push("visibility");
-      vals.push("public");
-    }
-
-    const placeholders = vals.map((_, idx) => `$${idx + 1}`).join(", ");
-    const sql = `INSERT INTO channels (${cols.join(", ")})
-                 VALUES (${placeholders})
-                 RETURNING *`;
-    const ins = await db.query(sql, vals);
-
-    await db.query(
-      `INSERT INTO channel_pages (channel_id, page_slug, title, blocks, is_home, sort_order)
-       VALUES ($1, 'home', 'Home', '[]'::jsonb, true, 0)`,
-      [ins.rows[0].id]
-    );
-
-    res.json(ins.rows[0]);
+    const ch = await getChannelByKey(client, req.params.key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
+    res.json({ ok: true, channel: ch });
   } catch (e) {
-    console.error("[POST /channels/me/ensure] error:", e);
-    res.status(500).json({ message: "Failed to create channel" });
+    console.error("[channels] GET /public/:key error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-// PUT /api/channels/me
-router.put("/me", authenticate, async (req, res) => {
+/**
+ * Public list: /api/channels/public/:key/pages
+ * { ok, pages: [...] }  (no blocks here to keep it light)
+ */
+router.get("/public/:key/pages", async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
-    const ownerCol = await ownerColName();
+    const ch = await getChannelByKey(client, req.params.key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
 
-    const cur = await db.query(
-      q`SELECT * FROM channels WHERE ${ownerCol}=$1 LIMIT 1`,
-      [req.user.id]
-    );
-    if (!cur.rows[0]) return res.status(404).json({ message: "Not found" });
-
-    const allowed = [
-      "title",
-      "slug",
-      "about",
-      "theme_color",
-      "text_color",
-      "hero_image_url",
-      "avatar_url",
-      "website",
-      "youtube",
-      "facebook",
-      "twitter",
-      "instagram",
-      "tiktok",
-    ];
-    const patch = pick(req.body || {}, allowed);
-
-    if (patch.slug != null) {
-      const next = slugify(patch.slug);
-      const clash = await db.query(
-        `SELECT id FROM channels WHERE LOWER(slug)=LOWER($1) AND id<>$2 LIMIT 1`,
-        [next, cur.rows[0].id]
-      );
-      if (clash.rows.length) {
-        return res.status(409).json({ message: "Slug already in use" });
-      }
-      patch.slug = next;
-    }
-
-    const sets = [];
-    const vals = [];
-    let i = 1;
-    for (const [k, v] of Object.entries(patch)) {
-      sets.push(`${k}=$${i++}`);
-      vals.push(v);
-    }
-    sets.push("updated_at=NOW()");
-    vals.push(req.user.id);
-
-    const sql = q`UPDATE channels SET ${sets.join(
-      ", "
-    )} WHERE ${ownerCol}=$${i} RETURNING *`;
-    const up = await db.query(sql, vals);
-    res.json(up.rows[0]);
+    const rows = await getChannelPages(client, ch.id);
+    res.json({ ok: true, pages: rows.map(pagePublicFields) });
   } catch (e) {
-    console.error("[PUT /channels/me] error:", e);
-    res.status(500).json({ message: "Failed to update channel" });
+    console.error("[channels] GET /public/:key/pages error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-/* --------------------------- Public: channel + pages --------------------------- */
-
-// GET /api/channels/:slug
-router.get("/:slug", async (req, res) => {
+/**
+ * Public page detail:
+ * /api/channels/public/:key/pages/:pageSlug
+ * { ok, page: {...minimal, blocks: {version:2, root:[...]}} }
+ */
+router.get("/public/:key/pages/:pageSlug", async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
-    const { rows } = await db.query(
-      `SELECT id, title, slug, about, theme_color, text_color,
-              hero_image_url, avatar_url, website, youtube, facebook, twitter, instagram, tiktok
-       FROM channels
-       WHERE LOWER(slug)=LOWER($1)
-       LIMIT 1`,
-      [req.params.slug]
-    );
-    if (!rows[0]) return res.status(404).json({ message: "Not found" });
-    res.json(rows[0]);
-  } catch (e) {
-    console.error("[GET /channels/:slug] error:", e);
-    res.status(500).json({ message: "Failed to load channel" });
-  }
-});
+    const { key, pageSlug } = req.params;
+    const ch = await getChannelByKey(client, key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
 
-// GET /api/channels/:slug/pages
-router.get("/:slug/pages", async (req, res) => {
-  try {
-    await ensureTables();
-    const ch = await db.query(
-      `SELECT id FROM channels WHERE LOWER(slug)=LOWER($1) LIMIT 1`,
-      [req.params.slug]
-    );
-    if (!ch.rows[0]) return res.status(404).json({ message: "Not found" });
-
-    const pages = await db.query(
-      `SELECT id, page_slug, title, blocks, is_home, sort_order
+    const { rows } = await client.query(
+      `SELECT *
          FROM channel_pages
-        WHERE channel_id=$1
-        ORDER BY sort_order ASC, id ASC`,
-      [ch.rows[0].id]
-    );
-    res.json(pages.rows);
-  } catch (e) {
-    console.error("[GET /channels/:slug/pages] error:", e);
-    res.status(500).json({ message: "Failed to load pages" });
-  }
-});
-
-// GET /api/channels/:slug/page/:pageSlug
-router.get("/:slug/page/:pageSlug", async (req, res) => {
-  try {
-    await ensureTables();
-
-    // find channel id first
-    const ch = await db.query(
-      `SELECT id FROM channels WHERE LOWER(slug)=LOWER($1) LIMIT 1`,
-      [req.params.slug]
-    );
-    if (!ch.rows[0]) return res.status(404).json({ message: "Not found" });
-
-    const channelId = ch.rows[0].id;
-    const wanted = String(req.params.pageSlug || "").toLowerCase();
-
-    // 1) try direct match on stored page_slug
-    const pg1 = await db.query(
-      `SELECT id, page_slug, title, blocks, is_home
-         FROM channel_pages
-        WHERE channel_id=$1 AND LOWER(page_slug)=LOWER($2)
+        WHERE channel_id = $1
+          AND (lower(slug) = lower($2) OR lower(page_slug) = lower($2))
         LIMIT 1`,
-      [channelId, wanted]
+      [ch.id, pageSlug]
     );
-    if (pg1.rowCount > 0) return res.json(pg1.rows[0]);
+    const r = rows[0];
+    if (!r) return res.status(404).json({ ok: false, error: "not_found" });
 
-    // 2) fallback: match against a slug derived from title (so /about works even if DB has page-7)
-    const all = await db.query(
-      `SELECT id, page_slug, title, blocks, is_home
-         FROM channel_pages
-        WHERE channel_id=$1`,
-      [channelId]
-    );
+    const doc =
+      normalizeBlocks(r.content_published) ||
+      normalizeBlocks(r.blocks) ||
+      normalizeBlocks(r.content_draft) ||
+      null;
 
-    const norm = (s) =>
-      (s || "")
-        .toLowerCase()
-        .normalize("NFKD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/(^-|-$)+/g, "")
-        .slice(0, 80) || "page";
-
-    const byTitle = all.rows.find((r) => norm(r.title) === wanted);
-    if (byTitle) return res.json(byTitle);
-
-    return res.status(404).json({ message: "Not found" });
+    res.json({
+      ok: true,
+      page: {
+        ...pagePublicFields(r),
+        blocks: doc,
+        published_html: r.published_html || null,
+      },
+    });
   } catch (e) {
-    console.error("[GET /channels/:slug/page/:pageSlug] error:", e);
-    res.status(500).json({ message: "Failed to load page" });
+    console.error("[channels] GET /public/:key/pages/:pageSlug error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-/* --------------------------- Studio: pages CRUD --------------------------- */
+/* ------------------------------- OWNER (ME) ------------------------------ */
 
-// POST /api/channels/me/pages
-router.post("/me/pages", authenticate, async (req, res) => {
+// Minimal owner channels (used by Studio)
+router.get("/me", requireUser, async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
-    const ownerCol = await ownerColName();
-
-    const ch = await db.query(
-      q`SELECT * FROM channels WHERE ${ownerCol}=$1 LIMIT 1`,
+    const { rows } = await client.query(
+      `SELECT id, slug, title, about, theme_color, text_color,
+              hero_url, avatar_url, created_at, updated_at
+         FROM channels
+        WHERE owner_user_id = $1
+        ORDER BY id`,
       [req.user.id]
     );
-    if (!ch.rows[0])
-      return res.status(404).json({ message: "Channel missing" });
+    res.json({ ok: true, channels: rows });
+  } catch (e) {
+    console.error("[channels] GET /me error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
 
-    const slug = slugify(req.body?.page_slug || req.body?.title || "page");
+// Owner: list pages
+router.get("/me/pages", requireUser, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const q = `
+      SELECT p.id, p.channel_id, p.slug, p.page_slug, p.title, p.kind,
+             p.nav_order, p.sort_order, p.is_visible, p.is_home,
+             p.is_published, p.updated_at, p.created_at
+        FROM channel_pages p
+        JOIN channels c ON c.id = p.channel_id
+       WHERE c.owner_user_id = $1
+    ORDER BY c.id, COALESCE(p.nav_order, p.sort_order, 0), p.id
+    `;
+    const { rows } = await client.query(q, [req.user.id]);
+    res.json({ ok: true, pages: rows });
+  } catch (e) {
+    console.error("[channels] GET /me/pages error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
 
-    const clash = await db.query(
-      `SELECT 1 FROM channel_pages WHERE channel_id=$1 AND LOWER(page_slug)=LOWER($2) LIMIT 1`,
-      [ch.rows[0].id, slug]
+// Owner: get one page (for editor)
+router.get("/me/pages/:id", requireUser, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      `SELECT p.*, c.owner_user_id
+         FROM channel_pages p
+         JOIN channels c ON c.id = p.channel_id
+        WHERE p.id = $1 AND c.owner_user_id = $2
+        LIMIT 1`,
+      [Number(req.params.id), req.user.id]
     );
-    if (clash.rows[0])
-      return res.status(409).json({ message: "Page slug already exists" });
+    const p = rows[0];
+    if (!p) return res.status(404).json({ ok: false, error: "not_found" });
 
-    const blocks = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
-    const isHome = !!req.body?.is_home;
-    const sortOrder = Number.isFinite(+req.body?.sort_order)
-      ? +req.body.sort_order
-      : 0;
+    res.json({
+      ok: true,
+      id: p.id,
+      channel_id: p.channel_id,
+      slug: p.slug || p.page_slug,
+      title: p.title,
+      kind: p.kind,
+      draft_json:
+        p.content_draft ?? (p.blocks ? { blocks: p.blocks } : { blocks: [] }),
+      meta: p.meta || {},
+    });
+  } catch (e) {
+    console.error("[channels] GET /me/pages/:id error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
 
-    if (isHome) {
-      await db.query(
-        `UPDATE channel_pages SET is_home=false WHERE channel_id=$1`,
-        [ch.rows[0].id]
+// Owner: create a page
+router.post("/me/pages", requireUser, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { channel_id, title } = req.body || {};
+    const reqSlug = req.body.slug
+      ? String(req.body.slug)
+      : slugify(title || "");
+    await client.query("BEGIN");
+
+    // find or create a channel for the owner if channel_id not supplied
+    let chId = Number(channel_id) || null;
+    if (!chId) {
+      const { rows } = await client.query(
+        `SELECT id FROM channels WHERE owner_user_id = $1 ORDER BY id LIMIT 1`,
+        [req.user.id]
       );
+      if (rows[0]) chId = rows[0].id;
+      else {
+        const ins = await client.query(
+          `INSERT INTO channels (owner_user_id, slug, title)
+           VALUES ($1,$2,$3)
+           RETURNING id`,
+          [req.user.id, slugify("my-channel"), "My Channel"]
+        );
+        chId = ins.rows[0].id;
+      }
     }
 
-    const ins = await db.query(
-      `INSERT INTO channel_pages (channel_id, page_slug, title, blocks, is_home, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6)
+    const ins = await client.query(
+      `INSERT INTO channel_pages
+         (channel_id, slug, page_slug, title, kind,
+          blocks, content_draft, nav_order, is_visible, is_published,
+          created_at, updated_at)
+       VALUES
+         ($1, $2, $2, $3, 'custom',
+          $4::jsonb, $5::jsonb, 0, TRUE, FALSE,
+          NOW(), NOW())
        RETURNING *`,
       [
-        ch.rows[0].id,
-        slug,
-        req.body?.title || "Page",
-        JSON.stringify(blocks),
-        isHome,
-        sortOrder,
+        chId,
+        reqSlug || "page",
+        title || "Untitled",
+        JSON.stringify([]),
+        JSON.stringify({ blocks: [] }),
       ]
     );
 
-    res.json(ins.rows[0]);
+    await client.query("COMMIT");
+    const p = ins.rows[0];
+    res.json({
+      ok: true,
+      page: {
+        id: p.id,
+        title: p.title,
+        slug: p.slug || p.page_slug,
+        is_home: p.is_home,
+        sort_order: p.sort_order,
+        is_published: p.is_published,
+        content_draft: p.content_draft,
+      },
+    });
   } catch (e) {
-    console.error("[POST /channels/me/pages] error:", e);
-    res.status(500).json({ message: "Failed to create page" });
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("[channels] POST /me/pages error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-// PUT /api/channels/me/pages/:id
-router.put("/me/pages/:id", authenticate, async (req, res) => {
+// Owner: save page meta/draft (also handles title/slug/is_home/sort_order)
+router.put("/me/pages/:id", requireUser, async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
-    const ownerCol = await ownerColName();
+    const id = Number(req.params.id);
+    const {
+      title,
+      slug,
+      is_home,
+      sort_order,
+      content_draft, // expects {blocks:[...]} from the builder (or omit)
+      meta, // may contain builder_html
+    } = req.body || {};
 
-    const ch = await db.query(
-      q`SELECT * FROM channels WHERE ${ownerCol}=$1 LIMIT 1`,
-      [req.user.id]
+    await client.query("BEGIN");
+
+    // Make sure they own it
+    const own = await client.query(
+      `SELECT p.id
+         FROM channel_pages p
+         JOIN channels c ON c.id = p.channel_id
+        WHERE p.id = $1 AND c.owner_user_id = $2`,
+      [id, req.user.id]
     );
-    if (!ch.rows[0])
-      return res.status(404).json({ message: "Channel missing" });
-
-    const pg = await db.query(
-      `SELECT * FROM channel_pages WHERE id=$1 AND channel_id=$2 LIMIT 1`,
-      [req.params.id, ch.rows[0].id]
-    );
-    if (!pg.rows[0]) return res.status(404).json({ message: "Page not found" });
-
-    const patch = pick(req.body || {}, [
-      "title",
-      "blocks",
-      "page_slug",
-      "is_home",
-      "sort_order",
-    ]);
-
-    if (patch.page_slug != null) {
-      const s = slugify(patch.page_slug);
-      const clash = await db.query(
-        `SELECT 1 FROM channel_pages
-         WHERE channel_id=$1 AND LOWER(page_slug)=LOWER($2) AND id<>$3 LIMIT 1`,
-        [ch.rows[0].id, s, pg.rows[0].id]
-      );
-      if (clash.rows[0])
-        return res.status(409).json({ message: "Page slug already exists" });
-      patch.page_slug = s;
+    if (!own.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "not_found" });
     }
 
-    if (patch.blocks != null && !Array.isArray(patch.blocks)) patch.blocks = [];
-    if (patch.is_home === true) {
-      await db.query(
-        `UPDATE channel_pages SET is_home=false WHERE channel_id=$1`,
-        [ch.rows[0].id]
+    // if is_home true, unset others in the same channel
+    if (is_home === true) {
+      await client.query(
+        `UPDATE channel_pages
+            SET is_home = FALSE
+          WHERE channel_id = (SELECT channel_id FROM channel_pages WHERE id = $1)`,
+        [id]
       );
     }
 
-    const sets = [];
-    const vals = [];
-    let i = 1;
-    for (const [k, v] of Object.entries(patch)) {
-      sets.push(`${k}=$${i++}`);
-      vals.push(k === "blocks" ? JSON.stringify(v) : v);
-    }
-    sets.push("updated_at=NOW()");
-    vals.push(req.params.id, ch.rows[0].id);
-
-    const up = await db.query(
-      `UPDATE channel_pages SET ${sets.join(", ")}
-        WHERE id=$${i++} AND channel_id=$${i++}
+    const upd = await client.query(
+      `UPDATE channel_pages
+          SET title = COALESCE($2, title),
+              slug = COALESCE($3, slug),
+              page_slug = COALESCE($3, page_slug),
+              is_home = COALESCE($4, is_home),
+              sort_order = COALESCE($5, sort_order),
+              content_draft = COALESCE($6::jsonb, content_draft),
+              meta = COALESCE($7::jsonb, meta),
+              updated_at = NOW()
+        WHERE id = $1
         RETURNING *`,
-      vals
+      [
+        id,
+        title ?? null,
+        slug ?? null,
+        typeof is_home === "boolean" ? is_home : null,
+        typeof sort_order === "number" ? sort_order : null,
+        content_draft ? JSON.stringify(content_draft) : null,
+        meta ? JSON.stringify(meta) : null,
+      ]
     );
 
-    res.json(up.rows[0]);
+    await client.query("COMMIT");
+    const r = upd.rows[0];
+    res.json({
+      ok: true,
+      page: {
+        id: r.id,
+        title: r.title,
+        slug: r.slug || r.page_slug,
+        is_home: r.is_home,
+        sort_order: r.sort_order,
+        is_published: r.is_published,
+        content_draft: r.content_draft,
+      },
+    });
   } catch (e) {
-    console.error("[PUT /channels/me/pages/:id] error:", e);
-    res.status(500).json({ message: "Failed to update page" });
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("[channels] PUT /me/pages/:id error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-// DELETE /api/channels/me/pages/:id
-router.delete("/me/pages/:id", authenticate, async (req, res) => {
+// Owner: publish (copy draft -> published)
+router.post("/me/pages/:id/publish", requireUser, async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
-    const ownerCol = await ownerColName();
+    const id = Number(req.params.id);
 
-    const ch = await db.query(
-      q`SELECT * FROM channels WHERE ${ownerCol}=$1 LIMIT 1`,
-      [req.user.id]
+    await client.query("BEGIN");
+
+    const row = await client.query(
+      `SELECT p.*, c.owner_user_id
+         FROM channel_pages p
+         JOIN channels c ON c.id = p.channel_id
+        WHERE p.id = $1 AND c.owner_user_id = $2
+        LIMIT 1`,
+      [id, req.user.id]
     );
-    if (!ch.rows[0])
-      return res.status(404).json({ message: "Channel missing" });
+    const p = row.rows[0];
+    if (!p) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "not_found" });
+    }
 
-    await db.query(`DELETE FROM channel_pages WHERE id=$1 AND channel_id=$2`, [
-      req.params.id,
-      ch.rows[0].id,
-    ]);
+    const draft = p.content_draft || { blocks: [] };
+    const html =
+      (p.meta && p.meta.builder_html ? String(p.meta.builder_html) : "") || "";
+
+    await client.query(
+      `UPDATE channel_pages
+          SET content_published = $2::jsonb,
+              published_html = $3::text,
+              is_published = TRUE,
+              published_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [id, JSON.stringify(draft), html]
+    );
+
+    await client.query("COMMIT");
     res.json({ ok: true });
   } catch (e) {
-    console.error("[DELETE /channels/me/pages/:id] error:", e);
-    res.status(500).json({ message: "Failed to delete page" });
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("[channels] POST /me/pages/:id/publish error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 
-/* --------------------------- Public fetch by slug or id --------------------------- */
-// GET /api/channels/p/:slugOrId  — public fetch by slug (or id as string)
-router.get("/p/:slugOrId", async (req, res) => {
-  const raw = String(req.params.slugOrId || "").trim();
-  if (!raw) return res.status(400).json({ message: "Missing slug" });
-
+// Owner: delete page
+router.delete("/me/pages/:id", requireUser, async (req, res) => {
+  const client = await pool.connect();
   try {
-    await ensureTables();
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ ok: false, message: "Invalid page id" });
+    }
 
-    // channels columns (visibility is optional)
-    const hasVisibility = await columnExists("channels", "visibility");
-    const channelCols = `
-      c.id,
-      c.slug,
-      c.title,
-      c.about,
-      c.hero_image_url,
-      c.avatar_url,
-      c.theme_color,
-      c.text_color,
-      c.website,
-      c.youtube,
-      c.facebook,
-      c.twitter,
-      c.instagram,
-      c.tiktok
-      ${hasVisibility ? ", c.visibility" : ""}
-    `;
+    // Ensure ownership & get is_home
+    const { rows } = await client.query(
+      `SELECT p.id, p.is_home
+         FROM channel_pages p
+         JOIN channels c ON c.id = p.channel_id
+        WHERE p.id = $1 AND c.owner_user_id = $2
+        LIMIT 1`,
+      [id, req.user.id]
+    );
+    const row = rows[0];
+    if (!row)
+      return res.status(404).json({ ok: false, message: "Page not found" });
+    if (row.is_home)
+      return res.status(409).json({
+        ok: false,
+        message: "Cannot delete the Home page. Unset it first.",
+      });
 
-    const cq = await db.query(
+    const del = await client.query(
+      `DELETE FROM channel_pages WHERE id = $1 RETURNING id`,
+      [id]
+    );
+    return res.json({ ok: true, deleted: del.rows[0].id });
+  } catch (e) {
+    console.error("[channels] DELETE /me/pages/:id error:", e);
+    res.status(500).json({ ok: false, message: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+/* -------------------------- PRIVATE (fallback) API ------------------------- */
+
+router.get("/:key", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ch = await getChannelByKey(client, req.params.key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
+    res.json({ ok: true, channel: ch });
+  } catch (e) {
+    console.error("[channels] GET /:key error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.get("/:key/pages", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ch = await getChannelByKey(client, req.params.key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
+    const rows = await getChannelPages(client, ch.id);
+    res.json({ ok: true, pages: rows.map(pagePublicFields) });
+  } catch (e) {
+    console.error("[channels] GET /:key/pages error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
+
+router.get("/:key/pages/:pageSlug", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { key, pageSlug } = req.params;
+    const ch = await getChannelByKey(client, key);
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const { rows } = await client.query(
+      `SELECT *
+         FROM channel_pages
+        WHERE channel_id = $1
+          AND (lower(slug) = lower($2) OR lower(page_slug) = lower($2))
+        LIMIT 1`,
+      [ch.id, pageSlug]
+    );
+    const r = rows[0];
+    if (!r) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const doc =
+      normalizeBlocks(r.content_published) ||
+      normalizeBlocks(r.blocks) ||
+      normalizeBlocks(r.content_draft) ||
+      null;
+
+    res.json({
+      ok: true,
+      page: {
+        ...pagePublicFields(r),
+        blocks: doc,
+        published_html: r.published_html || null,
+      },
+    });
+  } catch (e) {
+    console.error("[channels] GET /:key/pages/:pageSlug error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/channels/p/:slug/pages/:pageKey  -> full page (by slug or id)
+router.get("/p/:key/pages/:pageKey", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const channelKey = req.params.key; // slug or id for the channel
+    const pageKey = req.params.pageKey; // page slug or numeric id
+
+    // Find channel first
+    const chRes = await client.query(
+      `SELECT id, slug, title FROM channels WHERE lower(slug)=lower($1) OR id::text=$1 LIMIT 1`,
+      [String(channelKey)]
+    );
+    const ch = chRes.rows[0];
+    if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
+
+    // Then find page by slug or id, scoped to this channel
+    let pageRes;
+    if (/^\d+$/.test(String(pageKey))) {
+      pageRes = await client.query(
+        `SELECT *
+           FROM channel_pages
+          WHERE channel_id=$1 AND id=$2
+          LIMIT 1`,
+        [ch.id, Number(pageKey)]
+      );
+    } else {
+      pageRes = await client.query(
+        `SELECT *
+           FROM channel_pages
+          WHERE channel_id=$1 AND (lower(slug)=lower($2) OR lower(page_slug)=lower($2))
+          LIMIT 1`,
+        [ch.id, String(pageKey)]
+      );
+    }
+
+    const page = pageRes.rows[0];
+    if (!page) return res.status(404).json({ ok: false, error: "not_found" });
+
+    // Return the page with published fields (published_html/content_published)
+    return res.json({ ok: true, page });
+  } catch (e) {
+    console.error("[channels] GET /p/:key/pages/:pageKey error", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/site/public/:slug  -> { ok, page: { id, title, slug, blocks, published_html } }
+router.get("/site/public/:slug", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const slug = String(req.params.slug || "").trim();
+    if (!slug) return res.status(400).json({ ok: false, error: "bad_request" });
+
+    // Pick the most recently published page that matches the slug (case-insensitive)
+    const { rows } = await client.query(
       `
-      SELECT ${channelCols}
-        FROM channels c
-       WHERE (LOWER(c.slug) = LOWER($1) OR CAST(c.id AS TEXT) = $1)
+      SELECT p.*, c.slug AS channel_slug
+        FROM channel_pages p
+        JOIN channels c ON c.id = p.channel_id
+       WHERE p.is_published = TRUE
+         AND (lower(p.slug) = lower($1) OR lower(p.page_slug) = lower($1))
+       ORDER BY p.published_at DESC NULLS LAST, p.updated_at DESC
        LIMIT 1
       `,
-      [raw]
+      [slug]
     );
 
-    if (cq.rowCount === 0)
-      return res.status(404).json({ message: "Not found" });
+    const r = rows[0];
+    if (!r) return res.status(404).json({ ok: false, error: "not_found" });
 
-    const channel = cq.rows[0];
-    const isPublic =
-      !hasVisibility ||
-      String(channel.visibility || "public").toLowerCase() === "public";
-    if (!isPublic) return res.status(404).json({ message: "Not found" });
+    // Prefer published JSON; fall back defensively if needed
+    const blocks =
+      (r.content_published &&
+        (r.content_published.version === 2
+          ? r.content_published.root
+          : Array.isArray(r.content_published.blocks)
+          ? r.content_published.blocks
+          : Array.isArray(r.content_published)
+          ? r.content_published
+          : [])) ||
+      [];
 
-    // channel_pages columns vary; detect safely
-    const hasPageSlug = await columnExists("channel_pages", "page_slug");
-    const hasSlugCol = await columnExists("channel_pages", "slug");
-    const hasNameCol = await columnExists("channel_pages", "name");
-    const hasSortOrder = await columnExists("channel_pages", "sort_order");
-    const hasNavOrder = await columnExists("channel_pages", "nav_order");
-    const hasIsVisible = await columnExists("channel_pages", "is_visible");
-
-    const pageSlugExpr = hasPageSlug
-      ? "page_slug"
-      : hasSlugCol
-      ? "slug"
-      : `'home'`;
-
-    const titleExpr = hasNameCol ? "COALESCE(title, name)" : "title";
-
-    const posExpr = hasSortOrder
-      ? hasNavOrder
-        ? "COALESCE(sort_order, nav_order, 0)"
-        : "sort_order"
-      : hasNavOrder
-      ? "nav_order"
-      : "0";
-
-    const orderExpr = hasSortOrder
-      ? hasNavOrder
-        ? "COALESCE(sort_order, nav_order, 0)"
-        : "sort_order"
-      : hasNavOrder
-      ? "nav_order"
-      : "id";
-
-    const visibleClause = hasIsVisible
-      ? " AND COALESCE(is_visible, true) = true"
-      : "";
-
-    const pq = await db.query(
-      `
-      SELECT
-        id,
-        ${pageSlugExpr}                    AS page_slug,
-        ${titleExpr}                       AS title,
-        COALESCE(blocks, '[]'::jsonb)      AS blocks,
-        ${posExpr}                         AS position
-      FROM channel_pages
-      WHERE channel_id = $1${visibleClause}
-      ORDER BY ${orderExpr} NULLS FIRST, id ASC
-      `,
-      [channel.id]
-    );
-
-    res.json({ channel, pages: pq.rows });
+    return res.json({
+      ok: true,
+      page: {
+        id: r.id,
+        title: r.title,
+        slug: r.slug || r.page_slug,
+        channel_slug: r.channel_slug,
+        blocks,
+        published_html: r.published_html || null,
+        published_at: r.published_at,
+      },
+    });
   } catch (e) {
-    console.error("[GET /channels/p/:slugOrId] error:", e);
-    res.status(500).json({ message: "Failed" });
+    console.error("[channels] GET /site/public/:slug error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    client.release();
   }
 });
 

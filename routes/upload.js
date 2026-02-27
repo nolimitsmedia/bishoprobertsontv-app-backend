@@ -76,6 +76,26 @@ const WASABI_PUBLIC_BASE = (
 ).replace(/\/+$/, "");
 const PREFIX = (process.env.WASABI_PREFIX || "app").replace(/^\/+|\/+$/g, "");
 
+// Optional Bunny base-path overrides (useful when your Bunny Pull Zone has an origin path)
+const BUNNY_IMAGES_BASE_PATH = (
+  process.env.BUNNY_IMAGES_BASE_PATH || `${PREFIX}/images`
+).replace(/^\/+|\/+$/g, "");
+const BUNNY_PAGES_BASE_PATH = (
+  process.env.BUNNY_PAGES_BASE_PATH || `${PREFIX}/pages`
+).replace(/^\/+|\/+$/g, "");
+const BUNNY_VIDEOS_BASE_PATH = (
+  process.env.BUNNY_STORAGE_BASE_PATH || `${PREFIX}/videos`
+).replace(/^\/+|\/+$/g, "");
+
+function normalizeHttpBase(v) {
+  const s = String(v || "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!s) return "";
+  if (/^https?:\/\//i.test(s)) return s;
+  return `https://${s}`;
+}
+
 // Wasabi client (S3 compatible)
 let s3 = null;
 if (useWasabi) {
@@ -99,10 +119,7 @@ const useBunny =
 const BUNNY_STORAGE_ZONE = process.env.BUNNY_STORAGE_ZONE || "";
 const BUNNY_STORAGE_HOST =
   process.env.BUNNY_STORAGE_HOST || "storage.bunnycdn.com";
-const BUNNY_CDN_BASE_URL = (process.env.BUNNY_CDN_BASE_URL || "").replace(
-  /\/+$/,
-  "",
-);
+const BUNNY_CDN_BASE_URL = normalizeHttpBase(process.env.BUNNY_CDN_BASE_URL);
 
 // ---------------------------------------------------------------------------
 //  Local paths + Multer
@@ -156,7 +173,7 @@ function safeKind(k) {
 }
 
 // Category-aware key builder
-function keyFor(user, kind, originalName, category) {
+function keyFor(req, user, kind, originalName, category) {
   const ext = path.extname(originalName || "").toLowerCase();
   const base = slugify(path.basename(originalName || "upload", ext));
   const ts = Date.now();
@@ -165,8 +182,30 @@ function keyFor(user, kind, originalName, category) {
   const uid = user?.id ? `u_${user.id}` : "anon";
   const k = safeKind(kind);
   const catSlug = slugify(category || "uncategorized") || "uncategorized";
+  const folder = slugify(req?.body?.folder || req?.query?.folder || "") || "";
 
-  return `${PREFIX}/${k}/${catSlug}/${uid}/${base}-${ts}-${rand}${ext}`;
+  // For Bunny, it's common to separate "pages" images from general "images".
+  // These envs let you match your Bunny Pull Zone + folder conventions:
+  // - BUNNY_IMAGES_BASE_PATH (default: app/images)
+  // - BUNNY_PAGES_BASE_PATH  (default: app/pages)
+  // - BUNNY_STORAGE_BASE_PATH (videos default: app/videos)
+  //
+  // Rules:
+  // - videos -> BUNNY_STORAGE_BASE_PATH
+  // - images + category=pages -> BUNNY_PAGES_BASE_PATH/(hero|inline|gallery)/...
+  // - images -> BUNNY_IMAGES_BASE_PATH/<category>/...
+  // - everything else -> PREFIX/<kind>/<category>/...
+  let root = `${PREFIX}/${k}`;
+  if (k === "videos") root = BUNNY_VIDEOS_BASE_PATH || root;
+  if (k === "images") {
+    if (catSlug === "pages") {
+      root = BUNNY_PAGES_BASE_PATH || `${PREFIX}/pages`;
+      return `${root}${folder ? `/${folder}` : ""}/${uid}/${base}-${ts}-${rand}${ext}`;
+    }
+    root = BUNNY_IMAGES_BASE_PATH || `${PREFIX}/images`;
+  }
+
+  return `${root}/${catSlug}/${uid}/${base}-${ts}-${rand}${ext}`;
 }
 
 function shouldCreateVideo(req) {
@@ -340,7 +379,7 @@ async function handleUpload(req, res) {
   try {
     // 3) Save (Bunny, Wasabi, or local)
     if (useBunny) {
-      const key = keyFor(req.user, kind, originalName, category);
+      const key = keyFor(req, req.user, kind, originalName, category);
       const ContentType =
         req.file.mimetype ||
         mime.lookup(originalName) ||
@@ -390,7 +429,7 @@ async function handleUpload(req, res) {
 
     // Wasabi (legacy path)
     if (useWasabi) {
-      const key = keyFor(req.user, kind, originalName, category);
+      const key = keyFor(req, req.user, kind, originalName, category);
       const ContentType =
         req.file.mimetype ||
         mime.lookup(originalName) ||
@@ -551,7 +590,7 @@ router.post("/presign", authenticate, allowUploadRoles, async (req, res) => {
     category,
   } = req.body || {};
 
-  const key = keyFor(req.user, kind, filename, category);
+  const key = keyFor(req, req.user, kind, filename, category);
   const cmd = new PutObjectCommand({
     Bucket: WASABI_BUCKET,
     Key: key,

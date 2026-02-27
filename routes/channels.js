@@ -1,7 +1,7 @@
 // server-api/routes/channels.js
 const express = require("express");
 const router = express.Router();
-const pool = require("../db");
+const { pool } = require("../db");
 
 // Built-in slugify (no dependency)
 const slugify = (s = "") =>
@@ -34,7 +34,7 @@ async function getChannelByKey(client, keyRaw) {
   {
     const { rows } = await client.query(
       `SELECT * FROM channels WHERE lower(slug) = lower($1) LIMIT 1`,
-      [key]
+      [key],
     );
     if (rows[0]) return rows[0];
   }
@@ -42,7 +42,7 @@ async function getChannelByKey(client, keyRaw) {
   if (isIntLike(key)) {
     const { rows } = await client.query(
       `SELECT * FROM channels WHERE id = $1 LIMIT 1`,
-      [Number(key)]
+      [Number(key)],
     );
     if (rows[0]) return rows[0];
   }
@@ -186,7 +186,7 @@ router.get("/public/:key/pages/:pageSlug", async (req, res) => {
         WHERE channel_id = $1
           AND (lower(slug) = lower($2) OR lower(page_slug) = lower($2))
         LIMIT 1`,
-      [ch.id, pageSlug]
+      [ch.id, pageSlug],
     );
     const r = rows[0];
     if (!r) return res.status(404).json({ ok: false, error: "not_found" });
@@ -225,7 +225,7 @@ router.get("/me", requireUser, async (req, res) => {
          FROM channels
         WHERE owner_user_id = $1
         ORDER BY id`,
-      [req.user.id]
+      [req.user.id],
     );
     res.json({ ok: true, channels: rows });
   } catch (e) {
@@ -269,7 +269,7 @@ router.get("/me/pages/:id", requireUser, async (req, res) => {
          JOIN channels c ON c.id = p.channel_id
         WHERE p.id = $1 AND c.owner_user_id = $2
         LIMIT 1`,
-      [Number(req.params.id), req.user.id]
+      [Number(req.params.id), req.user.id],
     );
     const p = rows[0];
     if (!p) return res.status(404).json({ ok: false, error: "not_found" });
@@ -308,7 +308,7 @@ router.post("/me/pages", requireUser, async (req, res) => {
     if (!chId) {
       const { rows } = await client.query(
         `SELECT id FROM channels WHERE owner_user_id = $1 ORDER BY id LIMIT 1`,
-        [req.user.id]
+        [req.user.id],
       );
       if (rows[0]) chId = rows[0].id;
       else {
@@ -316,7 +316,7 @@ router.post("/me/pages", requireUser, async (req, res) => {
           `INSERT INTO channels (owner_user_id, slug, title)
            VALUES ($1,$2,$3)
            RETURNING id`,
-          [req.user.id, slugify("my-channel"), "My Channel"]
+          [req.user.id, slugify("my-channel"), "My Channel"],
         );
         chId = ins.rows[0].id;
       }
@@ -338,7 +338,7 @@ router.post("/me/pages", requireUser, async (req, res) => {
         title || "Untitled",
         JSON.stringify([]),
         JSON.stringify({ blocks: [] }),
-      ]
+      ],
     );
 
     await client.query("COMMIT");
@@ -388,7 +388,7 @@ router.put("/me/pages/:id", requireUser, async (req, res) => {
          FROM channel_pages p
          JOIN channels c ON c.id = p.channel_id
         WHERE p.id = $1 AND c.owner_user_id = $2`,
-      [id, req.user.id]
+      [id, req.user.id],
     );
     if (!own.rows[0]) {
       await client.query("ROLLBACK");
@@ -401,7 +401,7 @@ router.put("/me/pages/:id", requireUser, async (req, res) => {
         `UPDATE channel_pages
             SET is_home = FALSE
           WHERE channel_id = (SELECT channel_id FROM channel_pages WHERE id = $1)`,
-        [id]
+        [id],
       );
     }
 
@@ -425,7 +425,7 @@ router.put("/me/pages/:id", requireUser, async (req, res) => {
         typeof sort_order === "number" ? sort_order : null,
         content_draft ? JSON.stringify(content_draft) : null,
         meta ? JSON.stringify(meta) : null,
-      ]
+      ],
     );
 
     await client.query("COMMIT");
@@ -454,6 +454,32 @@ router.put("/me/pages/:id", requireUser, async (req, res) => {
 });
 
 // Owner: publish (copy draft -> published)
+
+// ✅ Publish status (read-only) - used by admin UI to check publish endpoint
+router.get("/me/pages/:id/publish", requireUser, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id))
+      return res.status(400).json({ ok: false, error: "bad_id" });
+
+    const row = await pool.query(
+      `SELECT p.id, p.slug, p.status, p.published_at, p.updated_at
+         FROM channel_pages p
+         JOIN channels c ON c.id = p.channel_id
+        WHERE p.id = $1 AND c.owner_user_id = $2
+        LIMIT 1`,
+      [id, req.user.id],
+    );
+
+    const p = row.rows[0];
+    if (!p) return res.status(404).json({ ok: false, error: "not_found" });
+    return res.json({ ok: true, page: p });
+  } catch (e) {
+    console.error("[channels] GET /me/pages/:id/publish error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 router.post("/me/pages/:id/publish", requireUser, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -467,7 +493,7 @@ router.post("/me/pages/:id/publish", requireUser, async (req, res) => {
          JOIN channels c ON c.id = p.channel_id
         WHERE p.id = $1 AND c.owner_user_id = $2
         LIMIT 1`,
-      [id, req.user.id]
+      [id, req.user.id],
     );
     const p = row.rows[0];
     if (!p) {
@@ -487,7 +513,7 @@ router.post("/me/pages/:id/publish", requireUser, async (req, res) => {
               published_at = NOW(),
               updated_at = NOW()
         WHERE id = $1`,
-      [id, JSON.stringify(draft), html]
+      [id, JSON.stringify(draft), html],
     );
 
     await client.query("COMMIT");
@@ -519,7 +545,7 @@ router.delete("/me/pages/:id", requireUser, async (req, res) => {
          JOIN channels c ON c.id = p.channel_id
         WHERE p.id = $1 AND c.owner_user_id = $2
         LIMIT 1`,
-      [id, req.user.id]
+      [id, req.user.id],
     );
     const row = rows[0];
     if (!row)
@@ -532,7 +558,7 @@ router.delete("/me/pages/:id", requireUser, async (req, res) => {
 
     const del = await client.query(
       `DELETE FROM channel_pages WHERE id = $1 RETURNING id`,
-      [id]
+      [id],
     );
     return res.json({ ok: true, deleted: del.rows[0].id });
   } catch (e) {
@@ -587,7 +613,7 @@ router.get("/:key/pages/:pageSlug", async (req, res) => {
         WHERE channel_id = $1
           AND (lower(slug) = lower($2) OR lower(page_slug) = lower($2))
         LIMIT 1`,
-      [ch.id, pageSlug]
+      [ch.id, pageSlug],
     );
     const r = rows[0];
     if (!r) return res.status(404).json({ ok: false, error: "not_found" });
@@ -624,7 +650,7 @@ router.get("/p/:key/pages/:pageKey", async (req, res) => {
     // Find channel first
     const chRes = await client.query(
       `SELECT id, slug, title FROM channels WHERE lower(slug)=lower($1) OR id::text=$1 LIMIT 1`,
-      [String(channelKey)]
+      [String(channelKey)],
     );
     const ch = chRes.rows[0];
     if (!ch) return res.status(404).json({ ok: false, error: "not_found" });
@@ -637,7 +663,7 @@ router.get("/p/:key/pages/:pageKey", async (req, res) => {
            FROM channel_pages
           WHERE channel_id=$1 AND id=$2
           LIMIT 1`,
-        [ch.id, Number(pageKey)]
+        [ch.id, Number(pageKey)],
       );
     } else {
       pageRes = await client.query(
@@ -645,7 +671,7 @@ router.get("/p/:key/pages/:pageKey", async (req, res) => {
            FROM channel_pages
           WHERE channel_id=$1 AND (lower(slug)=lower($2) OR lower(page_slug)=lower($2))
           LIMIT 1`,
-        [ch.id, String(pageKey)]
+        [ch.id, String(pageKey)],
       );
     }
 
@@ -680,7 +706,7 @@ router.get("/site/public/:slug", async (req, res) => {
        ORDER BY p.published_at DESC NULLS LAST, p.updated_at DESC
        LIMIT 1
       `,
-      [slug]
+      [slug],
     );
 
     const r = rows[0];
@@ -692,10 +718,10 @@ router.get("/site/public/:slug", async (req, res) => {
         (r.content_published.version === 2
           ? r.content_published.root
           : Array.isArray(r.content_published.blocks)
-          ? r.content_published.blocks
-          : Array.isArray(r.content_published)
-          ? r.content_published
-          : [])) ||
+            ? r.content_published.blocks
+            : Array.isArray(r.content_published)
+              ? r.content_published
+              : [])) ||
       [];
 
     return res.json({

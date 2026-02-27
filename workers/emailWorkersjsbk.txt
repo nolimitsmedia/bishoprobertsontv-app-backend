@@ -1,31 +1,32 @@
-// server-api/workers/emailWorker.js
-const path = require("path");
+/**
+ * server-api/workers/emailWorker.js
+ *
+ * Run standalone:
+ *   node workers/emailWorker.js
+ *
+ * Or from server.js:
+ *   const { startEmailWorker } = require("./workers/emailWorker");
+ *   startEmailWorker();
+ */
 
-// Only load dotenv when running this file directly
-if (require.main === module) {
-  require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-}
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const fs = require("fs");
 const axios = require("axios");
 const FormData = require("form-data");
 
-// Allow injected db when run from server.js
-const defaultDb = require("../db");
-
+const db = require("../db");
 const { decryptJSON } = require("../utils/crypto");
 
 const WORKER_NAME = "emailWorker";
-
-// Logging controls
-const VERBOSE =
-  String(process.env.EMAIL_WORKER_VERBOSE || "").toLowerCase() === "1" ||
-  String(process.env.EMAIL_WORKER_VERBOSE || "").toLowerCase() === "true";
+const POLL_MS = Number(process.env.EMAIL_WORKER_POLL_MS || 2500);
+const BATCH_SIZE = Math.min(
+  Number(process.env.EMAIL_WORKER_BATCH_SIZE || 25),
+  100,
+);
 
 function log(...args) {
-  if (VERBOSE) console.log(`[${WORKER_NAME}]`, ...args);
-}
-function info(...args) {
   console.log(`[${WORKER_NAME}]`, ...args);
 }
 function errlog(...args) {
@@ -40,6 +41,7 @@ function normalizeProvider(p) {
   return safeStr(p).trim().toLowerCase();
 }
 
+// ✅ Support BOTH camelCase + snake_case secrets
 function getSecret(secrets, camelKey, snakeKey) {
   if (!secrets || typeof secrets !== "object") return "";
   const a = secrets?.[camelKey];
@@ -47,6 +49,12 @@ function getSecret(secrets, camelKey, snakeKey) {
   return safeStr(a || b).trim();
 }
 
+/**
+ * Accept:
+ *  - "/uploads/xyz.png"
+ *  - "http://host/uploads/xyz.png"
+ * Convert to absolute file path under server-api/uploads
+ */
 function parseUploadsPathFromUrl(url) {
   if (!url) return null;
 
@@ -56,24 +64,86 @@ function parseUploadsPathFromUrl(url) {
       const u = new URL(url);
       pathname = u.pathname;
     }
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   if (!pathname.startsWith("/uploads/")) return null;
 
-  const rel = pathname.replace(/^\/+/, "");
-  const abs = path.join(__dirname, "..", rel);
-
+  // worker is /server-api/workers; uploads is /server-api/uploads
   const uploadsRoot = path.join(__dirname, "..", "uploads") + path.sep;
-  const absNorm = path.normalize(abs);
-  if (!absNorm.startsWith(uploadsRoot)) return null;
 
+  const rel = pathname.replace(/^\/+/, ""); // "uploads/xyz.png"
+  const abs = path.join(__dirname, "..", rel); // server-api/uploads/xyz.png
+  const absNorm = path.normalize(abs);
+
+  if (!absNorm.startsWith(uploadsRoot)) return null;
   return absNorm;
+}
+
+async function getActiveEmailConnection() {
+  // Prefer DB connection (encrypted secrets)
+  try {
+    const r = await db.query(
+      `SELECT provider, secrets_enc
+       FROM email_connections
+       WHERE is_active = TRUE
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+    );
+
+    if (r.rows?.length) {
+      const provider = normalizeProvider(r.rows[0].provider);
+      const secrets = decryptJSON(r.rows[0].secrets_enc);
+      return { provider, secrets };
+    }
+  } catch (e) {
+    errlog("getActiveEmailConnection error:", e?.message || e);
+  }
+
+  // Fallback to env (Mailgun)
+  const provider = "mailgun";
+  const secrets = {
+    apiKey: process.env.MAILGUN_API_KEY || "",
+    domain: process.env.MAILGUN_DOMAIN || "",
+    fromEmail: process.env.MAILGUN_FROM_EMAIL || "",
+    fromName: process.env.MAILGUN_FROM_NAME || "Bishop Robertson TV",
+    region: process.env.MAILGUN_REGION || "us",
+  };
+
+  if (!secrets.apiKey || !secrets.domain || !secrets.fromEmail) return null;
+  return { provider, secrets };
 }
 
 function mailgunBaseUrl(region = "us") {
   return region && region.toLowerCase() === "eu"
     ? "https://api.eu.mailgun.net"
     : "https://api.mailgun.net";
+}
+
+/**
+ * ✅ Throws a clean error string that includes Mailgun's response message/body.
+ * This is what will show in your "Recipients -> Error" column.
+ */
+function mailgunErrorToString(resOrErr) {
+  const res = resOrErr?.response || resOrErr;
+  const status = res?.status;
+  const data = res?.data;
+
+  if (!status) return safeStr(resOrErr?.message || "Mailgun request failed");
+
+  if (typeof data === "string")
+    return `Mailgun ${status}: ${data}`.slice(0, 1000);
+  if (data?.message)
+    return `Mailgun ${status}: ${safeStr(data.message)}`.slice(0, 1000);
+  if (data?.error)
+    return `Mailgun ${status}: ${safeStr(data.error)}`.slice(0, 1000);
+
+  try {
+    return `Mailgun ${status}: ${JSON.stringify(data)}`.slice(0, 1000);
+  } catch {
+    return `Mailgun ${status}: (unreadable error body)`.slice(0, 1000);
+  }
 }
 
 async function sendViaMailgun({
@@ -100,70 +170,44 @@ async function sendViaMailgun({
   const form = new FormData();
   form.append("from", from);
   form.append("to", to);
-  form.append("subject", subject || "");
+  form.append("subject", subject || "(no subject)");
   if (text) form.append("text", text);
   if (html) form.append("html", html);
 
+  // Attachments: only local /uploads files supported
   for (const a of (Array.isArray(attachments) ? attachments : []).slice(0, 8)) {
     const filePath = parseUploadsPathFromUrl(a?.url);
     if (!filePath) continue;
+    if (!fs.existsSync(filePath)) continue;
 
-    if (fs.existsSync(filePath)) {
-      form.append("attachment", fs.createReadStream(filePath), {
-        filename: a?.name || path.basename(filePath),
-        contentType: a?.mime || undefined,
-      });
-    }
+    form.append("attachment", fs.createReadStream(filePath), {
+      filename: a?.name || path.basename(filePath),
+      contentType: a?.mime || undefined,
+    });
   }
 
   const base = mailgunBaseUrl(region);
   const url = `${base}/v3/${encodeURIComponent(domain)}/messages`;
 
+  // ✅ do NOT use validateStatus to force axios to throw generic errors
   const res = await axios.post(url, form, {
     auth: { username: "api", password: apiKey },
     headers: form.getHeaders(),
     timeout: 30000,
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
-    validateStatus: (s) => s >= 200 && s < 300,
+    validateStatus: () => true,
   });
+
+  if (res.status < 200 || res.status >= 300) {
+    const msg = mailgunErrorToString(res);
+    throw new Error(msg);
+  }
 
   return res.data;
 }
 
-async function getActiveEmailConnection(db) {
-  try {
-    const r = await db.query(
-      `SELECT provider, secrets_enc
-       FROM email_connections
-       WHERE is_active = TRUE
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-    );
-
-    if (r.rows?.length) {
-      const provider = normalizeProvider(r.rows[0].provider);
-      const secrets = decryptJSON(r.rows[0].secrets_enc);
-      return { provider, secrets };
-    }
-  } catch (e) {
-    errlog("getActiveEmailConnection error:", e?.message || e);
-  }
-
-  const provider = "mailgun";
-  const secrets = {
-    apiKey: process.env.MAILGUN_API_KEY || "",
-    domain: process.env.MAILGUN_DOMAIN || "",
-    fromEmail: process.env.MAILGUN_FROM_EMAIL || "",
-    fromName: process.env.MAILGUN_FROM_NAME || "Bishop Robertson TV",
-    region: process.env.MAILGUN_REGION || "us",
-  };
-
-  if (!secrets.apiKey || !secrets.domain || !secrets.fromEmail) return null;
-  return { provider, secrets };
-}
-
-async function updateJobStatus(db, jobId) {
+async function updateJobStatus(jobId) {
   const r = await db.query(
     `SELECT
         SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
@@ -194,7 +238,7 @@ async function updateJobStatus(db, jobId) {
   );
 }
 
-async function claimQueuedItems(client, batchSize) {
+async function claimQueuedItems(client) {
   const r = await client.query(
     `WITH picked AS (
         SELECT id
@@ -209,12 +253,14 @@ async function claimQueuedItems(client, batchSize) {
      FROM picked
      WHERE it.id = picked.id
      RETURNING it.id, it.job_id, it.user_id, it.email`,
-    [batchSize],
+    [BATCH_SIZE],
   );
+
   return r.rows || [];
 }
 
-async function getJobPayload(db, jobId) {
+// ✅ Read job payload INCLUDING attachments if column exists
+async function getJobPayload(jobId) {
   try {
     const r = await db.query(
       `SELECT id, subject, body_html, body_text, audience, attachments
@@ -224,7 +270,7 @@ async function getJobPayload(db, jobId) {
       [jobId],
     );
     return r.rows?.[0] || null;
-  } catch {
+  } catch (_e) {
     const r = await db.query(
       `SELECT id, subject, body_html, body_text, audience
        FROM email_jobs
@@ -239,50 +285,45 @@ async function getJobPayload(db, jobId) {
 function normalizeAttachments(job) {
   const a1 = job?.attachments;
   if (Array.isArray(a1)) return a1;
+
   const a2 = job?.audience?.attachments;
   if (Array.isArray(a2)) return a2;
+
   return [];
 }
 
-let lastConnFingerprint = "";
-function fingerprintConn(conn) {
-  if (!conn) return "";
-  const provider = normalizeProvider(conn.provider);
-  const domain = getSecret(conn.secrets, "domain", "domain");
-  const fromEmail = getSecret(conn.secrets, "fromEmail", "from_email");
-  const region = getSecret(conn.secrets, "region", "region") || "us";
-  return `${provider}|${region}|${domain}|${fromEmail}`;
-}
-
-async function processOnce(db, batchSize) {
-  const conn = await getActiveEmailConnection(db);
+async function processOnce() {
+  const conn = await getActiveEmailConnection();
   if (!conn) {
-    log("No active email connection and MAILGUN env fallback is incomplete.");
+    log(
+      "No active email connection (DB) and MAILGUN env fallback is incomplete. Waiting…",
+    );
     return;
   }
 
   if (normalizeProvider(conn.provider) !== "mailgun") {
-    log(`Provider "${conn.provider}" not implemented in worker yet.`);
+    log(`Provider "${conn.provider}" not implemented in worker yet. Waiting…`);
     return;
   }
 
-  const fp = fingerprintConn(conn);
-  if (VERBOSE || fp !== lastConnFingerprint) {
-    const domain = getSecret(conn.secrets, "domain", "domain");
-    const fromEmail = getSecret(conn.secrets, "fromEmail", "from_email");
-    info(`Using Mailgun domain="${domain}" from="${fromEmail}"`);
-    lastConnFingerprint = fp;
+  // Helpful one-line debug (domain/from)
+  const domain = getSecret(conn.secrets, "domain", "domain");
+  const fromEmail = getSecret(conn.secrets, "fromEmail", "from_email");
+  if (domain && fromEmail) {
+    log(`Using Mailgun domain="${domain}" from="${fromEmail}"`);
   }
 
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
-    const items = await claimQueuedItems(client, batchSize);
+    const items = await claimQueuedItems(client);
     await client.query("COMMIT");
 
-    if (!items.length) return;
-    info(`Claimed ${items.length} item(s)`);
+    log(`Claimed ${items.length} item(s)`);
 
+    if (!items.length) return;
+
+    // Group claimed items by job
     const byJob = new Map();
     for (const it of items) {
       const jobId = Number(it.job_id);
@@ -291,7 +332,8 @@ async function processOnce(db, batchSize) {
     }
 
     for (const [jobId, jobItems] of byJob.entries()) {
-      const job = await getJobPayload(db, jobId);
+      const job = await getJobPayload(jobId);
+
       if (!job) {
         for (const it of jobItems) {
           await db.query(
@@ -301,7 +343,7 @@ async function processOnce(db, batchSize) {
             [it.id, "Job not found"],
           );
         }
-        await updateJobStatus(db, jobId);
+        await updateJobStatus(jobId);
         continue;
       }
 
@@ -336,24 +378,20 @@ async function processOnce(db, batchSize) {
             [it.id],
           );
         } catch (e) {
-          const msg =
-            e?.response?.data?.message ||
-            e?.response?.data?.error ||
-            e?.message ||
-            "Mailgun send failed";
-
-          errlog("Send failed:", safeStr(msg));
+          const msg = safeStr(e?.message || e).slice(0, 1000);
 
           await db.query(
             `UPDATE email_job_items
              SET status='failed', error=$2, updated_at=NOW()
              WHERE id=$1`,
-            [it.id, safeStr(msg).slice(0, 1000)],
+            [it.id, msg],
           );
+
+          errlog(`Send failed to "${to}":`, msg);
         }
       }
 
-      await updateJobStatus(db, jobId);
+      await updateJobStatus(jobId);
     }
   } catch (e) {
     try {
@@ -365,39 +403,39 @@ async function processOnce(db, batchSize) {
   }
 }
 
-async function startEmailWorker(dbInjected, opts = {}) {
-  const db = dbInjected || defaultDb;
-
-  const pollMs = Number(
-    opts.intervalMs || process.env.EMAIL_WORKER_POLL_MS || 2500,
-  );
-  const batchSize = Math.min(
-    Number(opts.batchSize || process.env.EMAIL_WORKER_BATCH_SIZE || 25),
-    100,
-  );
-
-  info(
-    `Starting worker (poll=${pollMs}ms batch=${batchSize} verbose=${VERBOSE ? "on" : "off"})`,
-  );
+function startEmailWorker() {
+  log(`Starting worker (poll=${POLL_MS}ms batch=${BATCH_SIZE})`);
 
   if (!db?.pool?.connect) {
     errlog("DB pool missing. Check server-api/db.js exports.");
-    process.exit(1);
+    return { stop: () => {} };
   }
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+  let stopped = false;
+  const timer = setInterval(async () => {
+    if (stopped) return;
     try {
-      await processOnce(db, batchSize);
+      await processOnce();
     } catch (e) {
       errlog("loop error:", e?.message || e);
     }
-    await new Promise((r) => setTimeout(r, pollMs));
-  }
+  }, POLL_MS);
+
+  // fire once immediately
+  processOnce().catch((e) => errlog("initial run error:", e?.message || e));
+
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+      log("Worker stopped.");
+    },
+  };
+}
+
+// If executed directly: run worker
+if (require.main === module) {
+  startEmailWorker();
 }
 
 module.exports = { startEmailWorker };
-
-if (require.main === module) {
-  startEmailWorker(defaultDb, {});
-}
