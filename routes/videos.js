@@ -399,7 +399,7 @@ router.get("/public/catalog", async (req, res) => {
       FROM videos v
       LEFT JOIN categories c ON c.id = v.category_id
       ${where}
-      ORDER BY COALESCE(v.published_at, v.created_at) DESC
+      ORDER BY COALESCE(v.updated_at, v.published_at, v.created_at) DESC
       LIMIT $${params.length}
     `;
     const r = await db.query(sql, params);
@@ -512,9 +512,14 @@ router.get("/public/:id", async (req, res) => {
     }
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
-    row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: ttl });
+    const isBunnyStream =
+      String(row.provider || "").toLowerCase() === "bunny_stream";
+    row.video_url = isBunnyStream
+      ? row.video_url
+      : bunnySignUrl(row.video_url, { ttlSeconds: ttl });
+    row.playback_url = row.playback_url || row.video_url;
     row.requires_login = true;
-    row.signed_ttl_seconds = ttl;
+    row.signed_ttl_seconds = isBunnyStream ? null : ttl;
 
     return res.json(row);
   } catch (e) {
@@ -561,7 +566,7 @@ router.get("/", authenticate, async (req, res) => {
       FROM videos v
       LEFT JOIN categories c ON c.id = v.category_id
       ${where}
-      ORDER BY COALESCE(v.published_at, v.created_at) DESC
+      ORDER BY COALESCE(v.updated_at, v.published_at, v.created_at) DESC
       LIMIT $${params.length}
     `;
     const r = await db.query(sql, params);
@@ -598,9 +603,18 @@ router.get("/:id", authenticate, async (req, res) => {
 
     const row = { ...r.rows[0] };
 
+    if (row.playback_url && !row.video_url) {
+      row.video_url = row.playback_url;
+    }
+
     if (row.video_url) {
-      row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
-      row.signed_ttl_seconds = 6 * 3600;
+      const isBunnyStream =
+        String(row.provider || "").toLowerCase() === "bunny_stream";
+      row.video_url = isBunnyStream
+        ? row.video_url
+        : bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
+      row.playback_url = row.playback_url || row.video_url;
+      row.signed_ttl_seconds = isBunnyStream ? null : 6 * 3600;
       row.requires_login = false;
     }
 
@@ -625,6 +639,13 @@ router.post("/", authenticate, async (req, res) => {
       "free_preview_seconds",
       "is_published",
       "published_at",
+      "bunny_video_id",
+      "bunny_library_id",
+      "provider",
+      "provider_key",
+      "embed_url",
+      "playback_url",
+      "processing_status",
     ]);
 
     if (!base.video_url) {
@@ -664,8 +685,10 @@ router.post("/", authenticate, async (req, res) => {
       `INSERT INTO videos
        (title, description, short_description, category_id, thumbnail_url, video_url,
         duration_seconds, visibility, is_premium, free_preview_seconds,
-        is_published, published_at, metadata, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        is_published, published_at, metadata, created_by,
+        bunny_video_id, bunny_library_id, provider, provider_key, embed_url,
+        playback_url, processing_status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
        RETURNING *`,
       [
         base.title || null,
@@ -682,6 +705,14 @@ router.post("/", authenticate, async (req, res) => {
         published_at,
         JSON.stringify(md),
         req.user?.id || null,
+        base.bunny_video_id || null,
+        base.bunny_library_id || null,
+        base.provider || (base.bunny_video_id ? "bunny_stream" : null),
+        base.provider_key || base.bunny_video_id || null,
+        base.embed_url || null,
+        base.playback_url || base.video_url || null,
+        base.processing_status ||
+          (base.bunny_video_id ? "processing" : "ready"),
       ],
     );
 
@@ -732,6 +763,13 @@ router.put("/:id", authenticate, async (req, res) => {
       "free_preview_seconds",
       "is_published",
       "published_at",
+      "bunny_video_id",
+      "bunny_library_id",
+      "provider",
+      "provider_key",
+      "embed_url",
+      "playback_url",
+      "processing_status",
     ]);
 
     const sets = [];
@@ -972,12 +1010,16 @@ router.get("/:id/playlists", async (req, res, next) => {
 router.get("/:id/status", authenticate, async (req, res) => {
   const { id } = req.params;
   const q = await db.query(
-    `SELECT id, processing_status, processing_error, processing_updated_at
+    `SELECT id, processing_status, processing_error, processing_updated_at,
+            provider, bunny_video_id, bunny_library_id
      FROM videos
      WHERE id=$1`,
     [id],
   );
   if (!q.rows[0]) return res.status(404).json({ message: "Not found" });
+
+  // Bunny Stream transcoding happens asynchronously on Bunny.
+  // Until a webhook/status sync is added, keep the local status but expose provider IDs.
   res.json(q.rows[0]);
 });
 

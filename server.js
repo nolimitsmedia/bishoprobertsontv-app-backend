@@ -446,6 +446,12 @@ try {
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || "0.0.0.0";
 
+// Keep long-running Wasabi/Bunny imports alive.
+server.requestTimeout = 0;
+server.timeout = 0;
+server.keepAliveTimeout = 75 * 1000;
+server.headersTimeout = 76 * 1000;
+
 server.listen(PORT, HOST, () => {
   console.log(`Server running on http://${HOST}:${PORT}`);
 });

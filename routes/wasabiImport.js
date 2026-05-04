@@ -766,6 +766,13 @@ router.post("/import", async (req, res) => {
   let didBegin = false;
 
   try {
+    // Keep long-running import requests alive for large Wasabi -> Bunny transfers.
+    try {
+      req.setTimeout?.(0);
+      res.setTimeout?.(0);
+      req.socket?.setTimeout?.(0);
+    } catch (_) {}
+
     if (!bunnyEnabled()) {
       return res.status(400).json({
         ok: false,
@@ -794,6 +801,9 @@ router.post("/import", async (req, res) => {
     const visibility = String(body.visibility || "private").toLowerCase();
     const allowedVis = new Set(["private", "unlisted", "public"]);
     const vis = allowedVis.has(visibility) ? visibility : "private";
+    const actorUserId = req.user?.id
+      ? Number(req.user.id) || req.user.id
+      : null;
 
     const titleMode = String(body.default_title_mode || "filename_no_ext");
 
@@ -875,10 +885,11 @@ router.post("/import", async (req, res) => {
               title = COALESCE($2, title),
               category_id = COALESCE($3, category_id),
               visibility = COALESCE($4, visibility),
+              created_by = COALESCE(created_by, $5),
               updated_at = now()
             WHERE id = $1
           `,
-            [dup.rows[0].id, title, category_id, vis],
+            [dup.rows[0].id, title, category_id, vis, actorUserId],
           );
 
           results.replaced++;
@@ -896,12 +907,12 @@ router.post("/import", async (req, res) => {
         const ins = await db.query(
           `
           INSERT INTO videos
-            (title, video_url, category_id, visibility, is_published, created_at, updated_at)
+            (title, video_url, category_id, visibility, is_published, created_by, created_at, updated_at)
           VALUES
-            ($1, $2, $3, $4, FALSE, now(), now())
+            ($1, $2, $3, $4, FALSE, $5, now(), now())
           RETURNING id
         `,
-          [title, cdnUrl, category_id, vis],
+          [title, cdnUrl, category_id, vis, actorUserId],
         );
 
         results.imported++;
