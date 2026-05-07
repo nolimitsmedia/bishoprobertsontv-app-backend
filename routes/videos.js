@@ -512,14 +512,14 @@ router.get("/public/:id", async (req, res) => {
     }
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
-    const isBunnyStream =
-      String(row.provider || "").toLowerCase() === "bunny_stream";
-    row.video_url = isBunnyStream
-      ? row.video_url
-      : bunnySignUrl(row.video_url, { ttlSeconds: ttl });
-    row.playback_url = row.playback_url || row.video_url;
+
+    // ✅ Signed preview URL for both Bunny Storage and Bunny Stream.
+    // Logged-out preview uses the native HLS/video player so the app can enforce
+    // free_preview_seconds. Bunny Stream direct HLS may return 403 unless signed.
+    row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: ttl });
+    row.playback_url = row.video_url;
     row.requires_login = true;
-    row.signed_ttl_seconds = isBunnyStream ? null : ttl;
+    row.signed_ttl_seconds = ttl;
 
     return res.json(row);
   } catch (e) {
@@ -608,13 +608,12 @@ router.get("/:id", authenticate, async (req, res) => {
     }
 
     if (row.video_url) {
-      const isBunnyStream =
-        String(row.provider || "").toLowerCase() === "bunny_stream";
-      row.video_url = isBunnyStream
-        ? row.video_url
-        : bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
-      row.playback_url = row.playback_url || row.video_url;
-      row.signed_ttl_seconds = isBunnyStream ? null : 6 * 3600;
+      // ✅ Sign both Bunny Storage and Bunny Stream native playback URLs.
+      // VideoView will still use Bunny iframe for full-access Bunny Stream videos,
+      // but signed native URLs remain available for fallback and preview logic.
+      row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
+      row.playback_url = row.video_url;
+      row.signed_ttl_seconds = 6 * 3600;
       row.requires_login = false;
     }
 
