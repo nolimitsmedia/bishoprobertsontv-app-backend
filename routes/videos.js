@@ -514,10 +514,14 @@ router.get("/public/:id", async (req, res) => {
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
 
     // ✅ Signed preview URL for both Bunny Storage and Bunny Stream.
-    // Logged-out preview uses the native HLS/video player so the app can enforce
-    // free_preview_seconds. Bunny Stream direct HLS may return 403 unless signed.
-    row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: ttl });
-    row.playback_url = row.video_url;
+    // IMPORTANT: migrated Bunny Stream videos keep the HLS URL in playback_url,
+    // so we must sign playback_url first. Otherwise VideoView receives a raw
+    // vz-*.b-cdn.net playlist.m3u8 and Bunny returns 403 for logged-out preview.
+    const sourceUrl = row.playback_url || row.video_url;
+    const signedUrl = bunnySignUrl(sourceUrl, { ttlSeconds: ttl });
+
+    row.video_url = signedUrl;
+    row.playback_url = signedUrl;
     row.requires_login = true;
     row.signed_ttl_seconds = ttl;
 
@@ -607,13 +611,17 @@ router.get("/:id", authenticate, async (req, res) => {
       row.video_url = row.playback_url;
     }
 
-    if (row.video_url) {
+    if (row.video_url || row.playback_url) {
       // ✅ Sign both Bunny Storage and Bunny Stream native playback URLs.
-      // VideoView will still use Bunny iframe for full-access Bunny Stream videos,
-      // but signed native URLs remain available for fallback and preview logic.
-      row.video_url = bunnySignUrl(row.video_url, { ttlSeconds: 6 * 3600 });
-      row.playback_url = row.video_url;
-      row.signed_ttl_seconds = 6 * 3600;
+      // IMPORTANT: Bunny Stream migrated records store the playlist in playback_url,
+      // so sign playback_url first and return it into both video_url/playback_url.
+      const ttl = 6 * 3600;
+      const sourceUrl = row.playback_url || row.video_url;
+      const signedUrl = bunnySignUrl(sourceUrl, { ttlSeconds: ttl });
+
+      row.video_url = signedUrl;
+      row.playback_url = signedUrl;
+      row.signed_ttl_seconds = ttl;
       row.requires_login = false;
     }
 
