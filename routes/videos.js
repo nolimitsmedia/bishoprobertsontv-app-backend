@@ -7,6 +7,7 @@ const authenticate = require("../middleware/authenticate");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const fetch = require("node-fetch");
 const { getDurationSeconds } = require("../services/mediaMeta");
 
 // 🔔 Centralized FCM sender (Admin SDK with legacy fallback)
@@ -349,11 +350,10 @@ function bunnySignUrl(inputUrl, { ttlSeconds = 3600, tokenPath = null } = {}) {
   const pathname = getPathname(absolute);
 
   const expires = Math.floor(Date.now() / 1000) + Math.max(30, ttlSeconds);
-  // IMPORTANT:
-  // For Bunny Stream HLS playlist signing, use the full playlist path:
-  // /VIDEO_ID/playlist.m3u8
-  // not just /VIDEO_ID/
-  const tp = tokenPath || pathname;
+
+  // For HLS, token_path should normally be the video folder so the playlist
+  // and every segment/key file under that folder can be requested with the same rule.
+  const tp = tokenPath || dirnamePath(pathname);
   const paramData = `token_path=${tp}`;
 
   const hashable = `${BUNNY_KEY}${pathname}${expires}${paramData}`;
@@ -368,6 +368,111 @@ function bunnySignUrl(inputUrl, { ttlSeconds = 3600, tokenPath = null } = {}) {
   return signed.toString();
 }
 
+function encodeProxyUrl(u) {
+  return Buffer.from(String(u || ""), "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function decodeProxyUrl(v) {
+  const raw = String(v || "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  return Buffer.from(raw, "base64").toString("utf8");
+}
+
+function isHlsUrl(u) {
+  const clean = String(u || "")
+    .split("?")[0]
+    .split("#")[0];
+  return /\.m3u8$/i.test(clean) || clean.includes(".m3u8");
+}
+
+function isAllowedPreviewHost(u) {
+  try {
+    const host = new URL(u).hostname.toLowerCase();
+    return (
+      host.endsWith(".b-cdn.net") ||
+      host === "iframe.mediadelivery.net" ||
+      host.endsWith(".mediadelivery.net")
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function fetchBunnyAsset(url, { headers = {} } = {}) {
+  const baseHeaders = {
+    "User-Agent": "BishopRobertsonTV/preview-proxy",
+    // Helps when Bunny domain restrictions expect a frontend referrer.
+    Referer:
+      process.env.CLIENT_ORIGIN?.split(",")?.[0] ||
+      "https://nolimitsmedia.github.io/",
+    Origin:
+      process.env.CLIENT_ORIGIN?.split(",")?.[0] ||
+      "https://nolimitsmedia.github.io",
+    ...headers,
+  };
+
+  let resp = await fetch(url, { headers: baseHeaders });
+
+  // If dashboard token auth is disabled but env token auth is still enabled,
+  // the signed URL can fail. Try the clean URL once before giving up.
+  if (resp.status === 401 || resp.status === 403) {
+    try {
+      const clean = new URL(url);
+      clean.searchParams.delete("token");
+      clean.searchParams.delete("expires");
+      clean.searchParams.delete("token_path");
+      resp = await fetch(clean.toString(), { headers: baseHeaders });
+    } catch {}
+  }
+
+  return resp;
+}
+
+async function getPublishedVideoForPreview(videoId) {
+  const r = await db.query(
+    `
+      SELECT
+        v.*,
+        COALESCE(v.is_premium, TRUE) AS is_premium,
+        ${PREVIEW_SECONDS_SQL},
+        c.name AS category_name
+       FROM videos v
+       LEFT JOIN categories c ON c.id = v.category_id
+       WHERE v.id = $1
+         AND v.is_published = TRUE
+       LIMIT 1`,
+    [videoId],
+  );
+  return r.rowCount ? r.rows[0] : null;
+}
+
+function rewriteM3u8(text, sourceUrl, videoId, ttlSeconds) {
+  const folderTokenPath = dirnamePath(getPathname(sourceUrl));
+
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) return line;
+
+      try {
+        const absoluteChild = new URL(trimmed, sourceUrl).toString();
+        const signedChild = bunnySignUrl(absoluteChild, {
+          ttlSeconds,
+          tokenPath: folderTokenPath,
+        });
+        return `/api/videos/public/${videoId}/preview-proxy?u=${encodeProxyUrl(signedChild)}`;
+      } catch {
+        return line;
+      }
+    })
+    .join("\n");
+}
 /* -------------------- PUBLIC ROUTES -------------------- */
 
 router.get("/public/catalog", async (req, res) => {
@@ -519,21 +624,133 @@ router.get("/public/:id", async (req, res) => {
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
 
-    // Native HLS preview mode for both Bunny Storage and Bunny Stream.
-    // Bunny Stream still provides the transcoded .m3u8; React controls the preview gate.
+    // Native HLS preview mode for logged-out users.
+    // Use our backend preview proxy for HLS so Bunny CORS / domain rules do not break the browser.
     const sourceUrl = row.playback_url || row.video_url;
-    const signedUrl = bunnySignUrl(sourceUrl, { ttlSeconds: ttl });
+    const signedUrl = bunnySignUrl(sourceUrl, {
+      ttlSeconds: ttl,
+      tokenPath: dirnamePath(getPathname(sourceUrl)),
+    });
+    const previewUrl = isHlsUrl(sourceUrl)
+      ? `/api/videos/public/${row.id}/preview.m3u8`
+      : signedUrl;
 
-    row.video_url = signedUrl;
-    row.playback_url = signedUrl;
+    row.video_url = previewUrl;
+    row.playback_url = previewUrl;
     row.requires_login = true;
-    row.preview_mode = "native_hls_preview";
+    row.preview_mode = isHlsUrl(sourceUrl)
+      ? "native_hls_preview_proxy"
+      : "native_direct_preview";
     row.signed_ttl_seconds = ttl;
 
     return res.json(row);
   } catch (e) {
     console.error("[GET /videos/public/:id] error:", e);
     return res.status(500).json({ message: "Failed to fetch video" });
+  }
+});
+
+router.get("/public/:id/preview.m3u8", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) return res.status(400).send("Invalid id");
+
+    const row = await getPublishedVideoForPreview(id);
+    if (!row) return res.status(404).send("Not found");
+
+    const previewSeconds = Number(row.free_preview_seconds || 0);
+    if (!(previewSeconds > 0))
+      return res.status(403).send("Preview unavailable");
+
+    const sourceUrl = row.playback_url || row.video_url;
+    if (
+      !sourceUrl ||
+      !isHlsUrl(sourceUrl) ||
+      !isAllowedPreviewHost(sourceUrl)
+    ) {
+      return res.status(400).send("Invalid preview source");
+    }
+
+    const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
+    const signedPlaylistUrl = bunnySignUrl(sourceUrl, {
+      ttlSeconds: ttl,
+      tokenPath: dirnamePath(getPathname(sourceUrl)),
+    });
+
+    const upstream = await fetchBunnyAsset(signedPlaylistUrl);
+    if (!upstream.ok) {
+      const detail = await upstream.text().catch(() => "");
+      console.error(
+        "[preview.m3u8] upstream failed",
+        upstream.status,
+        detail.slice(0, 250),
+      );
+      return res.status(upstream.status).send("Preview playlist unavailable");
+    }
+
+    const playlist = await upstream.text();
+    const rewritten = rewriteM3u8(playlist, signedPlaylistUrl, id, ttl);
+
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.send(rewritten);
+  } catch (e) {
+    console.error("[GET /videos/public/:id/preview.m3u8] error:", e);
+    return res.status(500).send("Preview playlist failed");
+  }
+});
+
+router.get("/public/:id/preview-proxy", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) return res.status(400).send("Invalid id");
+
+    const row = await getPublishedVideoForPreview(id);
+    if (!row) return res.status(404).send("Not found");
+
+    const previewSeconds = Number(row.free_preview_seconds || 0);
+    if (!(previewSeconds > 0))
+      return res.status(403).send("Preview unavailable");
+
+    const target = decodeProxyUrl(req.query.u);
+    if (!target || !isAllowedPreviewHost(target)) {
+      return res.status(400).send("Invalid preview asset");
+    }
+
+    const upstream = await fetchBunnyAsset(target, {
+      headers: req.headers.range ? { Range: req.headers.range } : {},
+    });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      const detail = await upstream.text().catch(() => "");
+      console.error(
+        "[preview-proxy] upstream failed",
+        upstream.status,
+        detail.slice(0, 250),
+      );
+      return res.status(upstream.status).send("Preview asset unavailable");
+    }
+
+    res.status(upstream.status);
+    const passthrough = [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "cache-control",
+    ];
+    for (const h of passthrough) {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    if (!res.getHeader("Cache-Control")) {
+      res.setHeader("Cache-Control", "public, max-age=300");
+    }
+
+    return upstream.body.pipe(res);
+  } catch (e) {
+    console.error("[GET /videos/public/:id/preview-proxy] error:", e);
+    return res.status(500).send("Preview proxy failed");
   }
 });
 
