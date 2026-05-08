@@ -349,7 +349,11 @@ function bunnySignUrl(inputUrl, { ttlSeconds = 3600, tokenPath = null } = {}) {
   const pathname = getPathname(absolute);
 
   const expires = Math.floor(Date.now() / 1000) + Math.max(30, ttlSeconds);
-  const tp = tokenPath || dirnamePath(pathname);
+  // IMPORTANT:
+  // For Bunny Stream HLS playlist signing, use the full playlist path:
+  // /VIDEO_ID/playlist.m3u8
+  // not just /VIDEO_ID/
+  const tp = tokenPath || pathname;
   const paramData = `token_path=${tp}`;
 
   const hashable = `${BUNNY_KEY}${pathname}${expires}${paramData}`;
