@@ -507,22 +507,23 @@ router.get("/public/:id", async (req, res) => {
 
     if (!(previewSeconds > 0)) {
       row.video_url = null;
+      row.playback_url = null;
+      row.embed_url = null;
       row.requires_login = true;
       return res.json(row);
     }
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
 
-    // ✅ Signed preview URL for both Bunny Storage and Bunny Stream.
-    // IMPORTANT: migrated Bunny Stream videos keep the HLS URL in playback_url,
-    // so we must sign playback_url first. Otherwise VideoView receives a raw
-    // vz-*.b-cdn.net playlist.m3u8 and Bunny returns 403 for logged-out preview.
+    // Native HLS preview mode for both Bunny Storage and Bunny Stream.
+    // Bunny Stream still provides the transcoded .m3u8; React controls the preview gate.
     const sourceUrl = row.playback_url || row.video_url;
     const signedUrl = bunnySignUrl(sourceUrl, { ttlSeconds: ttl });
 
     row.video_url = signedUrl;
     row.playback_url = signedUrl;
     row.requires_login = true;
+    row.preview_mode = "native_hls_preview";
     row.signed_ttl_seconds = ttl;
 
     return res.json(row);
@@ -641,6 +642,10 @@ router.post("/", authenticate, async (req, res) => {
       "category_id",
       "thumbnail_url",
       "video_url",
+      "preview_video_url",
+      "preview_embed_url",
+      "preview_bunny_video_id",
+      "preview_duration_seconds",
       "visibility",
       "is_premium",
       "free_preview_seconds",
@@ -694,8 +699,9 @@ router.post("/", authenticate, async (req, res) => {
         duration_seconds, visibility, is_premium, free_preview_seconds,
         is_published, published_at, metadata, created_by,
         bunny_video_id, bunny_library_id, provider, provider_key, embed_url,
-        playback_url, processing_status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+        playback_url, processing_status, preview_video_url, preview_embed_url,
+        preview_bunny_video_id, preview_duration_seconds)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
        RETURNING *`,
       [
         base.title || null,
@@ -720,6 +726,10 @@ router.post("/", authenticate, async (req, res) => {
         base.playback_url || base.video_url || null,
         base.processing_status ||
           (base.bunny_video_id ? "processing" : "ready"),
+        base.preview_video_url || null,
+        base.preview_embed_url || null,
+        base.preview_bunny_video_id || null,
+        coerceNonNegInt(base.preview_duration_seconds, 0),
       ],
     );
 
@@ -765,6 +775,10 @@ router.put("/:id", authenticate, async (req, res) => {
       "category_id",
       "thumbnail_url",
       "video_url",
+      "preview_video_url",
+      "preview_embed_url",
+      "preview_bunny_video_id",
+      "preview_duration_seconds",
       "visibility",
       "is_premium",
       "free_preview_seconds",
