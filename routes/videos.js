@@ -749,17 +749,16 @@ router.get("/public/:id", async (req, res) => {
     const row = { ...r.rows[0] };
     const previewSeconds = Number(row.free_preview_seconds || 0);
 
-    // Public watch responses must never expose the full iframe/full playback
-    // source unless a controlled preview source is returned below.
-    // This protects Bunny Storage videos from playing full-length while logged out.
-    row.requires_login = true;
-    row.embed_url = null;
+    if (!row.video_url) {
+      row.requires_login = true;
+      return res.json(row);
+    }
 
     if (!(previewSeconds > 0)) {
       row.video_url = null;
       row.playback_url = null;
-      row.hls_url = null;
-      row.preview_mode = "login_required_no_preview";
+      row.embed_url = null;
+      row.requires_login = true;
       return res.json(row);
     }
 
@@ -774,7 +773,6 @@ router.get("/public/:id", async (req, res) => {
     if (!sourceUrl) {
       row.video_url = null;
       row.playback_url = null;
-      row.hls_url = null;
       row.embed_url = null;
       row.requires_login = true;
       row.preview_mode = "preview_source_missing";
@@ -784,7 +782,9 @@ router.get("/public/:id", async (req, res) => {
     const playableUrl = signPlaybackUrlForRow(row, sourceUrl, ttl);
     const previewUrl = isHlsUrl(sourceUrl)
       ? `/api/videos/public/${row.id}/preview.m3u8`
-      : playableUrl;
+      : isAllowedPreviewHost(playableUrl)
+        ? `/api/videos/public/${row.id}/preview-proxy?u=${encodeProxyUrl(playableUrl)}`
+        : playableUrl;
 
     row.video_url = previewUrl;
     row.playback_url = previewUrl;
@@ -802,7 +802,6 @@ router.get("/public/:id", async (req, res) => {
         : "video_source";
     row.signed_ttl_seconds = ttl;
 
-    res.setHeader("Cache-Control", "no-store, max-age=0");
     return res.json(row);
   } catch (e) {
     console.error("[GET /videos/public/:id] error:", e);
