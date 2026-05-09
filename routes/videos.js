@@ -403,34 +403,174 @@ function isAllowedPreviewHost(u) {
   }
 }
 
-async function fetchBunnyAsset(url, { headers = {} } = {}) {
+function cleanBunnyUrl(url) {
+  try {
+    const clean = new URL(url);
+    clean.searchParams.delete("token");
+    clean.searchParams.delete("expires");
+    clean.searchParams.delete("token_path");
+    return clean.toString();
+  } catch {
+    return url;
+  }
+}
+
+function getHostNameSafe(u) {
+  try {
+    return new URL(u).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isBunnyStreamHost(u) {
+  const host = getHostNameSafe(u);
+  return (
+    /^vz-\d+\.b-cdn\.net$/i.test(host) || host.endsWith(".mediadelivery.net")
+  );
+}
+
+function isBunnyStreamRow(row) {
+  return (
+    String(row?.provider || "").toLowerCase() === "bunny_stream" ||
+    !!row?.bunny_video_id ||
+    !!row?.bunny_library_id ||
+    isBunnyStreamHost(row?.playback_url || row?.video_url || "")
+  );
+}
+
+function parseMetadataObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function getMigrationSourceUrl(row) {
+  const md = parseMetadataObject(row?.metadata);
+  return String(
+    md?.bunny_stream_migration?.source_url ||
+      md?.bunny_stream_migration?.sourceUrl ||
+      md?.source_url ||
+      "",
+  ).trim();
+}
+
+function getLoggedOutPreviewSource(row) {
+  // Priority for logged-out preview:
+  // 1) explicitly uploaded preview/trailer file if available
+  // 2) original source file saved during Bunny Stream migration
+  // 3) normal video_url for Bunny Storage / MP4 records
+  // 4) playback_url only as a last fallback
+  //
+  // Important: for Bunny Stream migrated videos, playback_url is usually
+  // https://vz-<library>.b-cdn.net/<guid>/playlist.m3u8. That URL is often
+  // blocked by Bunny Stream Allowed Domains / direct-file rules when used as
+  // native HLS. The original migration source is safer for preview gating.
+  const explicitPreview = String(
+    row?.preview_video_url ||
+      row?.preview_url ||
+      row?.trailer_url ||
+      parseMetadataObject(row?.metadata)?.trailer?.url ||
+      "",
+  ).trim();
+  if (explicitPreview) return explicitPreview;
+
+  const migratedSource = getMigrationSourceUrl(row);
+  if (isBunnyStreamRow(row) && migratedSource) return migratedSource;
+
+  const videoUrl = String(row?.video_url || "").trim();
+  if (videoUrl && !isBunnyStreamHost(videoUrl)) return videoUrl;
+
+  return String(row?.playback_url || row?.video_url || "").trim();
+}
+
+function signPlaybackUrlForRow(row, inputUrl, ttlSeconds) {
+  if (!inputUrl) return "";
+
+  // Bunny Stream uses Allowed Domains in this project, not CDN token auth.
+  // The BUNNY_TOKEN_AUTH_* env values belong to Bunny Storage. Signing Stream
+  // HLS URLs with that key causes 403/unconfigured responses from vz-*.b-cdn.net.
+  if (isBunnyStreamRow(row) || isBunnyStreamHost(inputUrl)) {
+    return cleanBunnyUrl(inputUrl);
+  }
+
+  return bunnySignUrl(inputUrl, {
+    ttlSeconds,
+    tokenPath: dirnamePath(getPathname(inputUrl)),
+  });
+}
+
+function normalizeHeaderOrigin(value) {
+  try {
+    if (!value) return "";
+    const u = new URL(String(value));
+    return u.origin;
+  } catch {
+    return "";
+  }
+}
+
+function getPreviewRequestOrigin(req) {
+  const fromOrigin = normalizeHeaderOrigin(req.get("origin"));
+  if (fromOrigin) return fromOrigin;
+
+  const fromReferer = normalizeHeaderOrigin(
+    req.get("referer") || req.get("referrer"),
+  );
+  if (fromReferer) return fromReferer;
+
+  return (
+    process.env.CLIENT_ORIGIN?.split(",")?.[0] ||
+    "https://nolimitsmedia.github.io"
+  ).replace(/\/+$/g, "");
+}
+
+async function fetchBunnyAsset(
+  url,
+  { headers = {}, req = null, preferClean = true } = {},
+) {
+  const requestOrigin = req ? getPreviewRequestOrigin(req) : "";
+  const fallbackOrigin = (
+    process.env.CLIENT_ORIGIN?.split(",")?.[0] ||
+    "https://nolimitsmedia.github.io"
+  ).replace(/\/+$/g, "");
+  const allowedOrigin = requestOrigin || fallbackOrigin;
+
   const baseHeaders = {
-    "User-Agent": "BishopRobertsonTV/preview-proxy",
-    // Helps when Bunny domain restrictions expect a frontend referrer.
-    Referer:
-      process.env.CLIENT_ORIGIN?.split(",")?.[0] ||
-      "https://nolimitsmedia.github.io/",
-    Origin:
-      process.env.CLIENT_ORIGIN?.split(",")?.[0] ||
-      "https://nolimitsmedia.github.io",
+    "User-Agent": "Mozilla/5.0 BishopRobertsonTVPreviewProxy/1.0",
+    // Bunny Stream domain rules check the referrer. Do not send a Node Origin
+    // header here because it can make Bunny treat the proxy request like a
+    // browser CORS request.
+    Referer: `${allowedOrigin}/`,
     ...headers,
   };
 
-  let resp = await fetch(url, { headers: baseHeaders });
+  const cleanUrl = cleanBunnyUrl(url);
 
-  // If dashboard token auth is disabled but env token auth is still enabled,
-  // the signed URL can fail. Try the clean URL once before giving up.
-  if (resp.status === 401 || resp.status === 403) {
-    try {
-      const clean = new URL(url);
-      clean.searchParams.delete("token");
-      clean.searchParams.delete("expires");
-      clean.searchParams.delete("token_path");
-      resp = await fetch(clean.toString(), { headers: baseHeaders });
-    } catch {}
+  // For Bunny Stream, request the clean URL only. Do not retry a signed Stream
+  // URL because the storage token is not valid for the Stream CDN.
+  const attempts = isBunnyStreamHost(cleanUrl)
+    ? [cleanUrl]
+    : preferClean && cleanUrl !== url
+      ? [cleanUrl, url]
+      : [url, cleanUrl];
+
+  let lastResp = null;
+
+  for (const attemptUrl of Array.from(new Set(attempts))) {
+    const resp = await fetch(attemptUrl, { headers: baseHeaders });
+    lastResp = resp;
+    if (resp.ok || resp.status === 206) return resp;
+    if (![401, 403].includes(resp.status)) return resp;
   }
 
-  return resp;
+  return lastResp;
 }
 
 async function getPublishedVideoForPreview(videoId) {
@@ -451,9 +591,7 @@ async function getPublishedVideoForPreview(videoId) {
   return r.rowCount ? r.rows[0] : null;
 }
 
-function rewriteM3u8(text, sourceUrl, videoId, ttlSeconds) {
-  const folderTokenPath = dirnamePath(getPathname(sourceUrl));
-
+function rewriteM3u8(text, sourceUrl, videoId, ttlSeconds, row = null) {
   return String(text || "")
     .split(/\r?\n/)
     .map((line) => {
@@ -462,17 +600,19 @@ function rewriteM3u8(text, sourceUrl, videoId, ttlSeconds) {
 
       try {
         const absoluteChild = new URL(trimmed, sourceUrl).toString();
-        const signedChild = bunnySignUrl(absoluteChild, {
+        const playableChild = signPlaybackUrlForRow(
+          row,
+          absoluteChild,
           ttlSeconds,
-          tokenPath: folderTokenPath,
-        });
-        return `/api/videos/public/${videoId}/preview-proxy?u=${encodeProxyUrl(signedChild)}`;
+        );
+        return `/api/videos/public/${videoId}/preview-proxy?u=${encodeProxyUrl(playableChild)}`;
       } catch {
         return line;
       }
     })
     .join("\n");
 }
+
 /* -------------------- PUBLIC ROUTES -------------------- */
 
 router.get("/public/catalog", async (req, res) => {
@@ -609,40 +749,60 @@ router.get("/public/:id", async (req, res) => {
     const row = { ...r.rows[0] };
     const previewSeconds = Number(row.free_preview_seconds || 0);
 
-    if (!row.video_url) {
-      row.requires_login = true;
-      return res.json(row);
-    }
+    // Public watch responses must never expose the full iframe/full playback
+    // source unless a controlled preview source is returned below.
+    // This protects Bunny Storage videos from playing full-length while logged out.
+    row.requires_login = true;
+    row.embed_url = null;
 
     if (!(previewSeconds > 0)) {
       row.video_url = null;
       row.playback_url = null;
-      row.embed_url = null;
-      row.requires_login = true;
+      row.hls_url = null;
+      row.preview_mode = "login_required_no_preview";
       return res.json(row);
     }
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
 
-    // Native HLS preview mode for logged-out users.
-    // Use our backend preview proxy for HLS so Bunny CORS / domain rules do not break the browser.
-    const sourceUrl = row.playback_url || row.video_url;
-    const signedUrl = bunnySignUrl(sourceUrl, {
-      ttlSeconds: ttl,
-      tokenPath: dirnamePath(getPathname(sourceUrl)),
-    });
+    // Logged-out preview must be controllable by our native <video> player.
+    // For Bunny Stream migrated videos, do NOT use the Stream HLS URL here when
+    // an original migration source exists. Bunny Stream HLS is commonly blocked
+    // by Allowed Domains/direct-file rules outside the iframe player.
+    const sourceUrl = getLoggedOutPreviewSource(row);
+
+    if (!sourceUrl) {
+      row.video_url = null;
+      row.playback_url = null;
+      row.hls_url = null;
+      row.embed_url = null;
+      row.requires_login = true;
+      row.preview_mode = "preview_source_missing";
+      return res.json(row);
+    }
+
+    const playableUrl = signPlaybackUrlForRow(row, sourceUrl, ttl);
     const previewUrl = isHlsUrl(sourceUrl)
       ? `/api/videos/public/${row.id}/preview.m3u8`
-      : signedUrl;
+      : playableUrl;
 
     row.video_url = previewUrl;
     row.playback_url = previewUrl;
+    // Never expose the Bunny Stream iframe to logged-out users unless you have
+    // a separate short preview asset. The iframe cannot be reliably stopped by
+    // our preview gate JavaScript.
+    row.embed_url = null;
     row.requires_login = true;
     row.preview_mode = isHlsUrl(sourceUrl)
       ? "native_hls_preview_proxy"
       : "native_direct_preview";
+    row.preview_source_type =
+      isBunnyStreamRow(row) && getMigrationSourceUrl(row)
+        ? "migration_source"
+        : "video_source";
     row.signed_ttl_seconds = ttl;
 
+    res.setHeader("Cache-Control", "no-store, max-age=0");
     return res.json(row);
   } catch (e) {
     console.error("[GET /videos/public/:id] error:", e);
@@ -662,7 +822,7 @@ router.get("/public/:id/preview.m3u8", async (req, res) => {
     if (!(previewSeconds > 0))
       return res.status(403).send("Preview unavailable");
 
-    const sourceUrl = row.playback_url || row.video_url;
+    const sourceUrl = getLoggedOutPreviewSource(row);
     if (
       !sourceUrl ||
       !isHlsUrl(sourceUrl) ||
@@ -672,12 +832,12 @@ router.get("/public/:id/preview.m3u8", async (req, res) => {
     }
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
-    const signedPlaylistUrl = bunnySignUrl(sourceUrl, {
-      ttlSeconds: ttl,
-      tokenPath: dirnamePath(getPathname(sourceUrl)),
-    });
+    const playlistUrl = signPlaybackUrlForRow(row, sourceUrl, ttl);
 
-    const upstream = await fetchBunnyAsset(signedPlaylistUrl);
+    const upstream = await fetchBunnyAsset(playlistUrl, {
+      req,
+      preferClean: true,
+    });
     if (!upstream.ok) {
       const detail = await upstream.text().catch(() => "");
       console.error(
@@ -689,7 +849,7 @@ router.get("/public/:id/preview.m3u8", async (req, res) => {
     }
 
     const playlist = await upstream.text();
-    const rewritten = rewriteM3u8(playlist, signedPlaylistUrl, id, ttl);
+    const rewritten = rewriteM3u8(playlist, playlistUrl, id, ttl, row);
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, max-age=0");
@@ -718,6 +878,8 @@ router.get("/public/:id/preview-proxy", async (req, res) => {
     }
 
     const upstream = await fetchBunnyAsset(target, {
+      req,
+      preferClean: true,
       headers: req.headers.range ? { Range: req.headers.range } : {},
     });
 
