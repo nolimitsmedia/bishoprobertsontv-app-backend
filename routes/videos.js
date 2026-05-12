@@ -613,6 +613,55 @@ function rewriteM3u8(text, sourceUrl, videoId, ttlSeconds, row = null) {
     .join("\n");
 }
 
+/* -------------------- WATCH PROGRESS (DB RESUME) -------------------- */
+
+let watchProgressTableReady = false;
+let watchProgressTablePromise = null;
+
+async function ensureWatchProgressTable() {
+  if (watchProgressTableReady) return;
+  if (watchProgressTablePromise) return watchProgressTablePromise;
+
+  watchProgressTablePromise = db
+    .query(
+      `
+      CREATE TABLE IF NOT EXISTS watch_progress (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        position_seconds INTEGER NOT NULL DEFAULT 0,
+        duration_seconds INTEGER,
+        completed BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (user_id, video_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_watch_progress_user_updated
+        ON watch_progress (user_id, updated_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_watch_progress_video_updated
+        ON watch_progress (video_id, updated_at DESC);
+    `,
+    )
+    .then(() => {
+      watchProgressTableReady = true;
+    })
+    .catch((err) => {
+      watchProgressTableReady = false;
+      watchProgressTablePromise = null;
+      throw err;
+    });
+
+  return watchProgressTablePromise;
+}
+
+function coerceProgressSeconds(v, fallback = 0) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.floor(n));
+}
+
 /* -------------------- PUBLIC ROUTES -------------------- */
 
 router.get("/public/catalog", async (req, res) => {
@@ -961,6 +1010,92 @@ router.get("/", authenticate, async (req, res) => {
   } catch (e) {
     console.error("[GET /videos] error:", e);
     res.status(500).json({ message: "Failed to fetch videos" });
+  }
+});
+
+router.get("/:id/progress", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) {
+      return res.status(400).json({ ok: false, message: "Invalid id" });
+    }
+
+    await ensureWatchProgressTable();
+
+    const r = await db.query(
+      `SELECT position_seconds,
+              duration_seconds,
+              completed,
+              updated_at
+         FROM watch_progress
+        WHERE user_id = $1
+          AND video_id = $2
+        LIMIT 1`,
+      [String(req.user.id), Number(id)],
+    );
+
+    if (r.rowCount === 0) {
+      return res.json({
+        ok: true,
+        video_id: Number(id),
+        position_seconds: 0,
+        duration_seconds: null,
+        completed: false,
+        updated_at: null,
+      });
+    }
+
+    return res.json({ ok: true, video_id: Number(id), ...r.rows[0] });
+  } catch (e) {
+    console.error("[GET /videos/:id/progress] error:", e);
+    return res
+      .status(500)
+      .json({ ok: false, message: "Failed to fetch watch progress" });
+  }
+});
+
+router.post("/:id/progress", authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isDigits(id)) {
+      return res.status(400).json({ ok: false, message: "Invalid id" });
+    }
+
+    await ensureWatchProgressTable();
+
+    const position = coerceProgressSeconds(
+      req.body?.position_seconds ?? req.body?.position ?? req.body?.seconds,
+      0,
+    );
+    const durationRaw =
+      req.body?.duration_seconds ?? req.body?.duration ?? null;
+    const duration =
+      durationRaw == null ? null : coerceProgressSeconds(durationRaw, 0);
+
+    const completed =
+      Boolean(req.body?.completed) ||
+      (duration && duration > 0 && position >= Math.max(0, duration - 5));
+
+    const r = await db.query(
+      `INSERT INTO watch_progress
+         (user_id, video_id, position_seconds, duration_seconds, completed, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (user_id, video_id)
+       DO UPDATE SET
+         position_seconds = EXCLUDED.position_seconds,
+         duration_seconds = COALESCE(EXCLUDED.duration_seconds, watch_progress.duration_seconds),
+         completed = EXCLUDED.completed OR watch_progress.completed,
+         updated_at = NOW()
+       RETURNING position_seconds, duration_seconds, completed, updated_at`,
+      [String(req.user.id), Number(id), position, duration, completed],
+    );
+
+    return res.json({ ok: true, video_id: Number(id), ...r.rows[0] });
+  } catch (e) {
+    console.error("[POST /videos/:id/progress] error:", e);
+    return res
+      .status(500)
+      .json({ ok: false, message: "Failed to save watch progress" });
   }
 });
 

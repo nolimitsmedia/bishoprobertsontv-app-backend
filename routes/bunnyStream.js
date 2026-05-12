@@ -493,6 +493,211 @@ router.post(
   },
 );
 
+/* -------------------- Bunny Stream -> Bunny Storage Restore Helpers -------------------- */
+
+function cleanStorageUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw) return "";
+  try {
+    const u = new URL(raw);
+    u.searchParams.delete("token");
+    u.searchParams.delete("expires");
+    u.searchParams.delete("token_path");
+    return u.toString();
+  } catch {
+    return raw;
+  }
+}
+
+function extractStorageProviderKey(url) {
+  const raw = cleanStorageUrl(url);
+  try {
+    const u = new URL(raw);
+    const configuredBase = BUNNY_STORAGE_CDN_BASE
+      ? new URL(BUNNY_STORAGE_CDN_BASE)
+      : null;
+
+    if (configuredBase && u.hostname === configuredBase.hostname) {
+      return decodeURIComponent((u.pathname || "/").replace(/^\/+/, ""));
+    }
+
+    return decodeURIComponent((u.pathname || "/").replace(/^\/+/, ""));
+  } catch {
+    return "";
+  }
+}
+
+function getRestoreStorageSource(localVideo) {
+  const md = localVideo?.metadata || {};
+  const migration = md?.bunny_stream_migration || {};
+  const restore = md?.bunny_storage_restore || {};
+
+  const candidates = [
+    restore.storage_url,
+    restore.source_url,
+    migration.source_url,
+    migration.sourceUrl,
+    md.source_url,
+    md.original_video_url,
+    md.original_url,
+  ];
+
+  for (const candidate of candidates) {
+    const clean = cleanStorageUrl(candidate);
+    if (
+      clean &&
+      isHttpUrl(clean) &&
+      !String(clean).includes("mediadelivery.net")
+    ) {
+      return clean;
+    }
+  }
+
+  return "";
+}
+
+async function restoreOneBunnyStreamToStorage(localVideo) {
+  if (!localVideo) throw new Error("Video not found.");
+
+  const provider = String(localVideo.provider || "").toLowerCase();
+  if (provider !== "bunny_stream" && !localVideo.bunny_video_id) {
+    return { skipped: true, reason: "not_bunny_stream", video: localVideo };
+  }
+
+  const storageUrl = getRestoreStorageSource(localVideo);
+  if (!storageUrl) {
+    throw new Error(
+      "No original Bunny Storage source URL was found for this Bunny Stream video. Restore is only possible when the original storage URL was saved during migration.",
+    );
+  }
+
+  const cleanUrl = cleanStorageUrl(storageUrl);
+  const providerKey = extractStorageProviderKey(cleanUrl);
+
+  const metaPatch = {
+    bunny_storage_restore: {
+      restored_at: new Date().toISOString(),
+      storage_url: cleanUrl,
+      previous_provider: localVideo.provider || null,
+      previous_bunny_video_id: localVideo.bunny_video_id || null,
+      previous_bunny_library_id: localVideo.bunny_library_id || null,
+      previous_playback_url: localVideo.playback_url || null,
+      previous_embed_url: localVideo.embed_url || null,
+    },
+  };
+
+  const result = await db.query(
+    `
+      UPDATE videos
+         SET provider = 'bunny',
+             provider_key = COALESCE(NULLIF($3, ''), provider_key),
+             bunny_video_id = NULL,
+             bunny_library_id = NULL,
+             playback_url = NULL,
+             embed_url = NULL,
+             video_url = $2,
+             processing_status = 'ready',
+             metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || $4::jsonb,
+             updated_at = NOW()
+       WHERE id = $1
+       RETURNING *
+    `,
+    [localVideo.id, cleanUrl, providerKey, JSON.stringify(metaPatch)],
+  );
+
+  return { skipped: false, video: result.rows[0], storageUrl: cleanUrl };
+}
+
+/**
+ * POST /api/bunny/stream/restore-storage/:id
+ * Switches a Bunny Stream video record back to its saved Bunny Storage source URL.
+ */
+router.post(
+  "/bunny/stream/restore-storage/:id",
+  authenticate,
+  allowUploadRoles,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id)) {
+        return res.status(400).json({ ok: false, message: "Invalid video ID" });
+      }
+
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        id,
+      ]);
+      if (q.rowCount === 0) {
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      }
+
+      const result = await restoreOneBunnyStreamToStorage(q.rows[0]);
+      return res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error("[bunnyStream] restore storage one error:", err);
+      return res.status(500).json({
+        ok: false,
+        message: err?.message || "Restore to Bunny Storage failed",
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/bunny/stream/restore-storage-bulk
+ * Body: { ids: number[] }
+ */
+router.post(
+  "/bunny/stream/restore-storage-bulk",
+  authenticate,
+  allowUploadRoles,
+  async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    if (!ids.length) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "No video IDs provided" });
+    }
+
+    const results = [];
+    for (const rawId of ids) {
+      const id = Number(rawId);
+      if (!Number.isFinite(id)) {
+        results.push({ id: rawId, ok: false, message: "Invalid video ID" });
+        continue;
+      }
+
+      try {
+        const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+          id,
+        ]);
+        if (q.rowCount === 0) {
+          results.push({ id, ok: false, message: "Video not found" });
+          continue;
+        }
+
+        const restored = await restoreOneBunnyStreamToStorage(q.rows[0]);
+        results.push({
+          id,
+          ok: true,
+          skipped: !!restored.skipped,
+          reason: restored.reason || null,
+          storageUrl: restored.storageUrl || restored.video?.video_url || null,
+        });
+      } catch (err) {
+        results.push({
+          id,
+          ok: false,
+          message: err?.message || "Restore to Bunny Storage failed",
+        });
+      }
+    }
+
+    const ok = results.filter((r) => r.ok).length;
+    const failed = results.length - ok;
+    return res.json({ ok: failed === 0, restored: ok, failed, results });
+  },
+);
+
 async function getBunnyVideoById(videoId) {
   if (!videoId) return null;
   try {
