@@ -294,6 +294,36 @@ const PREVIEW_SECONDS_SQL = `
   ) AS free_preview_seconds
 `;
 
+/* -------------------- ADMIN VIDEO LIST PERFORMANCE INDEXES -------------------- */
+let videoListIndexesStarted = false;
+function ensureVideoListIndexes() {
+  if (videoListIndexesStarted) return;
+  videoListIndexesStarted = true;
+
+  // Fire-and-forget: these indexes speed up the admin Videos page filtering,
+  // sorting, ownership checks, and pagination without blocking every request.
+  const statements = [
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_published_at ON videos (published_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_updated_at ON videos (updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_created_at ON videos (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_title_lower ON videos (LOWER(title))",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_category_id ON videos (category_id)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_created_by ON videos (created_by)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_published ON videos (is_published)",
+    "CREATE INDEX IF NOT EXISTS idx_videos_admin_provider_status ON videos (provider, processing_status)",
+  ];
+
+  Promise.allSettled(statements.map((sql) => db.query(sql))).then((results) => {
+    const failed = results.find((r) => r.status === "rejected");
+    if (failed) {
+      console.warn(
+        "[videos] one or more performance indexes were skipped:",
+        failed.reason?.message || failed.reason,
+      );
+    }
+  });
+}
+
 /* -------------------- BUNNY TOKEN AUTH (V2) -------------------- */
 /**
  * Bunny Token Auth (V2): token = Base64URL( SHA256_RAW( key + path + expires + queryParamsSorted ) )
@@ -622,9 +652,12 @@ async function ensureWatchProgressTable() {
   if (watchProgressTableReady) return;
   if (watchProgressTablePromise) return watchProgressTablePromise;
 
-  watchProgressTablePromise = db
-    .query(
-      `
+  // Keep this defensive because some dev/prod databases may already have an
+  // older watch_progress table that was created before the unique constraint or
+  // the newer columns existed. ON CONFLICT(user_id, video_id) requires a unique
+  // index, and completed must never be inserted as NULL.
+  watchProgressTablePromise = (async () => {
+    await db.query(`
       CREATE TABLE IF NOT EXISTS watch_progress (
         id SERIAL PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -633,25 +666,49 @@ async function ensureWatchProgressTable() {
         duration_seconds INTEGER,
         completed BOOLEAN NOT NULL DEFAULT FALSE,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (user_id, video_id)
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
 
+    await db.query(
+      `ALTER TABLE watch_progress
+         ADD COLUMN IF NOT EXISTS position_seconds INTEGER NOT NULL DEFAULT 0,
+         ADD COLUMN IF NOT EXISTS duration_seconds INTEGER,
+         ADD COLUMN IF NOT EXISTS completed BOOLEAN NOT NULL DEFAULT FALSE,
+         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+    );
+
+    // Remove older duplicate progress rows before creating the unique index.
+    await db.query(`
+      DELETE FROM watch_progress a
+      USING watch_progress b
+      WHERE a.ctid < b.ctid
+        AND a.user_id = b.user_id
+        AND a.video_id = b.video_id
+    `);
+
+    await db.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_progress_user_video_unique
+        ON watch_progress (user_id, video_id)
+    `);
+
+    await db.query(`
       CREATE INDEX IF NOT EXISTS idx_watch_progress_user_updated
-        ON watch_progress (user_id, updated_at DESC);
+        ON watch_progress (user_id, updated_at DESC)
+    `);
 
+    await db.query(`
       CREATE INDEX IF NOT EXISTS idx_watch_progress_video_updated
-        ON watch_progress (video_id, updated_at DESC);
-    `,
-    )
-    .then(() => {
-      watchProgressTableReady = true;
-    })
-    .catch((err) => {
-      watchProgressTableReady = false;
-      watchProgressTablePromise = null;
-      throw err;
-    });
+        ON watch_progress (video_id, updated_at DESC)
+    `);
+
+    watchProgressTableReady = true;
+  })().catch((err) => {
+    watchProgressTableReady = false;
+    watchProgressTablePromise = null;
+    throw err;
+  });
 
   return watchProgressTablePromise;
 }
@@ -968,7 +1025,25 @@ router.get("/public/:id/preview-proxy", async (req, res) => {
 
 router.get("/", authenticate, async (req, res) => {
   try {
-    const { search, category_id, status = "all", limit = 50 } = req.query;
+    ensureVideoListIndexes();
+
+    const {
+      search,
+      q,
+      category_id,
+      status = "all",
+      sort = "newest",
+      sortBy,
+      page = 1,
+      offset,
+      limit = 50,
+    } = req.query;
+
+    const safeLimit = Math.max(1, Math.min(100, Number(limit) || 50));
+    const safePage = Math.max(1, Number(page) || 1);
+    const safeOffset = Number.isFinite(Number(offset))
+      ? Math.max(0, Number(offset))
+      : (safePage - 1) * safeLimit;
 
     const params = [];
     let where = "WHERE 1=1";
@@ -978,8 +1053,9 @@ router.get("/", authenticate, async (req, res) => {
       where += ` AND v.created_by = $${params.length}`;
     }
 
-    if (search) {
-      params.push(`%${search}%`);
+    const term = String(search || q || "").trim();
+    if (term) {
+      params.push(`%${term}%`);
       where += ` AND (v.title ILIKE $${params.length} OR v.description ILIKE $${params.length})`;
     }
     if (category_id) {
@@ -993,7 +1069,25 @@ router.get("/", authenticate, async (req, res) => {
       where += ` AND (v.is_published = FALSE OR v.is_published IS NULL)`;
     }
 
-    params.push(Number(limit));
+    const selectedSort = String(sortBy || sort || "newest").toLowerCase();
+    let orderBy =
+      "COALESCE(v.published_at, v.updated_at, v.created_at) DESC NULLS LAST, v.id DESC";
+    if (selectedSort === "oldest") {
+      orderBy =
+        "COALESCE(v.published_at, v.updated_at, v.created_at) ASC NULLS LAST, v.id ASC";
+    } else if (selectedSort === "title") {
+      orderBy = "LOWER(v.title) ASC NULLS LAST, v.id DESC";
+    }
+
+    const countSql = `
+      SELECT COUNT(*)::int AS total
+      FROM videos v
+      ${where}
+    `;
+    const countResult = await db.query(countSql, params);
+    const total = Number(countResult.rows?.[0]?.total || 0);
+
+    const dataParams = [...params, safeLimit, safeOffset];
     const sql = `
       SELECT v.*,
              c.name AS category_name,
@@ -1002,11 +1096,21 @@ router.get("/", authenticate, async (req, res) => {
       FROM videos v
       LEFT JOIN categories c ON c.id = v.category_id
       ${where}
-      ORDER BY COALESCE(v.updated_at, v.published_at, v.created_at) DESC
-      LIMIT $${params.length}
+      ORDER BY ${orderBy}
+      LIMIT $${dataParams.length - 1}
+      OFFSET $${dataParams.length}
     `;
-    const r = await db.query(sql, params);
-    res.json({ items: r.rows });
+    const r = await db.query(sql, dataParams);
+
+    res.setHeader("Cache-Control", "private, max-age=10");
+    res.json({
+      items: r.rows,
+      total,
+      page: safePage,
+      limit: safeLimit,
+      offset: safeOffset,
+      has_more: safeOffset + r.rows.length < total,
+    });
   } catch (e) {
     console.error("[GET /videos] error:", e);
     res.status(500).json({ message: "Failed to fetch videos" });
@@ -1074,7 +1178,9 @@ router.post("/:id/progress", authenticate, async (req, res) => {
 
     const completed =
       Boolean(req.body?.completed) ||
-      (duration && duration > 0 && position >= Math.max(0, duration - 5));
+      Boolean(
+        duration && duration > 0 && position >= Math.max(0, duration - 5),
+      );
 
     const r = await db.query(
       `INSERT INTO watch_progress
@@ -1106,9 +1212,6 @@ router.get("/:id", authenticate, async (req, res) => {
       return res.status(400).json({ message: "Invalid id" });
     }
 
-    const perm = await assertOwnerOrAdmin(id, req.user);
-    if (!perm.ok) return res.status(perm.status).json({ message: "Forbidden" });
-
     const r = await db.query(
       `SELECT v.*, 
               c.name AS category_name,
@@ -1124,23 +1227,38 @@ router.get("/:id", authenticate, async (req, res) => {
     if (r.rowCount === 0) return res.status(404).json({ message: "Not found" });
 
     const row = { ...r.rows[0] };
+    const ownerOrAdmin =
+      isAdmin(req.user) ||
+      (row.created_by && String(row.created_by) === String(req.user?.id));
+
+    // ✅ Normal logged-in users are allowed to watch published videos, but they
+    // are not allowed to access unpublished/private admin content or edit tools.
+    // Admin/owner users can still load any video for the admin details page.
+    const isPublished = row.is_published === true;
+    const isPublicOrPrivateWatchable = ["public", "private", ""].includes(
+      String(row.visibility || "public").toLowerCase(),
+    );
+
+    if (!ownerOrAdmin && (!isPublished || !isPublicOrPrivateWatchable)) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
     if (row.playback_url && !row.video_url) {
       row.video_url = row.playback_url;
     }
 
     if (row.video_url || row.playback_url) {
-      // ✅ Sign both Bunny Storage and Bunny Stream native playback URLs.
-      // IMPORTANT: Bunny Stream migrated records store the playlist in playback_url,
-      // so sign playback_url first and return it into both video_url/playback_url.
+      // ✅ Use Stream-safe signing. Bunny Stream URLs must stay clean because
+      // BUNNY_TOKEN_AUTH_* belongs to Bunny Storage, not the Stream CDN.
       const ttl = 6 * 3600;
       const sourceUrl = row.playback_url || row.video_url;
-      const signedUrl = bunnySignUrl(sourceUrl, { ttlSeconds: ttl });
+      const signedUrl = signPlaybackUrlForRow(row, sourceUrl, ttl);
 
       row.video_url = signedUrl;
       row.playback_url = signedUrl;
       row.signed_ttl_seconds = ttl;
       row.requires_login = false;
+      row.can_manage = ownerOrAdmin;
     }
 
     res.json(row);

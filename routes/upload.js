@@ -16,8 +16,9 @@ const db = require("../db");
 //  - Browser will send OPTIONS before POST (especially when Authorization header is used)
 //  - We answer 204 fast so OPTIONS never accidentally hits auth/multer
 // ---------------------------------------------------------------------------
-router.options(["/", "/video", "/presign", "/__ping", "/__cors"], (_req, res) =>
-  res.sendStatus(204),
+router.options(
+  ["/", "/video", "/image", "/presign", "/__ping", "/__cors"],
+  (_req, res) => res.sendStatus(204),
 );
 
 // Optional debug endpoint: confirms what origin is hitting this router
@@ -119,7 +120,31 @@ const useBunny =
 const BUNNY_STORAGE_ZONE = process.env.BUNNY_STORAGE_ZONE || "";
 const BUNNY_STORAGE_HOST =
   process.env.BUNNY_STORAGE_HOST || "storage.bunnycdn.com";
-const BUNNY_CDN_BASE_URL = normalizeHttpBase(process.env.BUNNY_CDN_BASE_URL);
+const BUNNY_CDN_BASE_URL = normalizeHttpBase(
+  process.env.BUNNY_STORAGE_CDN_BASE_URL ||
+    process.env.BUNNY_PUBLIC_CDN_BASE_URL ||
+    process.env.BUNNY_CDN_BASE_URL,
+);
+
+const STREAM_CDN_HOST_RE = /^vz-\d+\.b-cdn\.net$/i;
+function isLikelyBunnyStreamCdnBase(url) {
+  try {
+    return STREAM_CDN_HOST_RE.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+if (
+  useBunny &&
+  BUNNY_CDN_BASE_URL &&
+  isLikelyBunnyStreamCdnBase(BUNNY_CDN_BASE_URL)
+) {
+  console.warn(
+    "[upload] WARNING: BUNNY_CDN_BASE_URL points to a Bunny Stream host (vz-*.b-cdn.net). " +
+      "Bunny Storage uploads, especially thumbnails/images, should use your Bunny Storage Pull Zone CDN host instead.",
+  );
+}
 
 // ---------------------------------------------------------------------------
 //  Local paths + Multer
@@ -537,10 +562,22 @@ async function handleUpload(req, res) {
  *   title, description, visibility, is_premium
  */
 router.post(
-  ["/", "/video"],
+  ["/", "/video", "/image"],
   authenticate,
   allowUploadRoles,
   attachEntitlements,
+
+  // /api/uploads/image is a convenience endpoint for thumbnails and other images.
+  // Query params are available before multer parses multipart fields, so this
+  // guarantees image uploads never use the video storage folder by mistake.
+  (req, _res, next) => {
+    if (req.path === "/image") {
+      req.query.kind = "images";
+      req.query.category = req.query.category || "thumbnails";
+      req.query.folder = req.query.folder || "video-thumbnails";
+    }
+    next();
+  },
 
   // Wrap multer to return clean JSON errors
   (req, res, next) => {
@@ -611,6 +648,8 @@ router.get("/__ping", (_req, res) =>
     FORCE_LOCAL,
     prefix: PREFIX,
     bunnyCdnBase: BUNNY_CDN_BASE_URL || null,
+    bunnyCdnBaseLooksLikeStreamHost:
+      isLikelyBunnyStreamCdnBase(BUNNY_CDN_BASE_URL),
     uploadMaxBytes: MAX_BYTES > 0 ? MAX_BYTES : null,
   }),
 );
