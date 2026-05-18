@@ -1299,6 +1299,33 @@ router.post("/", authenticate, async (req, res) => {
       return res.status(400).json({ message: "video_url is required" });
     }
 
+    // Bunny Stream upload dedupe:
+    // If the browser retries the create-record step after TUS upload succeeds,
+    // do not insert a second row for the same Bunny Stream video.
+    const incomingBunnyVideoId = String(
+      base.bunny_video_id || base.provider_key || "",
+    ).trim();
+
+    if (incomingBunnyVideoId) {
+      const existing = await db.query(
+        `SELECT *
+           FROM videos
+          WHERE bunny_video_id = $1
+             OR provider_key = $1
+          ORDER BY id DESC
+          LIMIT 1`,
+        [incomingBunnyVideoId],
+      );
+
+      if (existing.rowCount > 0) {
+        return res.json({
+          ...existing.rows[0],
+          deduped: true,
+          duplicate_prevented: true,
+        });
+      }
+    }
+
     const visibility =
       base.visibility === undefined
         ? "private"
