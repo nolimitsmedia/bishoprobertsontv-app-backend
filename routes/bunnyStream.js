@@ -35,59 +35,30 @@ if (!LIB_ID || !API_KEY) {
 
 function allowUploadRoles(req, res, next) {
   const role = String(req.user?.role || "user").toLowerCase();
-
-  // Keep this compatible with your current app roles, but include the common
-  // admin/team role names so uploads do not fail just because the role label
-  // is "super_admin", "administrator", etc.
-  const allowedRoles = new Set([
-    "user", // kept for existing studio/member upload compatibility
-    "member",
-    "subscriber",
-    "admin",
-    "administrator",
-    "super_admin",
-    "superadmin",
-    "creator",
-    "editor",
-    "manager",
-    "staff",
-    "owner",
-  ]);
-
-  if (allowedRoles.has(role)) return next();
-
-  return res.status(403).json({
-    ok: false,
-    message: `Forbidden: role "${role || "unknown"}" is not allowed to upload`,
-    role,
-  });
-}
-
-function redactKey(value = "") {
-  const s = String(value || "");
-  if (!s) return "";
-  if (s.length <= 10) return "configured";
-  return `${s.slice(0, 4)}…${s.slice(-4)}`;
-}
-
-function streamConfigStatus() {
-  return {
-    ok: !!LIB_ID && !!API_KEY,
-    libraryId: LIB_ID || null,
-    hasApiKey: !!API_KEY,
-    apiKeyPreview: redactKey(API_KEY),
-    streamCdnHost: STREAM_CDN_HOST || null,
-    tusEndpoint: "https://video.bunnycdn.com/tusupload",
-  };
+  if (
+    role === "user" ||
+    role === "admin" ||
+    role === "creator" ||
+    role === "owner"
+  ) {
+    return next();
+  }
+  return res
+    .status(403)
+    .json({ ok: false, message: "Forbidden: role not allowed" });
 }
 
 function buildPlaybackUrls(videoId) {
   const hlsUrl = STREAM_CDN_HOST
     ? `https://${STREAM_CDN_HOST}/${videoId}/playlist.m3u8`
     : "";
-  const thumbnailUrl = STREAM_CDN_HOST
-    ? `https://${STREAM_CDN_HOST}/${videoId}/thumbnail.jpg`
-    : "";
+  // Do not expose/save the raw Bunny Stream CDN thumbnail URL here.
+  // On some Bunny Stream libraries, direct thumbnail URLs like
+  // https://vz-<library>.b-cdn.net/<videoId>/thumbnail.jpg can show
+  // "Domain suspended or not configured" when opened directly.
+  // The app should use its default thumbnail until an admin uploads a custom
+  // thumbnail through Bunny Storage / image upload.
+  const thumbnailUrl = "";
   const embedUrl = `https://iframe.mediadelivery.net/embed/${LIB_ID}/${videoId}`;
 
   return {
@@ -97,28 +68,6 @@ function buildPlaybackUrls(videoId) {
     embedUrl,
   };
 }
-
-/**
- * GET /api/bunny/stream/health
- * Quick authenticated diagnostics for upload troubleshooting.
- * Does not expose the Bunny API key.
- */
-router.get(
-  "/bunny/stream/health",
-  authenticate,
-  allowUploadRoles,
-  (req, res) => {
-    return res.json({
-      ok: true,
-      user: {
-        id: req.user?.id || null,
-        email: req.user?.email || null,
-        role: req.user?.role || "user",
-      },
-      bunnyStream: streamConfigStatus(),
-    });
-  },
-);
 
 /**
  * Create a Bunny Stream video and return presigned TUS headers for direct browser upload.
@@ -143,21 +92,9 @@ router.post(
       if (!LIB_ID || !API_KEY) {
         return res.status(500).json({
           ok: false,
-          message:
-            "Bunny Stream env not configured. Please check BUNNY_STREAM_LIBRARY_ID and BUNNY_STREAM_API_KEY on the backend/Render environment.",
-          bunnyStream: streamConfigStatus(),
+          message: "Bunny Stream env not configured.",
         });
       }
-
-      console.log("[bunnyStream] presign requested", {
-        userId: req.user?.id || null,
-        role: req.user?.role || "user",
-        title,
-        filename: req.body?.filename || null,
-        contentType: req.body?.contentType || null,
-        sizeBytes: req.body?.sizeBytes || null,
-        libraryId: LIB_ID,
-      });
 
       const createUrl = `https://video.bunnycdn.com/library/${LIB_ID}/videos`;
       const createResp = await fetch(createUrl, {
@@ -169,36 +106,22 @@ router.post(
         body: JSON.stringify({ title: title || "Untitled" }),
       });
 
-      const createText = await createResp.text();
-      let created = null;
-      try {
-        created = createText ? JSON.parse(createText) : null;
-      } catch {
-        created = { raw: createText };
-      }
-
       if (!createResp.ok) {
-        console.error("[bunnyStream] create video failed:", {
-          status: createResp.status,
-          body: createText,
-        });
+        const text = await createResp.text();
+        console.error("[bunnyStream] create video failed:", text);
         return res.status(createResp.status).json({
           ok: false,
-          message: "Bunny Stream create video failed",
-          status: createResp.status,
-          detail: createText,
-          bunnyStream: streamConfigStatus(),
+          message: "Bunny create video failed",
+          detail: text,
         });
       }
 
+      const created = await createResp.json();
       const videoId = created?.guid || created?.videoId || created?.id;
       if (!videoId) {
-        console.error("[bunnyStream] response missing video id:", created);
         return res.status(500).json({
           ok: false,
           message: "Bunny response missing videoId/guid",
-          detail: created,
-          bunnyStream: streamConfigStatus(),
         });
       }
 
@@ -211,12 +134,6 @@ router.post(
         .digest("hex");
 
       const urls = buildPlaybackUrls(videoId);
-
-      console.log("[bunnyStream] presign ready", {
-        videoId,
-        libraryId: String(LIB_ID),
-        streamCdnHost: STREAM_CDN_HOST,
-      });
 
       return res.json({
         ok: true,
@@ -234,7 +151,7 @@ router.post(
         embedUrl: urls.embedUrl,
         hlsUrl: urls.hlsUrl,
         playbackUrl: urls.playbackUrl,
-        thumbnailUrl: urls.thumbnailUrl,
+        thumbnailUrl: urls.thumbnailUrl || null,
       });
     } catch (err) {
       console.error("[bunnyStream] presign error:", err);
