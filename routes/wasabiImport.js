@@ -22,14 +22,14 @@ const BUNNY_LIBRARY_ID = process.env.BUNNY_STREAM_LIBRARY_ID;
 const BUNNY_API_KEY = process.env.BUNNY_STREAM_API_KEY;
 
 /* =========================================================
-   WASABI S3 CLIENT
+   S3 CLIENT
 ========================================================= */
 function getS3() {
-  const config = getWasabiConfig();
+  const cfg = getWasabiConfig();
 
   return new S3Client({
-    region: config.region || "us-east-1",
-    endpoint: config.endpoint,
+    region: cfg.region || "us-east-1",
+    endpoint: cfg.endpoint,
     credentials: {
       accessKeyId: process.env.WASABI_ACCESS_KEY_ID,
       secretAccessKey: process.env.WASABI_SECRET_ACCESS_KEY,
@@ -39,13 +39,12 @@ function getS3() {
 }
 
 /* =========================================================
-   BUNNY STREAM (CLEAN INGEST ONLY)
+   Bunny Stream (SAFE INGEST ONLY)
 ========================================================= */
 async function pushToBunnyStream(fileUrl, title) {
   if (!BUNNY_LIBRARY_ID || !BUNNY_API_KEY) return null;
 
   try {
-    // 1. Create video
     const create = await axios.post(
       `https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos`,
       { title },
@@ -59,7 +58,6 @@ async function pushToBunnyStream(fileUrl, title) {
 
     const videoId = create.data.guid;
 
-    // 2. Tell Bunny to ingest from Wasabi URL (NO STORAGE COPY)
     await axios.put(
       `https://video.bunnycdn.com/library/${BUNNY_LIBRARY_ID}/videos/${videoId}`,
       fileUrl,
@@ -78,23 +76,38 @@ async function pushToBunnyStream(fileUrl, title) {
       hlsUrl: `https://vz-${BUNNY_LIBRARY_ID}.b-cdn.net/${videoId}/playlist.m3u8`,
     };
   } catch (err) {
-    console.warn("[Bunny Stream] ingest failed:", err.message);
+    console.warn("[Bunny Stream] failed:", err.message);
     return null;
   }
 }
 
 /* =========================================================
-   IMPORT ROUTE (CLEAN)
+   FIXED PREFIX HANDLING (IMPORTANT)
+========================================================= */
+function buildPrefix(base, input) {
+  const clean = (v) => (v || "").replace(/^\/+|\/+$/g, "");
+
+  const b = clean(base);
+  const i = clean(input);
+
+  if (!b && !i) return "";
+  if (!b) return i;
+  if (!i) return b;
+
+  return `${b}/${i}`;
+}
+
+/* =========================================================
+   IMPORT
 ========================================================= */
 router.post("/import", async (req, res) => {
   const db = req.db;
 
   try {
     const config = getWasabiConfig();
-    const prefix = `${config.prefix || ""}/${req.body?.prefix || ""}`.replace(
-      /\/+/g,
-      "/",
-    );
+
+    // 🔥 FIXED PREFIX (THIS WAS YOUR BUG)
+    const prefix = buildPrefix(config.prefix, req.body?.prefix);
 
     const limit = Math.min(5000, Number(req.body?.limit || 5000));
     const visibility = req.body?.visibility || "private";
@@ -102,6 +115,9 @@ router.post("/import", async (req, res) => {
       ? Number(req.body.category_id)
       : null;
 
+    /* =====================================================
+       LIST WASABI OBJECTS
+    ===================================================== */
     const objects = await listObjects({ prefix });
 
     const videos = objects
@@ -111,7 +127,7 @@ router.post("/import", async (req, res) => {
     const keys = videos.map((v) => v.key);
 
     /* =====================================================
-       Dedup check
+       DEDUP CHECK
     ===================================================== */
     const existing = await db.query(
       `SELECT wasabi_key FROM videos WHERE wasabi_key = ANY($1::text[])`,
@@ -119,13 +135,14 @@ router.post("/import", async (req, res) => {
     );
 
     const existingSet = new Set(existing.rows.map((r) => r.wasabi_key));
+
     const toImport = videos.filter((v) => !existingSet.has(v.key));
 
     let inserted = 0;
     const created = [];
 
     /* =====================================================
-       PROCESS
+       PROCESS FILES
     ===================================================== */
     for (const obj of toImport) {
       const file = filenameFromKey(obj.key);
@@ -136,12 +153,11 @@ router.post("/import", async (req, res) => {
         meta = await headObject(obj.key);
       } catch {}
 
-      // Signed Wasabi URL (source for Bunny Stream ingestion)
       const fileUrl = await signGetUrl(obj.key, 60 * 60);
 
-      /* =====================================================
-         BUNNY STREAM ONLY (NO STORAGE)
-      ===================================================== */
+      /* =================================================
+         BUNNY STREAM ONLY
+      ================================================= */
       const bunny = await pushToBunnyStream(fileUrl, title);
 
       const result = await db.query(
@@ -187,13 +203,14 @@ router.post("/import", async (req, res) => {
 
     return res.json({
       ok: true,
+      prefix,
       scanned: videos.length,
       inserted,
       skipped: videos.length - inserted,
       created,
     });
   } catch (e) {
-    console.error("[wasabiImport error]", e);
+    console.error("[wasabiImport ERROR]", e);
     return res.status(500).json({
       ok: false,
       message: e.message,
