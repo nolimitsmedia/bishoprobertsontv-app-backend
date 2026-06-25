@@ -63,6 +63,12 @@ function titleFromKey(key = "") {
   return noExt.replace(/[_-]+/g, " ").trim();
 }
 
+function normalizeComparableText(value = "") {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
 function buildWasabiUrl({ endpoint, bucket, key }) {
   const base = String(endpoint).replace(/\/+$/, "");
   return `${base}/${bucket}/${encodeURIComponent(key).replace(/%2F/g, "/")}`;
@@ -99,9 +105,14 @@ function bunnyStreamConfig() {
   const libraryId = mustEnv("BUNNY_STREAM_LIBRARY_ID");
   const apiKey = mustEnv("BUNNY_STREAM_API_KEY");
 
-  // Optional. If you know the Stream CDN host, set this in env:
-  // BUNNY_STREAM_CDN_HOST=vz-xxxxxx.b-cdn.net
-  const cdnHost = String(process.env.BUNNY_STREAM_CDN_HOST || "")
+  // Match the rest of the app's Bunny Stream URL format.
+  // If you have a custom Stream CDN host, set:
+  // BUNNY_STREAM_CDN_HOST=your-stream-host.b-cdn.net
+  const cdnHost = String(
+    process.env.BUNNY_STREAM_CDN_HOST ||
+      process.env.BUNNY_STREAM_PULL_ZONE_URL ||
+      `vz-${libraryId}.b-cdn.net`,
+  )
     .trim()
     .replace(/^https?:\/\//i, "")
     .replace(/\/+$/, "");
@@ -133,14 +144,85 @@ async function signWasabiGetUrl({ s3, bucket, key, expiresIn = 24 * 60 * 60 }) {
 
 function pickBunnyVideoId(data = {}) {
   return (
-    data.id ||
     data.guid ||
     data.videoId ||
     data.video_id ||
-    data?.video?.id ||
+    data.id ||
     data?.video?.guid ||
+    data?.video?.videoId ||
+    data?.video?.id ||
     null
   );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function bunnyStreamRequest(url, options = {}) {
+  const cfg = bunnyStreamConfig();
+
+  const resp = await axios.request({
+    url,
+    method: options.method || "GET",
+    data: options.data,
+    headers: {
+      AccessKey: cfg.apiKey,
+      Accept: "application/json",
+      ...(options.data ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+    timeout: options.timeout || 120000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+    validateStatus: () => true,
+  });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const body =
+      typeof resp.data === "string"
+        ? resp.data.slice(0, 800)
+        : JSON.stringify(resp.data || {}).slice(0, 800);
+
+    throw new Error(`Bunny Stream error ${resp.status}. Body=${body}`);
+  }
+
+  return resp.data || {};
+}
+
+async function findBunnyVideoByExactTitle(title) {
+  const cfg = bunnyStreamConfig();
+  const search = encodeURIComponent(title);
+  const data = await bunnyStreamRequest(
+    `https://video.bunnycdn.com/library/${cfg.libraryId}/videos?page=1&itemsPerPage=100&search=${search}&orderBy=date`,
+    { method: "GET" },
+  );
+
+  const items = Array.isArray(data?.items) ? data.items : [];
+  return (
+    items.find((v) => String(v?.title || "") === String(title)) ||
+    items.find((v) => String(v?.title || "").includes(String(title))) ||
+    null
+  );
+}
+
+async function updateBunnyVideoTitle(videoId, title) {
+  const cfg = bunnyStreamConfig();
+
+  try {
+    await bunnyStreamRequest(
+      `https://video.bunnycdn.com/library/${cfg.libraryId}/videos/${videoId}`,
+      {
+        method: "POST",
+        data: { title: title || "Untitled" },
+      },
+    );
+  } catch (e) {
+    console.warn(
+      "[wasabiImport] Could not update Bunny Stream title:",
+      e.message,
+    );
+  }
 }
 
 async function fetchWasabiToBunnyStream({ s3, bucket, key, title }) {
@@ -161,44 +243,49 @@ async function fetchWasabiToBunnyStream({ s3, bucket, key, title }) {
     expiresIn: 24 * 60 * 60,
   });
 
-  const fetchResp = await axios.post(
+  // Use a temporary unique title so we can reliably find the new Bunny video,
+  // then restore the clean title afterward.
+  const cleanTitle = String(title || "Untitled").trim() || "Untitled";
+  const uniqueTitle = `${cleanTitle} [WASABI-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}]`;
+
+  const fetchData = await bunnyStreamRequest(
     `https://video.bunnycdn.com/library/${cfg.libraryId}/videos/fetch`,
     {
-      url: sourceUrl,
-      title,
-    },
-    {
-      headers: {
-        AccessKey: cfg.apiKey,
-        Accept: "application/json",
-        "Content-Type": "application/json",
+      method: "POST",
+      data: {
+        url: sourceUrl,
+        title: uniqueTitle,
+        headers: {},
       },
       timeout: 120000,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      validateStatus: () => true,
     },
   );
 
-  if (fetchResp.status < 200 || fetchResp.status >= 300) {
-    const body =
-      typeof fetchResp.data === "string"
-        ? fetchResp.data.slice(0, 800)
-        : JSON.stringify(fetchResp.data || {}).slice(0, 800);
+  let videoId = pickBunnyVideoId(fetchData);
+  let bunnyVideo = videoId ? { guid: videoId, ...fetchData } : null;
 
-    throw new Error(
-      `Bunny Stream fetch failed (status ${fetchResp.status}). Body=${body}`,
-    );
+  // Some Bunny Stream /fetch responses do not immediately include the GUID.
+  // Search for the unique title for up to ~12 seconds.
+  if (!videoId) {
+    for (let i = 0; i < 12; i += 1) {
+      bunnyVideo = await findBunnyVideoByExactTitle(uniqueTitle);
+      videoId = pickBunnyVideoId(bunnyVideo || {});
+      if (videoId) break;
+      await sleep(1000);
+    }
   }
 
-  const videoId = pickBunnyVideoId(fetchResp.data);
   if (!videoId) {
     throw new Error(
-      `Bunny Stream fetch did not return a video id. Body=${JSON.stringify(
-        fetchResp.data || {},
+      `Bunny Stream fetch started, but the new video id was not found yet. Try again in a minute. Body=${JSON.stringify(
+        fetchData || {},
       ).slice(0, 800)}`,
     );
   }
+
+  await updateBunnyVideoTitle(videoId, cleanTitle);
 
   return {
     videoId,
@@ -212,10 +299,66 @@ async function fetchWasabiToBunnyStream({ s3, bucket, key, title }) {
       videoId,
     }),
     sourceUrl,
-    raw: fetchResp.data || {},
+    raw: fetchData || bunnyVideo || {},
   };
 }
 
+/* =========================================================
+   Imported detection helpers
+   Detects both new Bunny Stream imports and old Bunny Storage/CDN imports.
+========================================================= */
+function importedMatchSql(alias = "w") {
+  return `
+    EXISTS (
+      SELECT 1
+      FROM videos v
+      WHERE
+        v.wasabi_key = ${alias}.key
+        OR v.source_meta->>'wasabi_key' = ${alias}.key
+        OR v.source_meta->>'key' = ${alias}.key
+        OR v.source_meta->>'original_key' = ${alias}.key
+        OR v.metadata->>'wasabi_key' = ${alias}.key
+        OR v.metadata->>'source_key' = ${alias}.key
+        OR v.metadata->>'original_key' = ${alias}.key
+        OR LOWER(regexp_replace(split_part(COALESCE(v.video_url, ''), '?', 1), '^.*/', '')) =
+           LOWER(regexp_replace(${alias}.key, '^.*/', ''))
+        OR LOWER(regexp_replace(split_part(COALESCE(v.playback_url, ''), '?', 1), '^.*/', '')) =
+           LOWER(regexp_replace(${alias}.key, '^.*/', ''))
+        OR regexp_replace(LOWER(COALESCE(v.title, '')), '[^a-z0-9]+', '', 'g') =
+           regexp_replace(
+             LOWER(regexp_replace(regexp_replace(${alias}.key, '^.*/', ''), '\\.[^.]+$', '')),
+             '[^a-z0-9]+',
+             '',
+             'g'
+           )
+    )
+  `;
+}
+
+function importedJoinConditionSql() {
+  return `
+    (
+      v.wasabi_key = w.key
+      OR v.source_meta->>'wasabi_key' = w.key
+      OR v.source_meta->>'key' = w.key
+      OR v.source_meta->>'original_key' = w.key
+      OR v.metadata->>'wasabi_key' = w.key
+      OR v.metadata->>'source_key' = w.key
+      OR v.metadata->>'original_key' = w.key
+      OR LOWER(regexp_replace(split_part(COALESCE(v.video_url, ''), '?', 1), '^.*/', '')) =
+         LOWER(regexp_replace(w.key, '^.*/', ''))
+      OR LOWER(regexp_replace(split_part(COALESCE(v.playback_url, ''), '?', 1), '^.*/', '')) =
+         LOWER(regexp_replace(w.key, '^.*/', ''))
+      OR regexp_replace(LOWER(COALESCE(v.title, '')), '[^a-z0-9]+', '', 'g') =
+         regexp_replace(
+           LOWER(regexp_replace(regexp_replace(w.key, '^.*/', ''), '\\.[^.]+$', '')),
+           '[^a-z0-9]+',
+           '',
+           'g'
+         )
+    )
+  `;
+}
 /* =========================================================
    NEW: Wasabi → DB Indexing (real solution)
 ========================================================= */
@@ -440,6 +583,8 @@ router.get("/index", async (req, res) => {
     const limit = Math.max(1, Math.min(500, Number(req.query.limit || 100)));
     const offset = Math.max(0, Number(req.query.offset || 0));
 
+    const importedExistsSql = importedMatchSql("w");
+
     const where = [`w.prefix = $1`];
     const args = [prefix];
     let ai = 2;
@@ -450,14 +595,14 @@ router.get("/index", async (req, res) => {
       args.push(`%${q}%`);
     }
 
-    // Detect imported items by Wasabi key. This works for Bunny Stream imports
-    // and does not depend on old Bunny Storage CDN URLs.
+    // Multi-method imported detection:
+    // - new imports: videos.wasabi_key / source_meta
+    // - old imports: video_url/playback_url filename match
+    // - fallback: normalized title match
     if (importedFilter === "imported") {
-      where.push(`EXISTS (SELECT 1 FROM videos v WHERE v.wasabi_key = w.key)`);
+      where.push(importedExistsSql);
     } else if (importedFilter === "not_imported") {
-      where.push(
-        `NOT EXISTS (SELECT 1 FROM videos v WHERE v.wasabi_key = w.key)`,
-      );
+      where.push(`NOT ${importedExistsSql}`);
     }
 
     const orderBy =
@@ -467,7 +612,12 @@ router.get("/index", async (req, res) => {
 
     const rows = await db.query(
       `
-      SELECT w.key, w.size, w.last_modified, w.etag
+      SELECT
+        w.key,
+        w.size,
+        w.last_modified,
+        w.etag,
+        ${importedExistsSql} AS already_imported
       FROM wasabi_object_index w
       WHERE ${where.join(" AND ")}
       ORDER BY ${orderBy}
@@ -476,7 +626,7 @@ router.get("/index", async (req, res) => {
       [...args, limit, offset],
     );
 
-    const items = (rows.rows || []).map((r) => {
+    const out = (rows.rows || []).map((r) => {
       const filename = safeFilenameFromKey(r.key);
       return {
         key: r.key,
@@ -484,6 +634,7 @@ router.get("/index", async (req, res) => {
         lastModified: r.last_modified,
         etag: r.etag || null,
         filename,
+        alreadyImported: r.already_imported === true,
         // url is optional for index view. This is the Wasabi object URL,
         // not a Bunny Storage URL.
         url: buildWasabiUrl({
@@ -494,28 +645,7 @@ router.get("/index", async (req, res) => {
       };
     });
 
-    // detect already imported by Wasabi key, not Bunny Storage CDN URL
-    const itemKeys = items.map((x) => x.key).filter(Boolean);
-    let importedSet = new Set();
-
-    if (itemKeys.length) {
-      const r2 = await db.query(
-        `SELECT wasabi_key FROM videos WHERE wasabi_key = ANY($1::text[])`,
-        [itemKeys],
-      );
-      importedSet = new Set((r2.rows || []).map((x) => x.wasabi_key));
-    }
-
-    const out = items.map((x) => ({
-      key: x.key,
-      size: x.size,
-      lastModified: x.lastModified,
-      url: x.url,
-      alreadyImported: importedSet.has(x.key),
-      filename: x.filename,
-    }));
-
-    // total count (for UI “showing X of Y”)
+    // total count for the active filter
     const totalR = await db.query(
       `SELECT COUNT(*)::bigint AS c
        FROM wasabi_object_index w
@@ -524,7 +654,7 @@ router.get("/index", async (req, res) => {
     );
     const total = Number(totalR.rows?.[0]?.c || 0);
 
-    // Optional summary counts for this prefix/search, independent from pagination.
+    // Summary counts for this prefix/search, independent from pagination/filter.
     const summaryWhere = [`w.prefix = $1`];
     const summaryArgs = [prefix];
     let si = 2;
@@ -535,13 +665,18 @@ router.get("/index", async (req, res) => {
 
     const summaryR = await db.query(
       `
+      WITH matched AS (
+        SELECT
+          w.key,
+          ${importedExistsSql} AS already_imported
+        FROM wasabi_object_index w
+        WHERE ${summaryWhere.join(" AND ")}
+      )
       SELECT
         COUNT(*)::bigint AS total_all,
-        COUNT(v.id)::bigint AS imported_count,
-        (COUNT(*) - COUNT(v.id))::bigint AS not_imported_count
-      FROM wasabi_object_index w
-      LEFT JOIN videos v ON v.wasabi_key = w.key
-      WHERE ${summaryWhere.join(" AND ")}
+        COUNT(*) FILTER (WHERE already_imported)::bigint AS imported_count,
+        COUNT(*) FILTER (WHERE NOT already_imported)::bigint AS not_imported_count
+      FROM matched
       `,
       summaryArgs,
     );
@@ -844,9 +979,34 @@ router.post("/import", async (req, res) => {
           // non-fatal; Bunny fetch can still proceed if the signed URL works
         }
 
+        const comparableTitle = normalizeComparableText(titleFromKey(key));
+
         const existing = await db.query(
-          `SELECT id, bunny_stream_id FROM videos WHERE wasabi_key = $1 LIMIT 1`,
-          [key],
+          `
+          SELECT id, bunny_video_id, provider_key
+          FROM videos v
+          WHERE
+            v.wasabi_key = $1
+            OR v.source_meta->>'wasabi_key' = $1
+            OR v.source_meta->>'key' = $1
+            OR v.source_meta->>'original_key' = $1
+            OR v.metadata->>'wasabi_key' = $1
+            OR v.metadata->>'source_key' = $1
+            OR v.metadata->>'original_key' = $1
+            OR LOWER(regexp_replace(split_part(COALESCE(v.video_url, ''), '?', 1), '^.*/', '')) = LOWER($2)
+            OR LOWER(regexp_replace(split_part(COALESCE(v.playback_url, ''), '?', 1), '^.*/', '')) = LOWER($2)
+            OR regexp_replace(LOWER(COALESCE(v.title, '')), '[^a-z0-9]+', '', 'g') = $3
+          ORDER BY
+            CASE
+              WHEN v.wasabi_key = $1 THEN 0
+              WHEN LOWER(regexp_replace(split_part(COALESCE(v.video_url, ''), '?', 1), '^.*/', '')) = LOWER($2) THEN 1
+              WHEN LOWER(regexp_replace(split_part(COALESCE(v.playback_url, ''), '?', 1), '^.*/', '')) = LOWER($2) THEN 2
+              ELSE 3
+            END,
+            v.id DESC
+          LIMIT 1
+          `,
+          [key, filename, comparableTitle],
         );
 
         if (existing.rowCount > 0 && dupMode === "skip") {
@@ -856,7 +1016,7 @@ router.post("/import", async (req, res) => {
             status: "skipped",
             reason: "already_imported",
             id: existing.rows[0].id,
-            bunny_stream_id: existing.rows[0].bunny_stream_id || null,
+            bunny_video_id: existing.rows[0].bunny_video_id || null,
           });
           continue;
         }
@@ -868,6 +1028,7 @@ router.post("/import", async (req, res) => {
             provider: "bunny_stream",
             title,
             wouldReplace: existing.rowCount > 0,
+            matchedExistingId: existing.rows?.[0]?.id || null,
           });
           continue;
         }
@@ -880,6 +1041,8 @@ router.post("/import", async (req, res) => {
           title,
         });
 
+        const playbackUrl = bunny.hlsUrl || bunny.embedUrl;
+
         const sourceMeta = {
           provider: "bunny_stream",
           filename,
@@ -887,12 +1050,30 @@ router.post("/import", async (req, res) => {
           wasabi_key: key,
           content_type: head?.ContentType || "video/mp4",
           size: Number(head?.ContentLength || 0),
-          bunny_stream_id: bunny.videoId,
+          bunny_video_id: bunny.videoId,
           bunny_library_id: bunny.libraryId,
-          bunny_embed_url: bunny.embedUrl,
-          bunny_hls_url: bunny.hlsUrl || null,
+          embed_url: bunny.embedUrl,
+          playback_url: playbackUrl,
+          hls_url: bunny.hlsUrl || null,
           bunny_fetch_response: bunny.raw || null,
           imported_from: "wasabi",
+          imported_at: new Date().toISOString(),
+        };
+
+        const metadataPatch = {
+          wasabi_import: {
+            bucket,
+            key,
+            filename,
+            source: "wasabi",
+            imported_at: new Date().toISOString(),
+          },
+          bunny_stream_import: {
+            bunny_video_id: bunny.videoId,
+            bunny_library_id: bunny.libraryId,
+            embed_url: bunny.embedUrl,
+            playback_url: playbackUrl,
+          },
         };
 
         if (existing.rowCount > 0) {
@@ -904,23 +1085,29 @@ router.post("/import", async (req, res) => {
             SET
               title = COALESCE($2, title),
               video_url = COALESCE($3, video_url),
-              category_id = COALESCE($4, category_id),
-              visibility = COALESCE($5, visibility),
-              created_by = COALESCE(created_by, $6),
-              wasabi_bucket = $7,
-              wasabi_key = $8,
+              playback_url = COALESCE($3, playback_url),
+              embed_url = COALESCE($4, embed_url),
+              category_id = COALESCE($5, category_id),
+              visibility = COALESCE($6, visibility),
+              created_by = COALESCE(created_by, $7),
+              wasabi_bucket = $8,
+              wasabi_key = $9,
               source_type = 'bunny_stream',
-              source_meta = $9::jsonb,
-              bunny_stream_id = $10,
-              bunny_embed_url = $11,
-              bunny_hls_url = $12,
+              source_meta = $10::jsonb,
+              bunny_video_id = $11,
+              bunny_library_id = $12,
+              provider = 'bunny_stream',
+              provider_key = $11,
+              processing_status = 'processing',
+              metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || $13::jsonb,
               updated_at = now()
             WHERE id = $1
           `,
             [
               id,
               title,
-              bunny.hlsUrl || bunny.embedUrl,
+              playbackUrl,
+              bunny.embedUrl,
               category_id,
               vis,
               actorUserId,
@@ -928,8 +1115,8 @@ router.post("/import", async (req, res) => {
               key,
               JSON.stringify(sourceMeta),
               bunny.videoId,
-              bunny.embedUrl,
-              bunny.hlsUrl || null,
+              bunny.libraryId,
+              JSON.stringify(metadataPatch),
             ],
           );
 
@@ -939,9 +1126,9 @@ router.post("/import", async (req, res) => {
             status: "replaced",
             id,
             provider: "bunny_stream",
-            bunny_stream_id: bunny.videoId,
-            bunny_embed_url: bunny.embedUrl,
-            bunny_hls_url: bunny.hlsUrl || null,
+            bunny_video_id: bunny.videoId,
+            embed_url: bunny.embedUrl,
+            playback_url: playbackUrl,
           });
           continue;
         }
@@ -960,19 +1147,24 @@ router.post("/import", async (req, res) => {
               wasabi_key,
               source_type,
               source_meta,
-              bunny_stream_id,
-              bunny_embed_url,
-              bunny_hls_url,
+              bunny_video_id,
+              bunny_library_id,
+              provider,
+              provider_key,
+              embed_url,
+              playback_url,
+              processing_status,
+              metadata,
               created_at,
               updated_at
             )
           VALUES
-            ($1, $2, $3, $4, FALSE, $5, $6, $7, 'bunny_stream', $8::jsonb, $9, $10, $11, now(), now())
+            ($1, $2, $3, $4, FALSE, $5, $6, $7, 'bunny_stream', $8::jsonb, $9, $10, 'bunny_stream', $9, $11, $2, 'processing', $12::jsonb, now(), now())
           RETURNING id
         `,
           [
             title,
-            bunny.hlsUrl || bunny.embedUrl,
+            playbackUrl,
             category_id,
             vis,
             actorUserId,
@@ -980,8 +1172,9 @@ router.post("/import", async (req, res) => {
             key,
             JSON.stringify(sourceMeta),
             bunny.videoId,
+            bunny.libraryId,
             bunny.embedUrl,
-            bunny.hlsUrl || null,
+            JSON.stringify(metadataPatch),
           ],
         );
 
@@ -991,9 +1184,9 @@ router.post("/import", async (req, res) => {
           status: "imported",
           id: ins.rows?.[0]?.id || null,
           provider: "bunny_stream",
-          bunny_stream_id: bunny.videoId,
-          bunny_embed_url: bunny.embedUrl,
-          bunny_hls_url: bunny.hlsUrl || null,
+          bunny_video_id: bunny.videoId,
+          embed_url: bunny.embedUrl,
+          playback_url: playbackUrl,
         });
       } catch (err) {
         results.errors++;
