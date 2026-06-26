@@ -371,15 +371,9 @@ async function handleUpload(req, res) {
     req.query?.folder;
   const category = categoryRaw || "uncategorized";
 
-  // 1) Detect duration for videos (best-effort).
-  // For faster uploads, this is disabled by default because ffprobe can add
-  // noticeable delay before the API responds. Set UPLOAD_PROBE_DURATION=true
-  // if you want duration calculated during the upload request.
-  const PROBE_DURATION_ON_UPLOAD =
-    String(process.env.UPLOAD_PROBE_DURATION || "").toLowerCase() === "true";
-
+  // 1) Detect duration for videos (best-effort)
   let durationSec = null;
-  if (kind === "videos" && PROBE_DURATION_ON_UPLOAD) {
+  if (kind === "videos") {
     try {
       durationSec = await getDurationSeconds(localPath);
     } catch {}
