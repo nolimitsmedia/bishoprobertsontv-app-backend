@@ -31,21 +31,21 @@ async function ensureUsersTable() {
 
   // Columns we rely on or support (legacy compatible)
   await db.query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;`
   );
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password TEXT;`); // legacy support (will be phased out)
   await db.query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token TEXT;`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_token TEXT;`
   );
   await db.query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;`
   );
   await db.query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;`
   );
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;`);
   await db.query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS organization TEXT;`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS organization TEXT;`
   );
 
   // Add a (case-insensitive) unique index on email if missing
@@ -73,7 +73,7 @@ async function hasColumn(table, column) {
         AND table_name=$1
         AND column_name=$2
       LIMIT 1`,
-    [table, column],
+    [table, column]
   );
   return rows.length > 0;
 }
@@ -133,7 +133,7 @@ router.post("/register", async (req, res) => {
     // Reject duplicates early for clearer error (case-insensitive)
     const dupe = await db.query(
       `SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email],
+      [email]
     );
     if (dupe.rows[0]) {
       return res.status(409).json({ message: "Email already registered" });
@@ -150,7 +150,7 @@ router.post("/register", async (req, res) => {
           `INSERT INTO users (name, email, phone, organization, password, password_hash, role, created_at)
            VALUES ($1,$2,$3,$4,$5,$6,'user',NOW())
            RETURNING id, name, email, role, password_hash`,
-          [name, email, phone, organization, hash, hash],
+          [name, email, phone, organization, hash, hash]
         )
       ).rows;
     } else {
@@ -159,7 +159,7 @@ router.post("/register", async (req, res) => {
           `INSERT INTO users (name, email, phone, organization, password_hash, role, created_at)
            VALUES ($1,$2,$3,$4,$5,'user',NOW())
            RETURNING id, name, email, role, password_hash`,
-          [name, email, phone, organization, hash],
+          [name, email, phone, organization, hash]
         )
       ).rows;
     }
@@ -218,7 +218,7 @@ router.post("/login", async (req, res) => {
          FROM users
         WHERE LOWER(email)=$1
         LIMIT 1`,
-      [email],
+      [email]
     );
 
     const user = rows[0];
@@ -269,7 +269,7 @@ router.post("/forgot", async (req, res) => {
 
     const { rows } = await db.query(
       `SELECT id, name, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email],
+      [email]
     );
     const user = rows[0];
 
@@ -280,7 +280,7 @@ router.post("/forgot", async (req, res) => {
            SET reset_token=$1,
                reset_token_expires = NOW() + INTERVAL '1 day'
          WHERE id=$2`,
-        [token, user.id],
+        [token, user.id]
       );
 
       const base = appOrigin(req).replace(/\/$/, "");
@@ -328,7 +328,7 @@ router.get("/reset/verify", async (req, res) => {
         WHERE reset_token=$1
           AND (reset_token_expires IS NULL OR reset_token_expires > NOW())
         LIMIT 1`,
-      [token],
+      [token]
     );
 
     if (!rows[0]) {
@@ -370,7 +370,7 @@ router.post("/reset", async (req, res) => {
         WHERE reset_token=$1
           AND (reset_token_expires IS NULL OR reset_token_expires > NOW())
         LIMIT 1`,
-      [token],
+      [token]
     );
     const user = rows[0];
     if (!user)
@@ -387,7 +387,7 @@ router.post("/reset", async (req, res) => {
                 reset_token=NULL,
                 reset_token_expires=NULL
           WHERE id=$2`,
-        [newHash, user.id],
+        [newHash, user.id]
       );
     } else {
       await db.query(
@@ -396,7 +396,7 @@ router.post("/reset", async (req, res) => {
                 reset_token=NULL,
                 reset_token_expires=NULL
           WHERE id=$2`,
-        [newHash, user.id],
+        [newHash, user.id]
       );
     }
 
@@ -416,7 +416,7 @@ router.get("/me", authenticate, async (req, res) => {
     // req.user is populated by authenticate middleware
     const { rows } = await db.query(
       `SELECT id, name, email, role FROM users WHERE id=$1 LIMIT 1`,
-      [req.user.id],
+      [req.user.id]
     );
     const user = rows[0];
     if (!user) return res.status(404).json({ message: "User not found" });

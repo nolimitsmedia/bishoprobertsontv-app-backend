@@ -4,14 +4,8 @@ const router = express.Router();
 
 /**
  * Helpers to safely detect columns (so this works even if your schema differs).
- * Column lookups are cached in memory so the dashboard does not repeatedly hit
- * information_schema on every request.
  */
-const columnExistsCache = new Map();
-
 async function hasColumn(db, table, column) {
-  const cacheKey = `${table}.${column}`;
-  if (columnExistsCache.has(cacheKey)) return columnExistsCache.get(cacheKey);
   const q = `
     SELECT 1
     FROM information_schema.columns
@@ -21,9 +15,7 @@ async function hasColumn(db, table, column) {
     LIMIT 1
   `;
   const r = await db.query(q, [table, column]);
-  const exists = r.rowCount > 0;
-  columnExistsCache.set(cacheKey, exists);
-  return exists;
+  return r.rowCount > 0;
 }
 
 async function pickFirstExistingColumn(db, table, candidates) {
@@ -109,7 +101,7 @@ router.get("/overview", async (req, res) => {
     const videoPublishedBoolCol = await pickFirstExistingColumn(
       db,
       videosTable,
-      ["is_published", "published"],
+      ["is_published", "published"]
     );
 
     // Determine "published" expression

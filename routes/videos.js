@@ -724,6 +724,7 @@ function coerceProgressSeconds(v, fallback = 0) {
 router.get("/public/catalog", async (req, res) => {
   try {
     const { search, only_free, limit = 200 } = req.query;
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 600));
 
     const params = [];
     let where = `
@@ -743,7 +744,7 @@ router.get("/public/catalog", async (req, res) => {
       where += ` AND (v.is_premium = false OR v.is_premium IS NULL)`;
     }
 
-    params.push(Number(limit));
+    params.push(safeLimit);
     const sql = `
       SELECT
         v.*,
@@ -769,6 +770,10 @@ router.get("/public/catalog", async (req, res) => {
       map.get(key).items.push(row);
     }
 
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=30, stale-while-revalidate=120",
+    );
     res.json({
       sections: Array.from(map.values()),
     });
@@ -781,6 +786,7 @@ router.get("/public/catalog", async (req, res) => {
 router.get("/public", async (req, res) => {
   try {
     const { search, category_id, only_free, limit = 50 } = req.query;
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 600));
 
     const params = [];
     let where = `
@@ -804,7 +810,7 @@ router.get("/public", async (req, res) => {
       where += ` AND (v.is_premium = false OR v.is_premium IS NULL)`;
     }
 
-    params.push(Number(limit));
+    params.push(safeLimit);
     const sql = `
       SELECT
         v.*,
@@ -819,6 +825,10 @@ router.get("/public", async (req, res) => {
     `;
     const r = await db.query(sql, params);
 
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=30, stale-while-revalidate=120",
+    );
     res.json({ items: r.rows });
   } catch (e) {
     console.error("[GET /videos/public] error:", e);

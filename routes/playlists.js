@@ -115,6 +115,10 @@ router.get("/public", async (req, res) => {
     params.push(limit);
 
     const { rows } = await db.query(sql, params);
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=30, stale-while-revalidate=120",
+    );
     res.json({ items: rows });
   } catch (e) {
     console.error("[GET /playlists/public] error:", e);
@@ -184,6 +188,10 @@ router.get("/public/:idOrSlug", async (req, res) => {
       [playlist.id],
     );
 
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=30, stale-while-revalidate=120",
+    );
     res.json({ ...playlist, videos: vids.rows });
   } catch (e) {
     console.error("[GET /playlists/public/:idOrSlug] error:", e);
