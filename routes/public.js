@@ -161,6 +161,32 @@ router.get("/videos", async (req, res) => {
   }
 });
 
+/* Latest Teachings: select the correct four records in SQL, not after LIMIT. */
+router.get("/latest-teachings", async (req, res) => {
+  try {
+    const limit = clampInt(req.query.limit, 1, 12, 4);
+    const result = await db.query(
+      `
+      SELECT v.id, v.title, v.description, v.thumbnail_url,
+             v.published_at, v.created_at, v.category_id,
+             c.name AS category_name
+      FROM videos v
+      LEFT JOIN categories c ON c.id = v.category_id
+      WHERE v.is_published = TRUE
+        AND COALESCE(v.visibility, 'public') = 'public'
+      ORDER BY v.published_at DESC NULLS LAST, v.id DESC
+      LIMIT $1
+    `,
+      [limit],
+    );
+    res.set("Cache-Control", "no-store");
+    res.json({ items: result.rows.map((v) => fixVideoUrls(req, v)) });
+  } catch (e) {
+    console.error("[GET /api/public/latest-teachings] error:", e);
+    res.status(500).json({ message: "Failed to fetch latest teachings" });
+  }
+});
+
 /* ═══════════════════════════════════════════════════════════
    PUBLIC PLAYLISTS (legacy)
    GET /api/public/playlists
