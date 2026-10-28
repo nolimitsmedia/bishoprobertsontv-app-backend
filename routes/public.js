@@ -173,7 +173,7 @@ router.get("/latest-teachings", async (req, res) => {
       FROM videos v
       LEFT JOIN categories c ON c.id = v.category_id
       WHERE v.is_published = TRUE
-        AND COALESCE(v.visibility, 'public') = 'public'
+        AND v.visibility IN ('public', 'private')
       ORDER BY v.published_at DESC NULLS LAST, v.id DESC
       LIMIT $1
     `,
