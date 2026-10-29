@@ -86,7 +86,7 @@ const communityRoutes = require("./routes/community");
 // const authBridge = require("./middleware/auth-bridge");
 const authBridge = require("./middleware/auth-bridge");
 const bunnyStreamRouter = require("./routes/bunnyStream");
-const pagesRoutes = require("./routes/pages");
+// Legacy pages router disabled: overlapping unguarded endpoints.
 const adminAnalyticsRoutes = require("./routes/adminAnalytics");
 const adminUsersRoutes = require("./routes/adminUsers");
 const adminWasabiImport = require("./routes/adminWasabiImport");
@@ -333,7 +333,7 @@ app.use("/api/admin/calendar", adminCalendarRoutes);
 app.use("/api/admin/resources", adminResourcesRoutes);
 app.use("/api/admin/organize", adminOrganizeRoutes);
 app.use("/api/integrations", integrationsRoutes);
-app.use("/api", pagesRoutes);
+// Legacy pages router disabled; use authenticated adminPages and pagesPublic.
 app.use("/api/admin/analytics", adminAnalyticsRoutes);
 app.use("/api/admin/users", adminUsersRoutes);
 app.use("/api/admin/wasabi", require("./routes/wasabiImport"));

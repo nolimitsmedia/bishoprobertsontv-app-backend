@@ -32,8 +32,8 @@ router.get("/:slug", async (req, res) => {
         status,
         excerpt,
         hero_image_url,
-        content_html,
-        content_json,
+        COALESCE(published_html, content_html) AS content_html,
+        COALESCE(published_json, content_json) AS content_json,
         updated_at,
         published_at
       FROM pages

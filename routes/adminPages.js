@@ -59,6 +59,10 @@ async function getPagesSchema() {
   const heroCol = has("hero_image_url") ? "hero_image_url" : null;
   const excerptCol = has("excerpt") ? "excerpt" : null;
   const jsonCol = has("content_json") ? "content_json" : null;
+  const draftHtmlCol = has("draft_html") ? "draft_html" : null;
+  const draftJsonCol = has("draft_json") ? "draft_json" : null;
+  const publishedHtmlCol = has("published_html") ? "published_html" : null;
+  const publishedJsonCol = has("published_json") ? "published_json" : null;
 
   const updatedAtCol = has("updated_at") ? "updated_at" : null;
   const createdAtCol = has("created_at") ? "created_at" : null;
@@ -71,6 +75,10 @@ async function getPagesSchema() {
     heroCol,
     excerptCol,
     jsonCol,
+    draftHtmlCol,
+    draftJsonCol,
+    publishedHtmlCol,
+    publishedJsonCol,
     updatedAtCol,
     createdAtCol,
   };
@@ -205,8 +213,14 @@ router.get("/:id", async (req, res) => {
       `${defaultStatusExpr(s)} AS status`,
       s.heroCol ? `${s.heroCol} AS hero_image_url` : `NULL AS hero_image_url`,
       s.excerptCol ? `${s.excerptCol} AS excerpt` : `NULL AS excerpt`,
-      htmlSelectExpr(s),
-      s.jsonCol ? `${s.jsonCol} AS content_json` : `NULL AS content_json`,
+      s.draftHtmlCol
+        ? `COALESCE(${s.draftHtmlCol}, ${s.htmlCol || "NULL"}, '') AS content_html`
+        : htmlSelectExpr(s),
+      s.draftJsonCol
+        ? `COALESCE(${s.draftJsonCol}, ${s.jsonCol || "NULL"}) AS content_json`
+        : s.jsonCol
+          ? `${s.jsonCol} AS content_json`
+          : `NULL AS content_json`,
       updatedAtSelectExpr(s),
       publishedSelectExpr(s),
       createdAtSelectExpr(s),
@@ -268,15 +282,22 @@ router.put("/:id", async (req, res) => {
       params.push(excerpt);
     }
 
-    if (s.htmlCol) {
-      sets.push(`${s.htmlCol}=$${++p}`);
-      params.push(content_html);
+    if (
+      !s.draftHtmlCol ||
+      !s.draftJsonCol ||
+      !s.publishedHtmlCol ||
+      !s.publishedJsonCol
+    ) {
+      return res.status(503).json({
+        ok: false,
+        error: "Draft/published columns are required for safe editing",
+      });
     }
 
-    if (s.jsonCol) {
-      sets.push(`${s.jsonCol}=$${++p}`);
-      params.push(content_json);
-    }
+    sets.push(`${s.draftHtmlCol}=$${++p}`);
+    params.push(content_html);
+    sets.push(`${s.draftJsonCol}=$${++p}`);
+    params.push(content_json);
 
     if (s.updatedAtCol) {
       sets.push(`updated_at=${nowSql()}`);
@@ -291,8 +312,14 @@ router.put("/:id", async (req, res) => {
       `${defaultStatusExpr(s)} AS status`,
       s.heroCol ? `${s.heroCol} AS hero_image_url` : `NULL AS hero_image_url`,
       s.excerptCol ? `${s.excerptCol} AS excerpt` : `NULL AS excerpt`,
-      htmlSelectExpr(s),
-      s.jsonCol ? `${s.jsonCol} AS content_json` : `NULL AS content_json`,
+      s.draftHtmlCol
+        ? `COALESCE(${s.draftHtmlCol}, ${s.htmlCol || "NULL"}, '') AS content_html`
+        : htmlSelectExpr(s),
+      s.draftJsonCol
+        ? `COALESCE(${s.draftJsonCol}, ${s.jsonCol || "NULL"}) AS content_json`
+        : s.jsonCol
+          ? `${s.jsonCol} AS content_json`
+          : `NULL AS content_json`,
       updatedAtSelectExpr(s),
       publishedSelectExpr(s),
     ];
@@ -324,16 +351,31 @@ router.post("/:id/publish", async (req, res) => {
     const s = await getPagesSchema();
     const id = Number(req.params.id);
 
-    const sets = [];
-    if (s.statusCol) sets.push(`status='published'`);
-    if (s.publishedCol)
-      sets.push(`${s.publishedCol}=COALESCE(${s.publishedCol}, NOW())`);
-    if (s.updatedAtCol) sets.push(`updated_at=${nowSql()}`);
-
-    if (!sets.length) {
-      // If table has none of these columns, just respond OK (rare legacy)
-      return res.json({ ok: true, page: { id, status: "published" } });
+    if (
+      !s.draftHtmlCol ||
+      !s.draftJsonCol ||
+      !s.publishedHtmlCol ||
+      !s.publishedJsonCol
+    ) {
+      return res.status(503).json({
+        ok: false,
+        error: "Draft/published columns are required for safe publishing",
+      });
     }
+    const draftHtml = `COALESCE(${s.draftHtmlCol}, ${s.htmlCol || "NULL"}, '')`;
+    const draftJson = `COALESCE(${s.draftJsonCol}, ${s.jsonCol || "NULL"})`;
+    const sets = [
+      `${s.publishedHtmlCol}=${draftHtml}`,
+      `${s.publishedJsonCol}=${draftJson}`,
+    ];
+    // Keep legacy columns synchronized on PUBLISH only for older frontend readers.
+    if (s.htmlCol && s.htmlCol !== s.publishedHtmlCol)
+      sets.push(`${s.htmlCol}=${draftHtml}`);
+    if (s.jsonCol && s.jsonCol !== s.publishedJsonCol)
+      sets.push(`${s.jsonCol}=${draftJson}`);
+    if (s.statusCol) sets.push(`status='published'`);
+    if (s.publishedCol === "published_at") sets.push(`published_at=NOW()`);
+    if (s.updatedAtCol) sets.push(`updated_at=${nowSql()}`);
 
     const sql = `
       UPDATE pages
