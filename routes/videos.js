@@ -1052,6 +1052,29 @@ router.get("/public/:id/preview-proxy", async (req, res) => {
   }
 });
 
+/* Resolve listing privileges from the database when available.
+ * Some authentication middleware versions attach only { id } to req.user,
+ * even though /api/auth/me returns a role. Never trust a client-supplied role.
+ * On lookup failure, retain the trusted middleware identity (fail closed for
+ * users without a middleware administrator role).
+ */
+async function isAdminForVideoListing(user) {
+  if (!user?.id) return false;
+  try {
+    const result = await db.query(
+      "SELECT role FROM users WHERE id = $1 LIMIT 1",
+      [user.id],
+    );
+    if (result.rowCount > 0) {
+      // The database is authoritative when a matching user exists.
+      return isAdmin({ role: result.rows[0].role });
+    }
+  } catch (error) {
+    console.warn("[GET /videos] role lookup unavailable:", error.message);
+  }
+  return isAdmin(user);
+}
+
 /* -------------------- AUTH’D ROUTES -------------------- */
 
 router.get("/", authenticate, async (req, res) => {
@@ -1079,9 +1102,21 @@ router.get("/", authenticate, async (req, res) => {
     const params = [];
     let where = "WHERE 1=1";
 
-    if (!isAdmin(req.user)) {
+    const listingAdmin = await isAdminForVideoListing(req.user);
+    if (!listingAdmin) {
+      if (req.user?.id == null) {
+        return res.status(401).json({ message: "Authentication required" });
+      }
       params.push(req.user.id);
       where += ` AND v.created_by = $${params.length}`;
+    }
+    if (process.env.VIDEOS_LIST_DEBUG === "true") {
+      console.info("[GET /videos] listing scope", {
+        userId: req.user?.id,
+        middlewareRole: req.user?.role ?? req.user?.type ?? null,
+        admin: listingAdmin,
+        search: String(search || q || "").slice(0, 100),
+      });
     }
 
     const term = String(search || q || "").trim();
@@ -1133,7 +1168,7 @@ router.get("/", authenticate, async (req, res) => {
     `;
     const r = await db.query(sql, dataParams);
 
-    res.setHeader("Cache-Control", "private, max-age=10");
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.json({
       items: r.rows,
       total,
