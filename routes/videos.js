@@ -15,9 +15,30 @@ const { sendPush } = require("../notifications/fcm");
 
 /* -------------------- helpers -------------------- */
 
+// Recognize administrator role names used across common authentication systems.
+// Only use identity claims populated by the trusted authentication middleware;
+// never accept roles supplied through query parameters or request bodies.
+const ADMIN_ROLES = new Set([
+  "admin",
+  "administrator",
+  "owner",
+  "super_admin",
+  "superadmin",
+  "site_admin",
+]);
+
 function isAdmin(user) {
-  const r = (user?.role || user?.type || "").toLowerCase();
-  return r === "admin" || r === "owner";
+  if (!user || typeof user !== "object") return false;
+
+  // The canonical role takes precedence over a legacy type field.
+  const rawRole = user.role ?? user.type;
+  if (typeof rawRole !== "string") return false;
+
+  const role = rawRole
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  return ADMIN_ROLES.has(role);
 }
 
 function pick(obj, keys) {
