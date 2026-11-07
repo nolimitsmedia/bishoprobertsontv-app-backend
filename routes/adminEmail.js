@@ -4,6 +4,10 @@ const router = express.Router();
 
 const db = require("../db");
 const { requireAuth, requireAdmin } = require("../middleware/auth");
+// Phase 8-2: Email Center (send, job history) for Administrators and Marketing
+// Managers; the connection settings (connect/disconnect/test) stay admin-only.
+const { requireArea } = require("../lib/teamAccess");
+const marketing = requireArea("marketing");
 const { encryptJSON, decryptJSON } = require("../utils/crypto");
 
 /**
@@ -40,7 +44,7 @@ function cleanRegion(v) {
 /* -------------------------------
    GET active connection
 -------------------------------- */
-router.get("/connection", requireAuth, requireAdmin, async (_req, res) => {
+router.get("/connection", marketing, async (_req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, provider, is_active, created_at, updated_at
@@ -208,7 +212,7 @@ router.post("/test", requireAuth, requireAdmin, async (_req, res) => {
      attachments?: [{name,url,mime,size}]  // optional
    }
 -------------------------------- */
-router.post("/send", requireAuth, requireAdmin, async (req, res) => {
+router.post("/send", marketing, async (req, res) => {
   const subject = safeStr(req.body?.subject).trim();
   const html = safeStr(req.body?.html).trim();
   const text = safeStr(req.body?.text).trim();
@@ -347,7 +351,7 @@ router.post("/send", requireAuth, requireAdmin, async (req, res) => {
 /* -------------------------------
    LIST jobs
 -------------------------------- */
-router.get("/jobs", requireAuth, requireAdmin, async (req, res) => {
+router.get("/jobs", marketing, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 25, 100);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
 
@@ -369,7 +373,7 @@ router.get("/jobs", requireAuth, requireAdmin, async (req, res) => {
 /* -------------------------------
    LIST job items
 -------------------------------- */
-router.get("/jobs/:id/items", requireAuth, requireAdmin, async (req, res) => {
+router.get("/jobs/:id/items", marketing, async (req, res) => {
   const jobId = Number(req.params.id);
   if (!Number.isFinite(jobId)) {
     return res.status(400).json({ ok: false, error: "Invalid job id" });
@@ -401,7 +405,7 @@ router.get("/jobs/:id/items", requireAuth, requireAdmin, async (req, res) => {
    DELETE /api/admin/email/jobs/:id
    Optional: ?force=1 to delete even if queued/sending
 -------------------------------- */
-router.delete("/jobs/:id", requireAuth, requireAdmin, async (req, res) => {
+router.delete("/jobs/:id", marketing, async (req, res) => {
   const jobId = Number(req.params.id);
   if (!Number.isFinite(jobId)) {
     return res.status(400).json({ ok: false, error: "Invalid job id" });

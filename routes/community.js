@@ -18,6 +18,17 @@ function requireAuth(req, res, next) {
   if (req.user && req.user.id) return next();
   return res.status(401).json({ message: "Unauthorized" });
 }
+// Phase 8-2: Administrators and Community Managers moderate everyone's posts.
+// req.access is attached by attachTeamAccess (server.js) from the database.
+function isCommunityStaff(req) {
+  const a = req && req.access;
+  return !!(
+    a &&
+    (a.isAdmin ||
+      (Array.isArray(a.teamRoles) && a.teamRoles.includes("community")))
+  );
+}
+
 function isAdmin(user) {
   const role = (user?.role || "").toLowerCase();
   return role === "admin";
@@ -109,13 +120,15 @@ function uploadToBunny({ buffer, remotePath }) {
   return new Promise((resolve, reject) => {
     if (!BUNNY_STORAGE_ZONE || !BUNNY_STORAGE_API_KEY || !BUNNY_CDN_BASE_URL) {
       return reject(
-        new Error("Bunny Storage env vars missing (ZONE/API_KEY/CDN_BASE_URL).")
+        new Error(
+          "Bunny Storage env vars missing (ZONE/API_KEY/CDN_BASE_URL).",
+        ),
       );
     }
 
     const storagePath = `/${BUNNY_STORAGE_ZONE}/${remotePath}`.replace(
       /\\/g,
-      "/"
+      "/",
     );
 
     const req = https.request(
@@ -136,11 +149,11 @@ function uploadToBunny({ buffer, remotePath }) {
           if (res.statusCode >= 200 && res.statusCode < 300) return resolve();
           return reject(
             new Error(
-              `Bunny upload failed (${res.statusCode}): ${body || "no body"}`
-            )
+              `Bunny upload failed (${res.statusCode}): ${body || "no body"}`,
+            ),
           );
         });
-      }
+      },
     );
 
     req.on("error", reject);
@@ -176,7 +189,7 @@ async function ensureMediaFolder({ postId, title }) {
   // If media_folder exists, keep it
   const existing = await db.query(
     `SELECT media_folder FROM public.community_posts WHERE id=$1`,
-    [postId]
+    [postId],
   );
   if (existing.rowCount && existing.rows[0].media_folder) {
     return existing.rows[0].media_folder;
@@ -188,7 +201,7 @@ async function ensureMediaFolder({ postId, title }) {
         SET media_folder = COALESCE(media_folder, $1)
       WHERE id = $2
       RETURNING media_folder`,
-    [key, postId]
+    [key, postId],
   );
   return up.rows[0].media_folder || key;
 }
@@ -201,13 +214,13 @@ async function uploadCommunityImage({ postId, mediaFolder, file }) {
     const filename = safeFileName(file.originalname);
     const remotePath = `Community/${mediaFolder}/${filename}`.replace(
       /\\/g,
-      "/"
+      "/",
     );
 
     // multer memoryStorage => file.buffer
     if (!file.buffer || !Buffer.isBuffer(file.buffer)) {
       throw new Error(
-        "Upload buffer missing. Ensure multer memoryStorage is used."
+        "Upload buffer missing. Ensure multer memoryStorage is used.",
       );
     }
 
@@ -252,13 +265,16 @@ router.get("/posts", optionalAuth, async (req, res) => {
     if (!resolvedChannelId && channelSlug) {
       const r = await db.query(
         `SELECT id FROM public.community_channels WHERE slug=$1 LIMIT 1`,
-        [channelSlug]
+        [channelSlug],
       );
       resolvedChannelId = r.rowCount ? r.rows[0].id : -1;
     }
 
     const viewer = req.user || null;
-    const viewerIsAdmin = !!(viewer && isAdmin(viewer));
+    const viewerIsAdmin = !!(
+      (viewer && isAdmin(viewer)) ||
+      isCommunityStaff(req)
+    );
     const viewerId = viewer?.id || null;
 
     let visSQL = `p.visibility = 'public'`;
@@ -326,7 +342,10 @@ router.get("/posts/:id", optionalAuth, async (req, res) => {
     if (!postId) return res.status(400).json({ message: "Bad post id" });
 
     const viewer = req.user || null;
-    const viewerIsAdmin = !!(viewer && isAdmin(viewer));
+    const viewerIsAdmin = !!(
+      (viewer && isAdmin(viewer)) ||
+      isCommunityStaff(req)
+    );
     const viewerId = viewer?.id || null;
 
     let visSQL = `p.visibility = 'public'`;
@@ -362,7 +381,7 @@ router.get("/posts/:id", optionalAuth, async (req, res) => {
       WHERE p.id = $3 AND (${visSQL})
       LIMIT 1
       `,
-      params
+      params,
     );
 
     if (!rows.length) return res.status(404).json({ message: "Not found" });
@@ -404,7 +423,7 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
 
     // visibility stays admin-only
     let visibility = "public";
-    if (isAdmin(req.user)) {
+    if (isAdmin(req.user) || isCommunityStaff(req)) {
       visibility = normalizeVisibility(req.body?.visibility);
     }
 
@@ -418,7 +437,7 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
        (user_id, title, body, media_url, is_pinned, visibility, channel_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id, user_id, title, body, media_url, created_at, is_pinned, visibility, channel_id`,
-      [userId, title, body || null, null, is_pinned, visibility, channel_id]
+      [userId, title, body || null, null, is_pinned, visibility, channel_id],
     );
 
     let post = ins.rows[0];
@@ -441,7 +460,7 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
       const up = await db.query(
         `UPDATE public.community_posts SET media_url = $1 WHERE id = $2
          RETURNING id, user_id, title, body, media_url, created_at, is_pinned, visibility, channel_id`,
-        [mediaUrl, post.id]
+        [mediaUrl, post.id],
       );
       post = up.rows[0];
     }
@@ -451,7 +470,7 @@ router.post("/posts", requireAuth, upload.any(), async (req, res) => {
          FROM public.users u
          LEFT JOIN public.profiles pr ON pr.user_id = u.id
         WHERE u.id = $1`,
-      [post.user_id]
+      [post.user_id],
     );
     post.author_name = arows[0]?.author_name || "Member";
     post.comments_count = 0;
@@ -478,12 +497,12 @@ router.patch("/posts/:id", requireAuth, upload.any(), async (req, res) => {
       `SELECT id, user_id, media_url, media_folder, title
          FROM public.community_posts
         WHERE id = $1`,
-      [postId]
+      [postId],
     );
     if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
 
     const owns = cur.rows[0].user_id === req.user.id;
-    const admin = isAdmin(req.user);
+    const admin = isAdmin(req.user) || isCommunityStaff(req);
     if (!admin && !owns) return res.status(403).json({ message: "Forbidden" });
 
     const titleRaw = req.body?.title;
@@ -572,18 +591,18 @@ router.patch("/posts/:id", requireAuth, upload.any(), async (req, res) => {
          FROM public.users u
          LEFT JOIN public.profiles pr ON pr.user_id = u.id
         WHERE u.id = $1`,
-      [post.user_id]
+      [post.user_id],
     );
     post.author_name = arows[0]?.author_name || "Member";
 
     const [{ rows: cr }, { rows: lr }] = await Promise.all([
       db.query(
         `SELECT COUNT(*)::int AS cnt FROM public.community_comments WHERE post_id = $1`,
-        [post.id]
+        [post.id],
       ),
       db.query(
         `SELECT COUNT(*)::int AS cnt FROM public.community_post_likes WHERE post_id = $1`,
-        [post.id]
+        [post.id],
       ),
     ]);
     post.comments_count = cr[0].cnt || 0;
@@ -608,12 +627,12 @@ router.delete("/posts/:id", requireAuth, async (req, res) => {
 
     const cur = await db.query(
       `SELECT user_id FROM public.community_posts WHERE id = $1`,
-      [postId]
+      [postId],
     );
     if (!cur.rowCount) return res.status(404).json({ message: "Not found" });
 
     const owns = cur.rows[0].user_id === req.user.id;
-    if (!isAdmin(req.user) && !owns)
+    if (!(isAdmin(req.user) || isCommunityStaff(req)) && !owns)
       return res.status(403).json({ message: "Forbidden" });
 
     await db.query(`DELETE FROM public.community_posts WHERE id = $1`, [
@@ -638,21 +657,21 @@ router.post("/posts/:id/like", requireAuth, async (req, res) => {
     const exists = await db.query(
       `SELECT 1 FROM public.community_post_likes
        WHERE post_id = $1 AND user_id = $2 LIMIT 1`,
-      [postId, userId]
+      [postId, userId],
     );
 
     if (exists.rowCount) {
       await db.query(
         `DELETE FROM public.community_post_likes
          WHERE post_id = $1 AND user_id = $2`,
-        [postId, userId]
+        [postId, userId],
       );
       return res.json({ liked: false });
     } else {
       await db.query(
         `INSERT INTO public.community_post_likes (post_id, user_id)
          VALUES ($1, $2)`,
-        [postId, userId]
+        [postId, userId],
       );
       return res.json({ liked: true });
     }
@@ -687,7 +706,7 @@ router.get("/posts/:id/comments", optionalAuth, async (req, res) => {
        WHERE c.post_id = $1
        ORDER BY c.created_at ASC
       `,
-      [postId]
+      [postId],
     );
 
     const items = rows.map((r) => ({
@@ -699,7 +718,7 @@ router.get("/posts/:id/comments", optionalAuth, async (req, res) => {
       author_name: buildCommentAuthorName(
         r.profile_name,
         r.user_name,
-        r.user_email
+        r.user_email,
       ),
     }));
 
@@ -724,7 +743,7 @@ router.post("/posts/:id/comments", requireAuth, async (req, res) => {
       `INSERT INTO public.community_comments (post_id, user_id, body)
        VALUES ($1, $2, $3)
        RETURNING id, post_id, user_id, body, created_at`,
-      [postId, userId, body]
+      [postId, userId, body],
     );
 
     const comment = ins.rows[0];
@@ -739,14 +758,14 @@ router.post("/posts/:id/comments", requireAuth, async (req, res) => {
         LEFT JOIN public.profiles p ON p.user_id = u.id
         WHERE u.id = $1
       `,
-      [userId]
+      [userId],
     );
 
     const nameRow = rows[0] || {};
     comment.author_name = buildCommentAuthorName(
       nameRow.profile_name,
       nameRow.user_name,
-      nameRow.user_email
+      nameRow.user_email,
     );
 
     res.status(201).json({ comment });
@@ -765,7 +784,7 @@ router.get("/channels", async (_req, res) => {
       `SELECT id, slug, name, is_public, sort_order
          FROM public.community_channels
         WHERE slug IN ('bishoprobertsontv','techsupport')
-        ORDER BY sort_order, name`
+        ORDER BY sort_order, name`,
     );
     res.json({ items: rows });
   } catch (e) {

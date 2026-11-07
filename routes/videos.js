@@ -27,8 +27,22 @@ const ADMIN_ROLES = new Set([
   "site_admin",
 ]);
 
+// Phase 8-1: Administrators and Content Managers manage everyone's content.
+// req.access is attached by attachTeamAccess (server.js) from the database.
+function isContentStaff(req) {
+  const a = req && req.access;
+  return !!(
+    a &&
+    (a.isAdmin ||
+      (Array.isArray(a.teamRoles) && a.teamRoles.includes("content")))
+  );
+}
+
 function isAdmin(user) {
   if (!user || typeof user !== "object") return false;
+  // Phase 8-1: Content Managers (team role loaded from the database).
+  if (Array.isArray(user.teamRoles) && user.teamRoles.includes("content"))
+    return true;
 
   // The canonical role takes precedence over a legacy type field.
   const rawRole = user.role ?? user.type;
@@ -1060,6 +1074,13 @@ router.get("/public/:id/preview-proxy", async (req, res) => {
  */
 async function isAdminForVideoListing(user) {
   if (!user?.id) return false;
+  // Phase 8: Content Managers and Video Uploaders see the whole library.
+  if (
+    Array.isArray(user.teamRoles) &&
+    (user.teamRoles.includes("content") ||
+      user.teamRoles.includes("video_upload"))
+  )
+    return true;
   try {
     const result = await db.query(
       "SELECT role FROM users WHERE id = $1 LIMIT 1",
@@ -1295,6 +1316,7 @@ router.get("/:id", authenticate, async (req, res) => {
     const row = { ...r.rows[0] };
     const ownerOrAdmin =
       isAdmin(req.user) ||
+      isContentStaff(req) ||
       (row.created_by && String(row.created_by) === String(req.user?.id));
 
     // ✅ Normal logged-in users are allowed to watch published videos, but they

@@ -57,6 +57,17 @@ async function ensureTables() {
   return ensureTablesPromise;
 }
 
+// Phase 8-1: Administrators and Content Managers manage everyone's content.
+// req.access is attached by attachTeamAccess (server.js) from the database.
+function isContentStaff(req) {
+  const a = req && req.access;
+  return !!(
+    a &&
+    (a.isAdmin ||
+      (Array.isArray(a.teamRoles) && a.teamRoles.includes("content")))
+  );
+}
+
 function isAdmin(user) {
   const r = (user?.role || user?.type || "").toLowerCase();
   return r === "admin" || r === "owner";
@@ -163,7 +174,10 @@ router.put("/:id", authenticate, async (req, res) => {
     );
     const row = found[0];
     if (!row) return res.status(404).json({ message: "Not found" });
-    if (!isAdmin(req.user) && String(row.created_by) !== String(userId))
+    if (
+      !(isAdmin(req.user) || isContentStaff(req)) &&
+      String(row.created_by) !== String(userId)
+    )
       return res.status(403).json({ message: "Forbidden" });
 
     const name = cleanStr(req.body?.name);
@@ -211,7 +225,10 @@ router.delete("/:id", authenticate, async (req, res) => {
     );
     const row = found[0];
     if (!row) return res.status(404).json({ message: "Not found" });
-    if (!isAdmin(req.user) && String(row.created_by) !== String(userId))
+    if (
+      !(isAdmin(req.user) || isContentStaff(req)) &&
+      String(row.created_by) !== String(userId)
+    )
       return res.status(403).json({ message: "Forbidden" });
 
     await db.query(`DELETE FROM categories WHERE id=$1`, [id]);

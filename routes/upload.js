@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
+const { fileFilter } = require("../lib/uploadPolicy");
 const path = require("path");
 const fs = require("fs");
 const mime = require("mime-types");
@@ -177,6 +178,8 @@ const MAX_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 0);
 const upload = multer({
   storage,
   limits: MAX_BYTES > 0 ? { fileSize: MAX_BYTES } : undefined,
+  // Security: only media and document types (no web pages, SVG, scripts, programs).
+  fileFilter: fileFilter("media"),
 });
 
 // ---------------------------------------------------------------------------
@@ -602,6 +605,14 @@ router.post(
         return res.status(400).json({
           message: "Upload error",
           detail: err.message,
+          code: err.code,
+        });
+      }
+
+      if (err?.code === "UPLOAD_TYPE_NOT_ALLOWED") {
+        return res.status(415).json({
+          message: err.message,
+          error: err.message,
           code: err.code,
         });
       }

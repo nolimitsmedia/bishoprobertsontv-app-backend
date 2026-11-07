@@ -4,6 +4,17 @@ const router = express.Router();
 const db = require("../db");
 const authenticate = require("../middleware/authenticate");
 
+// Phase 8-2: Administrators and Community Managers moderate everyone's posts.
+// req.access is attached by attachTeamAccess (server.js) from the database.
+function isCommunityStaff(req) {
+  const a = req && req.access;
+  return !!(
+    a &&
+    (a.isAdmin ||
+      (Array.isArray(a.teamRoles) && a.teamRoles.includes("community")))
+  );
+}
+
 // 🔔 Centralized FCM sender (Admin SDK with legacy fallback)
 const { sendPush } = require("../notifications/fcm");
 
@@ -60,7 +71,7 @@ router.get("/", async (req, res) => {
       ORDER BY c.created_at ASC
       LIMIT $2 OFFSET $3
       `,
-      [videoId, limit, offset]
+      [videoId, limit, offset],
     );
 
     return res.json({
@@ -111,7 +122,7 @@ router.get("/by-video/:videoId", async (req, res) => {
       WHERE c.video_id = $1
       ORDER BY c.created_at ASC
       `,
-      [videoId]
+      [videoId],
     );
 
     return res.json({
@@ -173,7 +184,7 @@ router.post("/", authenticate, async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING id
       `,
-      [VIDEO_COMMENTS_POST_ID, videoId, userId, userId, text, parentId]
+      [VIDEO_COMMENTS_POST_ID, videoId, userId, userId, text, parentId],
     );
     const newId = insert.rows[0].id;
 
@@ -188,7 +199,7 @@ router.post("/", authenticate, async (req, res) => {
       WHERE c.id = $1
       LIMIT 1
       `,
-      [newId]
+      [newId],
     );
     const row = rows[0];
 
@@ -197,7 +208,7 @@ router.post("/", authenticate, async (req, res) => {
       try {
         const meta = await db.query(
           `SELECT created_by, title FROM videos WHERE id = $1 LIMIT 1`,
-          [videoId]
+          [videoId],
         );
         const videoOwnerId = meta.rows?.[0]?.created_by || null;
         const videoTitle = meta.rows?.[0]?.title || "New comment";
@@ -209,7 +220,7 @@ router.post("/", authenticate, async (req, res) => {
               AND user_id IS NOT NULL
               AND user_id <> $2
             LIMIT 500`,
-          [videoId, userId]
+          [videoId, userId],
         );
 
         const userSet = new Set();
@@ -230,7 +241,7 @@ router.post("/", authenticate, async (req, res) => {
              FROM user_push_tokens
             WHERE token IS NOT NULL AND token <> ''
               AND user_id = ANY($1::int[])`,
-          [ids.map((x) => Number(x))]
+          [ids.map((x) => Number(x))],
         );
         const tokens = t.rows.map((r) => r.token).filter(Boolean);
 
@@ -281,7 +292,7 @@ router.delete("/:id", authenticate, async (req, res) => {
 
     const cur = await db.query(
       "SELECT id, user_id FROM public.comments WHERE id = $1 LIMIT 1",
-      [id]
+      [id],
     );
     if (!cur.rowCount) {
       return res.status(404).json({ message: "Not found" });
@@ -290,7 +301,8 @@ router.delete("/:id", authenticate, async (req, res) => {
     const comment = cur.rows[0];
     const isOwner = String(comment.user_id) === String(req.user.id);
     const role = (req.user?.role || req.user?.type || "").toLowerCase();
-    const isAdmin = role === "admin" || role === "owner";
+    const isAdmin =
+      role === "admin" || role === "owner" || isCommunityStaff(req);
 
     if (!isOwner && !isAdmin) {
       return res.status(403).json({ message: "Forbidden" });

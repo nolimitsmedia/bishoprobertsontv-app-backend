@@ -4,8 +4,11 @@ const router = express.Router();
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
+const { fileFilter, uploadErrorHandler } = require("../lib/uploadPolicy");
 const crypto = require("crypto");
-const authenticateAdmin = require("../middleware/authenticateAdmin"); // adjust
+// Phase 8-1: Administrators and Website Managers.
+const { requireArea } = require("../lib/teamAccess");
+const authenticateAdmin = requireArea("website");
 
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
@@ -32,6 +35,8 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({
+  // Security: allowed file types only (see lib/uploadPolicy.js).
+  fileFilter: fileFilter("images"),
   storage,
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
 });
@@ -56,5 +61,8 @@ router.post("/pages", upload.single("file"), (req, res) => {
     res.status(500).json({ ok: false, error: "Upload failed" });
   }
 });
+
+// Rejected file types get a clear 415 response instead of a server error.
+router.use(uploadErrorHandler);
 
 module.exports = router;

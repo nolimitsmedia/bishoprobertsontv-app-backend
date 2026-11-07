@@ -4,6 +4,7 @@ const router = express.Router();
 const pool = require("../db");
 
 const multer = require("multer");
+const { fileFilter, uploadErrorHandler } = require("../lib/uploadPolicy");
 const path = require("path");
 
 function cleanStr(v) {
@@ -76,6 +77,8 @@ function guessExt(originalName, mime) {
    Multer: memory storage (we upload to Bunny, not local disk)
 ------------------------------------------------------- */
 const upload = multer({
+  // Security: allowed file types only (see lib/uploadPolicy.js).
+  fileFilter: fileFilter("resources"),
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 50 * 1024 * 1024, // 50MB
@@ -90,14 +93,14 @@ async function uploadToBunny({ buffer, remotePath, contentType }) {
 
   // ✅ Option B: support both env var names
   const key = cleanStr(
-    process.env.BUNNY_STORAGE_KEY || process.env.BUNNY_STORAGE_API_KEY
+    process.env.BUNNY_STORAGE_KEY || process.env.BUNNY_STORAGE_API_KEY,
   );
 
   const region = cleanStr(process.env.BUNNY_STORAGE_REGION); // optional
 
   if (!zone || !key) {
     const err = new Error(
-      "Missing Bunny Storage env (BUNNY_STORAGE_ZONE / BUNNY_STORAGE_KEY)."
+      "Missing Bunny Storage env (BUNNY_STORAGE_ZONE / BUNNY_STORAGE_KEY).",
     );
     err.code = "BUNNY_ENV_MISSING";
     throw err;
@@ -108,8 +111,8 @@ async function uploadToBunny({ buffer, remotePath, contentType }) {
   const host = hostFromEnv
     ? hostFromEnv.replace(/^https?:\/\//, "").replace(/\/+$/, "")
     : region
-    ? `${region}.storage.bunnycdn.com`
-    : "storage.bunnycdn.com";
+      ? `${region}.storage.bunnycdn.com`
+      : "storage.bunnycdn.com";
 
   // IMPORTANT: remotePath should NOT start with a leading slash
   const storageUrl = `https://${host}/${encodeURIComponent(zone)}/${remotePath
@@ -129,7 +132,7 @@ async function uploadToBunny({ buffer, remotePath, contentType }) {
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     const e = new Error(
-      `Bunny upload failed (${res.status}): ${txt || res.statusText}`
+      `Bunny upload failed (${res.status}): ${txt || res.statusText}`,
     );
     e.code = "BUNNY_UPLOAD_FAILED";
     throw e;
@@ -169,7 +172,7 @@ router.post("/upload", upload.single("file"), async (req, res) => {
 
     const ext = guessExt(req.file.originalname, req.file.mimetype);
     const base = safeFileBaseName(
-      path.basename(req.file.originalname || "file", ext)
+      path.basename(req.file.originalname || "file", ext),
     );
     const finalName = `${base}-${Date.now()}${ext}`;
 
@@ -204,7 +207,7 @@ router.get("/", async (req, res) => {
   try {
     const q = cleanStr(req.query.q);
     const visibility = normalizeVisibility(
-      req.query.visibility || req.query.access
+      req.query.visibility || req.query.access,
     );
     const type = cleanStr(req.query.type).toLowerCase();
     const active = cleanStr(req.query.active);
@@ -215,7 +218,7 @@ router.get("/", async (req, res) => {
     if (q) {
       params.push(`%${q}%`);
       where.push(
-        `(r.title ILIKE $${params.length} OR COALESCE(r.description,'') ILIKE $${params.length})`
+        `(r.title ILIKE $${params.length} OR COALESCE(r.description,'') ILIKE $${params.length})`,
       );
     }
 
@@ -275,8 +278,8 @@ router.post("/", async (req, res) => {
       req.body.collection_id != null
         ? Number(req.body.collection_id)
         : req.body.category_id != null
-        ? Number(req.body.category_id)
-        : null;
+          ? Number(req.body.category_id)
+          : null;
 
     const sort_order = Number(req.body.sort_order || 0);
     const is_active = req.body.is_active === false ? false : true;
@@ -334,7 +337,7 @@ router.put("/:id", async (req, res) => {
     // 1) Load existing row so we can support partial updates
     const existingRes = await pool.query(
       `SELECT * FROM resources WHERE id=$1`,
-      [id]
+      [id],
     );
     const existing = existingRes.rows[0];
     if (!existing) {
@@ -374,7 +377,7 @@ router.put("/:id", async (req, res) => {
       "public";
 
     const type = cleanStr(
-      req.body.type || existing.type || "link"
+      req.body.type || existing.type || "link",
     ).toLowerCase();
 
     const video_id =
@@ -387,8 +390,8 @@ router.put("/:id", async (req, res) => {
       req.body.collection_id != null
         ? Number(req.body.collection_id)
         : req.body.category_id != null
-        ? Number(req.body.category_id)
-        : existing.collection_id;
+          ? Number(req.body.category_id)
+          : existing.collection_id;
 
     const sort_order =
       req.body.sort_order == null || req.body.sort_order === ""
@@ -463,7 +466,7 @@ router.delete("/:id", async (req, res) => {
 
     const { rows } = await pool.query(
       `UPDATE resources SET is_active=false, updated_at=NOW() WHERE id=$1 RETURNING id`,
-      [id]
+      [id],
     );
 
     if (!rows[0]) {
@@ -479,5 +482,8 @@ router.delete("/:id", async (req, res) => {
       .json({ ok: false, message: "Failed to delete resource." });
   }
 });
+
+// Rejected file types get a clear 415 response instead of a server error.
+router.use(uploadErrorHandler);
 
 module.exports = router;

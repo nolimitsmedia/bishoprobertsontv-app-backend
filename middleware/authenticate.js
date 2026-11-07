@@ -7,7 +7,17 @@ module.exports = function authenticate(req, res, next) {
       return next();
     }
 
-    const secret = process.env.JWT_SECRET || "dev_secret_change_me";
+    const secret =
+      process.env.JWT_SECRET ||
+      (process.env.NODE_ENV === "production" ? "" : "dev_secret_change_me");
+    if (!secret) {
+      console.error(
+        "[authenticate] JWT_SECRET is not set; refusing to verify tokens.",
+      );
+      return res
+        .status(500)
+        .json({ message: "Server authentication is not configured" });
+    }
 
     const authHeader = req.headers.authorization || "";
     const accessToken = req.get("x-access-token") || "";

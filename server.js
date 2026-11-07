@@ -84,6 +84,10 @@ const channelsRouter = require("./routes/channels");
 const playlistsRouter = require("./routes/playlists");
 const communityRoutes = require("./routes/community");
 // const authBridge = require("./middleware/auth-bridge");
+const authenticateAdmin = require("./middleware/authenticateAdmin");
+// Phase 8-1: team roles (Website Manager, Content Manager).
+const { requireArea, attachTeamAccess } = require("./lib/teamAccess");
+const contentStaff = requireArea("content");
 const authBridge = require("./middleware/auth-bridge");
 const bunnyStreamRouter = require("./routes/bunnyStream");
 // Legacy pages router disabled: overlapping unguarded endpoints.
@@ -265,8 +269,8 @@ app.use("/api/auth/facebook", facebookRoutes);
 app.use("/api/auth", authRoutes);
 
 app.use("/api/videos", require("./routes/videoPlaybackUrl"));
-app.use("/api/videos", videosRoutes);
-app.use("/api/categories", categoriesRoutes);
+app.use("/api/videos", attachTeamAccess, videosRoutes);
+app.use("/api/categories", attachTeamAccess, categoriesRoutes);
 
 // ✅ uploads (no limit on multipart sizes; multer config controls max bytes)
 app.use("/api/uploads", uploadsRouter);
@@ -281,9 +285,9 @@ if (String(process.env.USE_BUNNY_STORAGE || "").toLowerCase() === "true") {
 }
 
 app.use("/api/subscription", subscriptionRoutes);
-app.use("/api/collections", collectionsRoutes);
+app.use("/api/collections", attachTeamAccess, collectionsRoutes);
 
-app.use("/api/live", liveRoutes);
+app.use("/api/live", attachTeamAccess, liveRoutes);
 app.use("/api/streamcontrol", streamcontrolRoutes); // keep clean single mount
 
 app.use("/api/site", siteRoutes);
@@ -310,7 +314,10 @@ app.use("/api/public", publicRoutes);
 
 app.use("/api/devices", devicesRoutes);
 
-app.use("/dev", devEmailRoutes);
+// Security: the test-email route is for local development only, and admin only.
+if (process.env.NODE_ENV !== "production") {
+  app.use("/dev", authenticateAdmin, devEmailRoutes);
+}
 app.use("/api/emails", emailsRoutes);
 app.use("/api/admin/email", require("./routes/adminEmail"));
 
@@ -320,23 +327,50 @@ app.use("/api/channels", channelsRouter);
 
 app.use("/api/pages", require("./routes/pagesPublic"));
 app.use("/api/admin/pages", require("./routes/adminPages"));
+// Phase 7-2: publish scheduled pages: shortly after start-up, then every minute.
+{
+  const { runDueSchedules } = require("./routes/adminPages");
+  const first = setTimeout(() => runDueSchedules(), 15 * 1000);
+  const every = setInterval(() => runDueSchedules(), 60 * 1000);
+  first.unref?.();
+  every.unref?.();
+}
+// Phase 4G-C3: reusable section library (admin only).
+app.use("/api/admin/sections", require("./routes/adminSections"));
+// Phase 4H-1: media library (admin only).
+app.use("/api/admin/media", require("./routes/adminMedia"));
+// Phase 8-1: access check for the admin panel, and team management.
+app.use("/api/admin/access", require("./routes/adminAccess"));
+app.use("/api/admin/team", require("./routes/adminTeam"));
+// Customer-editable public header navigation (separate from CMS pages).
+app.use("/api/navigation", require("./routes/navigation"));
+app.use("/api/site-design", require("./routes/siteDesign"));
 
 // ✅ playlists router (admin + public endpoints live here)
 app.use("/api/playlists", playlistsRouter);
 
 // ✅ community
-app.use("/api/community", communityRoutes);
+app.use("/api/community", attachTeamAccess, communityRoutes);
 
 // ✅ admin routes
 app.use("/api/admin/dashboard", adminDashboardRoutes);
-app.use("/api/admin/calendar", adminCalendarRoutes);
-app.use("/api/admin/resources", adminResourcesRoutes);
-app.use("/api/admin/organize", adminOrganizeRoutes);
+// Security: reading events stays public (Home and Live pages use it);
+// creating, changing and deleting require an admin.
+app.use(
+  "/api/admin/calendar",
+  (req, res, next) =>
+    ["GET", "HEAD", "OPTIONS"].includes(req.method)
+      ? next()
+      : contentStaff(req, res, next),
+  adminCalendarRoutes,
+);
+app.use("/api/admin/resources", contentStaff, adminResourcesRoutes); // admin or Content Manager
+app.use("/api/admin/organize", contentStaff, adminOrganizeRoutes); // admin or Content Manager
 app.use("/api/integrations", integrationsRoutes);
 // Legacy pages router disabled; use authenticated adminPages and pagesPublic.
 app.use("/api/admin/analytics", adminAnalyticsRoutes);
 app.use("/api/admin/users", adminUsersRoutes);
-app.use("/api/admin/wasabi", require("./routes/wasabiImport"));
+app.use("/api/admin/wasabi", contentStaff, require("./routes/wasabiImport")); // admin or Content Manager
 // app.use("/api/storage", require("./routes/storage"));
 app.use("/api/admin/storage", require("./routes/storage"));
 app.use("/api/admin/import-jobs", require("./routes/importJobs"));
@@ -367,7 +401,7 @@ app.use("/watch", require("./routes/watch"));
 app.use("/devices", require("./routes/devices"));
 app.use("/me", require("./routes/library"));
 
-app.use("/api/comments", require("./routes/comments"));
+app.use("/api/comments", attachTeamAccess, require("./routes/comments"));
 app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/push", require("./routes/push"));
 

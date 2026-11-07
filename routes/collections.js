@@ -3,6 +3,9 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const authenticate = require("../middleware/authenticate");
+// Phase 8-1 security fix: changes were open to any signed-in member.
+const { requireArea } = require("../lib/teamAccess");
+const contentStaff = requireArea("content");
 
 function slugify(s) {
   return String(s || "")
@@ -256,7 +259,7 @@ router.get("/:id/videos", authenticate, async (req, res) => {
 });
 
 // POST /api/collections
-router.post("/", authenticate, async (req, res) => {
+router.post("/", authenticate, contentStaff, async (req, res) => {
   try {
     const { title, description, slug } = req.body || {};
     if (!title) return res.status(400).json({ message: "title required" });
@@ -274,7 +277,7 @@ router.post("/", authenticate, async (req, res) => {
 });
 
 // PUT /api/collections/:id
-router.put("/:id", authenticate, async (req, res) => {
+router.put("/:id", authenticate, contentStaff, async (req, res) => {
   try {
     const { title, description, slug } = req.body || {};
     const q = await db.query(
@@ -300,7 +303,7 @@ router.put("/:id", authenticate, async (req, res) => {
 });
 
 // DELETE /api/collections/:id
-router.delete("/:id", authenticate, async (req, res) => {
+router.delete("/:id", authenticate, contentStaff, async (req, res) => {
   try {
     const del = await db.query(
       `DELETE FROM collections WHERE id = $1 RETURNING id`,
@@ -315,7 +318,7 @@ router.delete("/:id", authenticate, async (req, res) => {
 });
 
 // POST /api/collections/:id/videos   { video_id }
-router.post("/:id/videos", authenticate, async (req, res) => {
+router.post("/:id/videos", authenticate, contentStaff, async (req, res) => {
   try {
     const { video_id } = req.body || {};
     if (!video_id)
@@ -342,21 +345,26 @@ router.post("/:id/videos", authenticate, async (req, res) => {
 });
 
 // DELETE /api/collections/:id/videos/:video_id
-router.delete("/:id/videos/:video_id", authenticate, async (req, res) => {
-  try {
-    await db.query(
-      `DELETE FROM collection_videos WHERE collection_id = $1 AND video_id = $2`,
-      [req.params.id, req.params.video_id],
-    );
-    res.json({ message: "Removed" });
-  } catch (err) {
-    console.error("[DELETE /collections/:id/videos/:video_id] error:", err);
-    res.status(500).json({ message: "Failed to remove video" });
-  }
-});
+router.delete(
+  "/:id/videos/:video_id",
+  authenticate,
+  contentStaff,
+  async (req, res) => {
+    try {
+      await db.query(
+        `DELETE FROM collection_videos WHERE collection_id = $1 AND video_id = $2`,
+        [req.params.id, req.params.video_id],
+      );
+      res.json({ message: "Removed" });
+    } catch (err) {
+      console.error("[DELETE /collections/:id/videos/:video_id] error:", err);
+      res.status(500).json({ message: "Failed to remove video" });
+    }
+  },
+);
 
 // PUT /api/collections/:id/reorder   { video_ids: [..] }
-router.put("/:id/reorder", authenticate, async (req, res) => {
+router.put("/:id/reorder", authenticate, contentStaff, async (req, res) => {
   try {
     const { video_ids } = req.body || {};
     if (!Array.isArray(video_ids)) {

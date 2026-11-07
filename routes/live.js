@@ -21,6 +21,17 @@ const baseAuth =
   authenticate ||
   ((_req, _res, next) => next());
 
+// Phase 8-1: Administrators and Content Managers manage everyone's content.
+// req.access is attached by attachTeamAccess (server.js) from the database.
+function isContentStaff(req) {
+  const a = req && req.access;
+  return !!(
+    a &&
+    (a.isAdmin ||
+      (Array.isArray(a.teamRoles) && a.teamRoles.includes("content")))
+  );
+}
+
 function isAdmin(user) {
   const r = (user?.role || user?.type || "").toLowerCase();
   return r === "admin" || r === "owner";
@@ -48,8 +59,8 @@ function userIdFromUser(u) {
       u.uid,
       u.account_id,
       u.owner_id,
-      u.sub
-    )
+      u.sub,
+    ),
   );
 }
 function getReqUserId(req) {
@@ -71,7 +82,12 @@ function getReqUserId(req) {
 
 // Allow user/admin/creator/owner (must be authenticated)
 function allowUserOrAdmin(req, res, next) {
-  if (roleAllows(req.user) || isAdmin(req.user) || getReqUserId(req) != null)
+  if (
+    roleAllows(req.user) ||
+    isAdmin(req.user) ||
+    isContentStaff(req) ||
+    getReqUserId(req) != null
+  )
     return next();
   return res.status(403).json({ message: "Forbidden" });
 }
@@ -99,7 +115,7 @@ const safeEntitlements =
             if (err)
               console.warn(
                 "[entitlements] attach failed:",
-                err?.message || err
+                err?.message || err,
               );
             next();
           });
@@ -107,8 +123,8 @@ const safeEntitlements =
             r.catch((e) =>
               console.warn(
                 "[entitlements] attach failed (promise):",
-                e?.message || e
-              )
+                e?.message || e,
+              ),
             );
           }
         } catch (e) {
@@ -155,7 +171,7 @@ async function getFallbackMonthlyLimitFromDB(userId) {
       ORDER BY s.id DESC
       LIMIT 1
       `,
-      [userId]
+      [userId],
     );
     const r = rows[0];
     if (!r) return 0;
@@ -196,7 +212,7 @@ async function resolveMonthlyLiveLimit(req) {
    PROVIDER CONFIG
 ────────────────────────────────────────────────────────────── */
 const VIDEO_PROVIDER = String(
-  process.env.VIDEO_PROVIDER || "livepeer"
+  process.env.VIDEO_PROVIDER || "livepeer",
 ).toLowerCase();
 
 const LIVEPEER_BASE =
@@ -210,7 +226,7 @@ const HLS_CDN_BASE_LIVEPEER =
 const STREAMCONTROL_CHANNEL_ID = process.env.STREAMCONTROL_CHANNEL_ID || "";
 const RTMP_BASE_STREAMCONTROL = String(
   process.env.STREAMCONTROL_RTMP_URL ||
-    "rtmps://ingest.mycloudstream.io:1936/static"
+    "rtmps://ingest.mycloudstream.io:1936/static",
 ).replace(/\/+$/, "");
 const HLS_FIXED_STREAMCONTROL = process.env.STREAMCONTROL_HLS_URL || "";
 const HLS_TEMPLATE_STREAMCONTROL = process.env.STREAMCONTROL_HLS_TEMPLATE || "";
@@ -270,10 +286,10 @@ async function ensureLiveTables() {
     } catch {}
   }
   await db.query(
-    `CREATE INDEX IF NOT EXISTS idx_live_events_creator ON live_events (created_by)`
+    `CREATE INDEX IF NOT EXISTS idx_live_events_creator ON live_events (created_by)`,
   );
   await db.query(
-    `CREATE INDEX IF NOT EXISTS idx_live_events_status ON live_events (status)`
+    `CREATE INDEX IF NOT EXISTS idx_live_events_status ON live_events (status)`,
   );
 
   await db.query(`
@@ -287,7 +303,7 @@ async function ensureLiveTables() {
     );
   `);
   await db.query(
-    `CREATE INDEX IF NOT EXISTS idx_chat_event ON live_chat_messages (event_id, created_at)`
+    `CREATE INDEX IF NOT EXISTS idx_chat_event ON live_chat_messages (event_id, created_at)`,
   );
 }
 
@@ -333,7 +349,7 @@ function scDeriveHlsFor(key) {
   if (HLS_TEMPLATE_STREAMCONTROL) {
     return HLS_TEMPLATE_STREAMCONTROL.replace("{name}", key).replace(
       "{key}",
-      key
+      key,
     );
   }
   return null;
@@ -364,11 +380,11 @@ function attachPlaybackFallback(row) {
 async function assertOwnerOrAdmin(eventId, req) {
   const q = await db.query(
     "SELECT id, created_by FROM live_events WHERE id=$1 LIMIT 1",
-    [eventId]
+    [eventId],
   );
   if (!q.rowCount) return { ok: false, status: 404 };
   const row = q.rows[0];
-  if (isAdmin(req.user)) return { ok: true, row };
+  if (isAdmin(req.user) || isContentStaff(req)) return { ok: true, row };
 
   const uid = getReqUserId(req);
   if (row.created_by == null && uid != null) {
@@ -479,7 +495,7 @@ router.post(
           hls_url,
           !!record,
           creatorId,
-        ]
+        ],
       );
 
       return res.json(attachPlaybackFallback(ins.rows[0]));
@@ -487,7 +503,7 @@ router.post(
       console.error("POST /live/events error:", err?.response?.data || err);
       return res.status(500).json({ message: "Failed to create event" });
     }
-  }
+  },
 );
 
 /* ──────────────────────────────────────────────────────────────
@@ -497,14 +513,14 @@ router.get("/events", baseAuth, allowUserOrAdmin, async (req, res) => {
   try {
     await ensureLiveTables();
 
-    if (isAdmin(req.user)) {
+    if (isAdmin(req.user) || isContentStaff(req)) {
       const q = await db.query("SELECT * FROM live_events ORDER BY id DESC");
       return res.json({ items: q.rows.map(attachPlaybackFallback) });
     }
     const uid = getReqUserId(req);
     const q = await db.query(
       "SELECT * FROM live_events WHERE created_by=$1 ORDER BY id DESC",
-      [uid]
+      [uid],
     );
     res.json({ items: q.rows.map(attachPlaybackFallback) });
   } catch (e) {
@@ -571,16 +587,16 @@ router.put(
       vals.push(id);
       const up = await db.query(
         `UPDATE live_events SET ${sets.join(
-          ", "
+          ", ",
         )}, updated_at=now() WHERE id=$${vals.length} RETURNING *`,
-        vals
+        vals,
       );
       return res.json(attachPlaybackFallback(up.rows[0]));
     } catch (e) {
       console.error("PUT /live/events/:id error:", e);
       res.status(500).json({ message: "Failed to update event" });
     }
-  }
+  },
 );
 
 /* ──────────────────────────────────────────────────────────────
@@ -626,7 +642,7 @@ router.post(
 
       const up = await db.query(
         "UPDATE live_events SET status='live', started_at=COALESCE(started_at, now()), updated_at=now() WHERE id=$1 RETURNING *",
-        [id]
+        [id],
       );
       if (!up.rows[0]) return res.status(404).json({ message: "Not found" });
       res.json(attachPlaybackFallback(up.rows[0]));
@@ -634,7 +650,7 @@ router.post(
       console.error("POST /live/events/:id/start error:", e);
       res.status(500).json({ message: "Failed to mark live" });
     }
-  }
+  },
 );
 
 /* ──────────────────────────────────────────────────────────────
@@ -661,7 +677,7 @@ router.post(
       const endedAt = new Date();
       await db.query(
         "UPDATE live_events SET status='ended', ended_at=$2, updated_at=now() WHERE id=$1",
-        [id, endedAt]
+        [id, endedAt],
       );
 
       // Reload event for accurate fields
@@ -679,7 +695,7 @@ router.post(
           if (evt.provider === "livepeer" && evt.provider_stream_id) {
             try {
               const sessions = await lpGet(
-                `/stream/${evt.provider_stream_id}/sessions`
+                `/stream/${evt.provider_stream_id}/sessions`,
               );
               if (Array.isArray(sessions) && sessions.length) {
                 hours = sessions.reduce((sum, s) => {
@@ -687,8 +703,8 @@ router.post(
                   const end = s?.endedAt
                     ? new Date(s.endedAt)
                     : s?.lastSeen
-                    ? new Date(s.lastSeen)
-                    : endedAt;
+                      ? new Date(s.lastSeen)
+                      : endedAt;
                   if (
                     start &&
                     isFinite(+start) &&
@@ -724,7 +740,7 @@ router.post(
         } catch (err) {
           console.warn(
             "Could not record live usage:",
-            err?.response?.data || err
+            err?.response?.data || err,
           );
         }
       })();
@@ -736,7 +752,7 @@ router.post(
       if (evt.record && evt.provider === "livepeer" && evt.provider_stream_id) {
         try {
           const sessions = await lpGet(
-            `/stream/${evt.provider_stream_id}/sessions`
+            `/stream/${evt.provider_stream_id}/sessions`,
           );
           let assetId = null;
           if (Array.isArray(sessions) && sessions.length) {
@@ -766,19 +782,19 @@ router.post(
                   !!evt.is_premium,
                   evt.visibility || "public",
                   evt.created_by || getReqUserId(req) || null,
-                ]
+                ],
               );
               createdVodId = ins.rows[0]?.id || null;
               await db.query(
                 "UPDATE live_events SET vod_video_id=$1, vod_hls_url=$2 WHERE id=$3",
-                [createdVodId, createdVodUrl, evt.id]
+                [createdVodId, createdVodUrl, evt.id],
               );
             }
           }
         } catch (e) {
           console.warn(
             "end() could not auto-create VOD:",
-            e?.response?.data || e
+            e?.response?.data || e,
           );
         }
       }
@@ -794,7 +810,7 @@ router.post(
       console.error("POST /live/events/:id/end error:", err);
       return res.status(500).json({ message: "Failed to end event" });
     }
-  }
+  },
 );
 
 /* ──────────────────────────────────────────────────────────────
@@ -837,7 +853,7 @@ router.delete(
       console.error("DELETE /live/events/:id error:", e);
       return res.status(500).json({ message: "Failed to delete live event" });
     }
-  }
+  },
 );
 
 /* ──────────────────────────────────────────────────────────────
@@ -856,7 +872,7 @@ router.get("/events/:id/chat", async (req, res) => {
        WHERE event_id=$1
        ORDER BY created_at ASC
        LIMIT $2`,
-      [id, limit]
+      [id, limit],
     );
     res.json({ items: q.rows });
   } catch (e) {
@@ -906,7 +922,7 @@ router.get("/events/:id/register", async (req, res) => {
       res.setHeader("Content-Type", "text/calendar; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="event-${row.id}.ics"`
+        `attachment; filename="event-${row.id}.ics"`,
       );
       return res.send(ics);
     }
@@ -967,7 +983,7 @@ router.post(
       console.error("POST /live/end error:", e);
       res.status(500).json({ error: "Live end failed" });
     }
-  }
+  },
 );
 
 module.exports = router;

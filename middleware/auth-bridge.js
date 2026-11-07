@@ -13,6 +13,8 @@ const jwt = require("jsonwebtoken");
  * Authorization decisions happen elsewhere.
  */
 module.exports = function authBridge(req, _res, next) {
+  // Without a signing secret no token can be trusted, so no user is attached.
+  if (!process.env.JWT_SECRET) return next();
   // --------------------------------------------------
   // 1) Authorization: Bearer <token>
   // --------------------------------------------------
@@ -20,7 +22,7 @@ module.exports = function authBridge(req, _res, next) {
   if (auth.startsWith("Bearer ")) {
     const token = auth.slice(7);
     try {
-      const payload = jwt.verify(token, process.env.JWT_SECRET || "devsecret");
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
 
       const id = Number(payload?.sub || payload?.id);
       if (Number.isFinite(id) && id > 0) {
@@ -44,7 +46,7 @@ module.exports = function authBridge(req, _res, next) {
       ?.split("=")[1];
 
     if (token) {
-      const payload = jwt.verify(token, process.env.JWT_SECRET || "devsecret");
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
 
       const id = Number(payload?.sub || payload?.id);
       if (Number.isFinite(id) && id > 0) {
@@ -59,7 +61,13 @@ module.exports = function authBridge(req, _res, next) {
   // --------------------------------------------------
   // 3) Dev escape hatch
   // --------------------------------------------------
-  if (req.headers["x-dev-user-id"]) {
+  // Security: this header lets a request claim any user id without a token.
+  // It only works when explicitly enabled on a non-production machine.
+  if (
+    process.env.NODE_ENV !== "production" &&
+    process.env.ALLOW_DEV_USER_HEADER === "true" &&
+    req.headers["x-dev-user-id"]
+  ) {
     const id = Number(req.headers["x-dev-user-id"]);
     if (Number.isFinite(id) && id > 0) {
       req.user = { id };

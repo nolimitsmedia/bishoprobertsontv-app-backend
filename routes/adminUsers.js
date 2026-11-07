@@ -119,6 +119,114 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+/* -----------------------------
+   Phase 8-1: Owner rules (as in Uscreen)
+   - nobody changes their own role or deletes their own account here
+   - the Owner cannot be demoted or deleted (transfer ownership first)
+   - only the Owner adds or removes administrators
+   Before the team-roles migration (no Owner yet) only the first rule applies.
+----------------------------- */
+async function loadRoleInfo(db, id) {
+  const { rows } = await db.query(
+    `SELECT id, role,
+            COALESCE((to_jsonb(users) ->> 'is_owner')::boolean, FALSE) AS is_owner
+       FROM users WHERE id = $1 LIMIT 1`,
+    [id],
+  );
+  return rows[0] || null;
+}
+
+function ownerRules(action) {
+  return async function (req, res, next) {
+    try {
+      const db = req.db;
+      const actorId = Number(req.user?.id);
+      const targetId = Number(req.params.id);
+      if (!Number.isFinite(targetId) || targetId <= 0) return next();
+      const [actor, target] = await Promise.all([
+        loadRoleInfo(db, actorId),
+        loadRoleInfo(db, targetId),
+      ]);
+      if (!target) return next(); // the route answers "not found"
+      const ownerExists =
+        (
+          await db.query(
+            `SELECT 1 FROM users WHERE COALESCE((to_jsonb(users) ->> 'is_owner')::boolean, FALSE) LIMIT 1`,
+          )
+        ).rows.length > 0;
+      const actorIsOwner = !!actor?.is_owner;
+      const targetIsAdmin = normalizeRole(target.role) === "admin";
+      const deny = (message) =>
+        res.status(403).json({ ok: false, message, error: message });
+
+      if (action === "delete") {
+        if (targetId === actorId)
+          return deny("You can't delete your own account here.");
+        if (target.is_owner)
+          return deny(
+            "The Owner's account can't be deleted. Transfer ownership first.",
+          );
+        if (targetIsAdmin && ownerExists && !actorIsOwner)
+          return deny("Only the Owner can remove administrators.");
+        return next();
+      }
+
+      // Phase 8-2: Customer Support (not an administrator) edits member accounts
+      // only: never staff accounts (that could take them over) and never roles.
+      if (req.access && !req.access.isAdmin) {
+        const staffTarget =
+          targetIsAdmin ||
+          (
+            await db
+              .query(
+                "SELECT 1 FROM admin_team_roles WHERE user_id = $1 LIMIT 1",
+                [targetId],
+              )
+              .catch(() => ({ rows: [] }))
+          ).rows.length > 0;
+        if (staffTarget)
+          return deny(
+            "Customer Support can edit member accounts only, not team or administrator accounts.",
+          );
+        if (
+          req.body?.role !== undefined &&
+          normalizeRole(req.body.role) !== normalizeRole(target.role)
+        )
+          return deny("Customer Support can't change roles.");
+        return next();
+      }
+
+      // update: only role changes are restricted
+      if (req.body?.role === undefined) return next();
+      const newRole = normalizeRole(req.body.role);
+      const oldRole = normalizeRole(target.role);
+      if (newRole === oldRole) return next();
+      if (targetId === actorId) return deny("You can't change your own role.");
+      if (target.is_owner)
+        return deny(
+          "The Owner's role can't be changed. Transfer ownership first.",
+        );
+      if (
+        (newRole === "admin" || oldRole === "admin") &&
+        ownerExists &&
+        !actorIsOwner
+      )
+        return deny("Only the Owner can add or remove administrators.");
+      return next();
+    } catch (e) {
+      console.error("[adminUsers] owner rules error:", e);
+      return res.status(500).json({ ok: false, message: "Server error" });
+    }
+  };
+}
+
+// Phase 8-2: Customer Support views and edits member accounts; Marketing
+// Managers read the list (Email Center recipients). requireArea also admits
+// administrators and verifies the person's current access from the database.
+const { requireArea } = require("../lib/teamAccess");
+const listReaders = requireArea("support", "marketing");
+const supportStaff = requireArea("support");
+
 /**
  * GET /api/admin/users
  * Query:
@@ -128,7 +236,7 @@ async function requireAdmin(req, res, next) {
  *  - sort (created_at|id|name|email|role)
  *  - order (asc|desc)
  */
-router.get("/", requireAdmin, async (req, res) => {
+router.get("/", listReaders, async (req, res) => {
   try {
     const db = req.db;
     const usersTable = "users";
@@ -247,7 +355,7 @@ router.get("/", requireAdmin, async (req, res) => {
  * GET /api/admin/users/:id
  * Returns a single user (safe fields only)
  */
-router.get("/:id", requireAdmin, async (req, res) => {
+router.get("/:id", supportStaff, async (req, res) => {
   try {
     const db = req.db;
     const usersTable = "users";
@@ -323,7 +431,7 @@ router.get("/:id", requireAdmin, async (req, res) => {
  * Body: { name, email, role, password? }
  * - password optional; if provided, hashes and updates password_hash/password column
  */
-router.put("/:id", requireAdmin, async (req, res) => {
+router.put("/:id", supportStaff, ownerRules("update"), async (req, res) => {
   try {
     const db = req.db;
     const usersTable = "users";
@@ -446,7 +554,7 @@ router.put("/:id", requireAdmin, async (req, res) => {
 });
 
 // DELETE /api/admin/users/:id
-router.delete("/:id", requireAdmin, async (req, res) => {
+router.delete("/:id", requireAdmin, ownerRules("delete"), async (req, res) => {
   const db = req.db;
   const usersTable = "users";
   const userId = Number(req.params.id);
@@ -467,6 +575,10 @@ router.delete("/:id", requireAdmin, async (req, res) => {
     ]);
 
     await db.query("COMMIT");
+    // Phase 8-1: remove the deleted user's team roles (ignored before the migration).
+    await db
+      .query("DELETE FROM admin_team_roles WHERE user_id = $1", [userId])
+      .catch(() => {});
 
     if (del.rowCount === 0) {
       return res.status(404).json({ ok: false, message: "User not found" });

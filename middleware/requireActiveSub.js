@@ -6,6 +6,17 @@ module.exports = async function requireActiveSub(req, res, next) {
     const uid = req?.user?.id;
     if (!uid) return res.status(401).json({ message: "Unauthorized" });
 
+    // Phase 8-1: Administrators and Content Managers act for the ministry and
+    // do not need a personal subscription (req.access comes from the database).
+    const a = req.access;
+    if (
+      a &&
+      (a.isAdmin ||
+        (Array.isArray(a.teamRoles) && a.teamRoles.includes("content")))
+    ) {
+      return next();
+    }
+
     const { rows } = await db.query(
       `
       SELECT
@@ -16,7 +27,7 @@ module.exports = async function requireActiveSub(req, res, next) {
       ORDER BY created_at DESC
       LIMIT 1
       `,
-      [uid]
+      [uid],
     );
 
     const sub = rows[0];
@@ -32,8 +43,8 @@ module.exports = async function requireActiveSub(req, res, next) {
     const periodEnd = sub.current_period_end
       ? new Date(sub.current_period_end)
       : sub.renews_at
-      ? new Date(sub.renews_at)
-      : null;
+        ? new Date(sub.renews_at)
+        : null;
     const notExpired = periodEnd ? periodEnd > now : true;
 
     const status = String(sub.status || "").toLowerCase();
