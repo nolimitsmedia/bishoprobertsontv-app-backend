@@ -656,21 +656,85 @@ async function getPublishedVideoForPreview(videoId) {
   return r.rowCount ? r.rows[0] : null;
 }
 
-function rewriteM3u8(text, sourceUrl, videoId, ttlSeconds, row = null) {
-  return String(text || "")
+// Keep a media playlist only up to the preview length, and mark it ended, so a
+// logged-out preview cannot load the rest of the video (enforced by the server).
+function trimMediaPlaylist(text, maxSeconds) {
+  const lines = String(text || "").split(/\r?\n/);
+  if (!(maxSeconds > 0) || !lines.some((l) => l.trim().startsWith("#EXTINF")))
+    return String(text || "");
+  const out = [];
+  let total = 0;
+  let pending = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (t === "#EXT-X-ENDLIST") continue;
+    if (t.startsWith("#EXTINF")) {
+      pending = Number.parseFloat(t.slice(8)) || 0;
+      out.push(line);
+      continue;
+    }
+    if (t && !t.startsWith("#") && pending !== null) {
+      out.push(line);
+      total += pending;
+      pending = null;
+      if (total >= maxSeconds) break;
+      continue;
+    }
+    out.push(line);
+  }
+  out.push("#EXT-X-ENDLIST");
+  return out.join("\n");
+}
+
+function isPlaylistResponse(url, contentType) {
+  const t = String(contentType || "").toLowerCase();
+  if (t.includes("mpegurl")) return true;
+  try {
+    return new URL(String(url)).pathname.toLowerCase().endsWith(".m3u8");
+  } catch {
+    return false;
+  }
+}
+
+// Point every address in a playlist (sub-playlists, video pieces, and URI="…"
+// in key / init-segment / audio-track tags) at the preview proxy, signed.
+// Mobile/desktop fix: sub-playlists are rewritten too (they used to pass through
+// unchanged, so their relative piece addresses broke and playback stuck).
+function rewriteM3u8(
+  text,
+  sourceUrl,
+  videoId,
+  ttlSeconds,
+  row = null,
+  previewSeconds = 0,
+) {
+  const proxied = (ref) => {
+    const absoluteChild = new URL(ref, sourceUrl).toString();
+    if (!/^https?:/i.test(absoluteChild)) return ref;
+    const playableChild = signPlaybackUrlForRow(row, absoluteChild, ttlSeconds);
+    return `/api/videos/public/${videoId}/preview-proxy?u=${encodeProxyUrl(playableChild)}`;
+  };
+  const body =
+    previewSeconds > 0
+      ? trimMediaPlaylist(text, previewSeconds)
+      : String(text || "");
+  return body
     .split(/\r?\n/)
     .map((line) => {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) return line;
-
+      if (!trimmed) return line;
+      if (trimmed.startsWith("#")) {
+        if (!/URI="/.test(trimmed)) return line;
+        return line.replace(/URI="([^"]+)"/g, (m, ref) => {
+          try {
+            return `URI="${proxied(ref)}"`;
+          } catch {
+            return m;
+          }
+        });
+      }
       try {
-        const absoluteChild = new URL(trimmed, sourceUrl).toString();
-        const playableChild = signPlaybackUrlForRow(
-          row,
-          absoluteChild,
-          ttlSeconds,
-        );
-        return `/api/videos/public/${videoId}/preview-proxy?u=${encodeProxyUrl(playableChild)}`;
+        return proxied(trimmed);
       } catch {
         return line;
       }
@@ -999,7 +1063,14 @@ router.get("/public/:id/preview.m3u8", async (req, res) => {
     }
 
     const playlist = await upstream.text();
-    const rewritten = rewriteM3u8(playlist, playlistUrl, id, ttl, row);
+    const rewritten = rewriteM3u8(
+      playlist,
+      playlistUrl,
+      id,
+      ttl,
+      row,
+      previewSeconds,
+    );
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.setHeader("Cache-Control", "no-store, max-age=0");
@@ -1032,6 +1103,7 @@ function previewMediaType(url, upstreamType) {
   return "video/mp4"; // .mp4, .m4v and unknown video files
 }
 router.previewMediaType = previewMediaType; // for tests
+router.previewHls = { trimMediaPlaylist, isPlaylistResponse }; // for tests
 
 router.get("/public/:id/preview-proxy", async (req, res) => {
   try {
@@ -1064,6 +1136,18 @@ router.get("/public/:id/preview-proxy", async (req, res) => {
         detail.slice(0, 250),
       );
       return res.status(upstream.status).send("Preview asset unavailable");
+    }
+
+    // A sub-playlist (e.g. 720p/video.m3u8): rewrite its addresses and trim it
+    // to the preview length, like the main playlist.
+    if (isPlaylistResponse(target, upstream.headers.get("content-type"))) {
+      const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);
+      const text = await upstream.text();
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      return res
+        .status(200)
+        .send(rewriteM3u8(text, target, id, ttl, row, previewSeconds));
     }
 
     res.status(upstream.status);
