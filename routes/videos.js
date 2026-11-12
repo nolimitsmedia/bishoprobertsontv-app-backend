@@ -1010,6 +1010,29 @@ router.get("/public/:id/preview.m3u8", async (req, res) => {
   }
 });
 
+// The right media type for a preview file: keep a real video/* or audio/*
+// type; otherwise decide by the file extension (Safari needs it).
+function previewMediaType(url, upstreamType) {
+  const t = String(upstreamType || "").toLowerCase();
+  if (/^(video|audio)\//.test(t) || t.includes("mpegurl")) return upstreamType;
+  let path = "";
+  try {
+    path = new URL(String(url)).pathname.toLowerCase();
+  } catch {
+    path = String(url || "")
+      .toLowerCase()
+      .split("?")[0];
+  }
+  if (path.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
+  if (path.endsWith(".ts")) return "video/mp2t";
+  if (path.endsWith(".mov")) return "video/quicktime";
+  if (path.endsWith(".webm")) return "video/webm";
+  if (path.endsWith(".m4a")) return "audio/mp4";
+  if (path.endsWith(".mp3")) return "audio/mpeg";
+  return "video/mp4"; // .mp4, .m4v and unknown video files
+}
+router.previewMediaType = previewMediaType; // for tests
+
 router.get("/public/:id/preview-proxy", async (req, res) => {
   try {
     const { id } = req.params;
@@ -1055,6 +1078,14 @@ router.get("/public/:id/preview-proxy", async (req, res) => {
       const v = upstream.headers.get(h);
       if (v) res.setHeader(h, v);
     }
+    // iPhone/iPad fix: Safari won't play a video labeled as a generic file
+    // (e.g. "binary/octet-stream" from storage), and it needs byte ranges.
+    res.setHeader(
+      "Content-Type",
+      previewMediaType(target, upstream.headers.get("content-type")),
+    );
+    if (upstream.status === 206 || upstream.headers.get("content-range"))
+      res.setHeader("Accept-Ranges", "bytes");
     if (!res.getHeader("Cache-Control")) {
       res.setHeader("Cache-Control", "public, max-age=300");
     }
