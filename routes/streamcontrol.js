@@ -157,7 +157,7 @@ function normalizeChannel(payload = {}) {
     metrics.uptime_sec ||
       metrics.broadcast_time_sec ||
       metrics.live_seconds ||
-      0
+      0,
   );
 
   const recording = !!(
@@ -616,7 +616,16 @@ router.get("/:id/player", async (req, res) => {
 -------------------------------------------------------------------*/
 router.get("/:id/events", async (_req, res) => res.json([]));
 router.get("/events", async (_req, res) =>
-  res.json({ upcoming: [], past: [] })
+  res.json({ upcoming: [], past: [] }),
 );
+
+// Release 2.2: shared with the live streaming integration (routes/liveIntegration.js).
+router.helpers = {
+  scRequestAnyVersion,
+  normalizeChannel,
+  fallbackChannel,
+  getNextLiveFromDb,
+  getDb,
+};
 
 module.exports = router;

@@ -342,6 +342,26 @@ app.use("/api/admin/media", require("./routes/adminMedia"));
 // Phase 8-1: access check for the admin panel, and team management.
 app.use("/api/admin/access", require("./routes/adminAccess"));
 app.use("/api/admin/team", require("./routes/adminTeam"));
+// Site options: homepage choice and site-wide custom CSS.
+app.use("/api/site-options", require("./routes/siteOptions"));
+// Release 1.2: Form element submissions (public submit + admin inbox).
+app.use("/api/forms", require("./routes/forms"));
+// Release 2.0: viewer experience (Browse rows, Continue Watching, My List).
+app.use("/api/viewer", require("./routes/viewer"));
+// Release 2.2: live streaming integration (any provider) and unified live status.
+{
+  const live = require("./routes/liveIntegration");
+  app.use("/api/live-status", live.publicRouter);
+  app.use("/api/live-settings", live.adminRouter);
+}
+// Release 2.2 Part B: live page chat and "Notify me" reminders.
+{
+  const chat = require("./routes/liveChat");
+  app.use("/api/live-chat", chat.router);
+  const reminders = require("./routes/liveReminders");
+  app.use("/api/live-reminders", reminders.router);
+  reminders.startReminderWorker();
+}
 // Customer-editable public header navigation (separate from CMS pages).
 app.use("/api/navigation", require("./routes/navigation"));
 app.use("/api/site-design", require("./routes/siteDesign"));
@@ -413,6 +433,8 @@ if (tusRouter) {
 /* --------------------------------------------------------
    SOCKET.IO CHAT
 --------------------------------------------------------- */
+require("./routes/liveChat").attach(io); // Release 2.2: secured live page chat
+
 io.on("connection", (socket) => {
   socket.on("chat:join", ({ eventId, name }) => {
     if (!eventId) return;

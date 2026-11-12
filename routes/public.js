@@ -95,21 +95,78 @@ router.get("/categories", async (req, res) => {
    PUBLIC VIDEOS
    GET /api/public/videos
 ════════════════════════════════════════════════════════════ */
+// The videos table differs between databases (e.g. "views" vs "view_count",
+// optional URL columns). Read its real columns once, so the list below never
+// asks for a column that doesn't exist.
+let videoColsPromise = null;
+function videoColumns() {
+  if (!videoColsPromise) {
+    videoColsPromise = db
+      .query(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_name = 'videos' AND table_schema = ANY (current_schemas(false))`,
+      )
+      .then((r) => new Set(r.rows.map((x) => x.column_name)))
+      .catch((e) => {
+        videoColsPromise = null; // retry next time
+        throw e;
+      });
+  }
+  return videoColsPromise;
+}
+const VIDEO_LIST_COLS = [
+  "id",
+  "title",
+  "description",
+  "thumbnail_url",
+  "duration_seconds",
+  "is_premium",
+  "is_published",
+  "visibility",
+  "category_id",
+  "published_at",
+  "created_at",
+  "updated_at",
+  "bunny_video_id",
+  "video_url",
+  "hls_url",
+];
+
 router.get("/videos", async (req, res) => {
   try {
     // OPTIMIZATION 1 & 2: respect sort params; cap limit properly
     const { search, only_free, sort, sort_by, order, order_by } = req.query;
 
     const limit = clampInt(req.query.limit ?? req.query.per_page, 1, 500, 100);
-    const sortCol = resolveSortCol(sort || sort_by);
+    const cols = await videoColumns();
+    const viewsCol = cols.has("views")
+      ? "views"
+      : cols.has("view_count")
+        ? "view_count"
+        : "";
+    // Sort only by a column that exists (views/view_count map to the real one).
+    let sortCol = resolveSortCol(sort || sort_by);
+    const sortName = sortCol.replace(/^v\./, "");
+    if (sortName === "views" || sortName === "view_count")
+      sortCol = viewsCol ? `v.${viewsCol}` : "";
+    else if (!cols.has(sortName)) sortCol = "";
+    if (!sortCol)
+      sortCol = cols.has("published_at") ? "v.published_at" : "v.created_at";
     const sortDir = resolveOrder(order || order_by);
+    const selectList = [
+      ...VIDEO_LIST_COLS.map((c) => (cols.has(c) ? `v.${c}` : `NULL AS ${c}`)),
+      viewsCol ? `v.${viewsCol} AS views` : "0 AS views",
+    ].join(",\n        ");
 
     const params = [];
     let where = `
       WHERE v.is_published = TRUE
         AND v.visibility IN ('public','unlisted')
-        AND v.category_id IS NOT NULL
     `;
+    // The catalog lists categorized videos only; page Video galleries ask for
+    // every published video (any_category=1).
+    if (req.query.any_category !== "1")
+      where += " AND v.category_id IS NOT NULL";
 
     if (only_free === "1" || only_free === "true") {
       where += " AND v.is_premium = false";
@@ -125,22 +182,7 @@ router.get("/videos", async (req, res) => {
     // OPTIMIZATION 6: explicit columns instead of v.* — avoids sending blob/binary fields
     const sql = `
       SELECT
-        v.id,
-        v.title,
-        v.description,
-        v.thumbnail_url,
-        v.duration_seconds,
-        v.is_premium,
-        v.is_published,
-        v.visibility,
-        v.category_id,
-        v.published_at,
-        v.created_at,
-        v.updated_at,
-        v.views,
-        v.bunny_video_id,
-        v.video_url,
-        v.hls_url,
+        ${selectList},
         c.name AS category_name
       FROM videos v
       LEFT JOIN categories c ON c.id = v.category_id

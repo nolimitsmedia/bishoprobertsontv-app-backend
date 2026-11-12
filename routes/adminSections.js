@@ -38,8 +38,51 @@ function cleanText(value, max) {
     .slice(0, max);
 }
 
+// Release 1.2 templates: a saved item is a section, an element (a section
+// wrapping one block), or a whole page (__template_kind "page" with
+// page_sections). All stay section-shaped, so no migration is needed.
+const TEMPLATE_KINDS = new Set(["section", "element", "page"]);
+const MAX_PAGE_SECTIONS = 60;
+const MAX_PAGE_BYTES = 2 * 1024 * 1024;
+
 function validateSection(section) {
   if (!isObj(section)) throw new Error("Section must be an object");
+  const kind =
+    section.__template_kind === undefined
+      ? "section"
+      : String(section.__template_kind);
+  if (!TEMPLATE_KINDS.has(kind)) throw new Error("Unknown template type");
+  if (kind === "element") {
+    const b = Array.isArray(section.blocks) ? section.blocks : [];
+    if (b.length !== 1 || !isObj(b[0]))
+      throw new Error("An element template holds exactly one element");
+  }
+  if (kind === "page") {
+    const secs = section.page_sections;
+    if (!Array.isArray(secs) || !secs.length)
+      throw new Error("A page template needs at least one section");
+    if (secs.length > MAX_PAGE_SECTIONS)
+      throw new Error(
+        `A page template can hold up to ${MAX_PAGE_SECTIONS} sections`,
+      );
+    if (
+      secs.some(
+        (x) =>
+          !isObj(x) || (x.blocks !== undefined && !Array.isArray(x.blocks)),
+      )
+    )
+      throw new Error(
+        "Every section in the page must be an object with a list of blocks",
+      );
+    const pj = JSON.stringify(section);
+    if (Buffer.byteLength(pj, "utf8") > MAX_PAGE_BYTES)
+      throw new Error(
+        "This page is too large to save as a template (2 MB limit)",
+      );
+    const copy = JSON.parse(pj);
+    copy.page_sections.forEach((x) => delete x.collapsed);
+    return copy;
+  }
   if (section.blocks !== undefined && !Array.isArray(section.blocks))
     throw new Error("Section blocks must be a list");
   const blocks = Array.isArray(section.blocks) ? section.blocks : [];
@@ -61,9 +104,17 @@ function validateSection(section) {
 function summarize(row) {
   const sec = isObj(row.section_json) ? row.section_json : {};
   const blocks = Array.isArray(sec.blocks) ? sec.blocks : [];
+  const kind = TEMPLATE_KINDS.has(sec.__template_kind)
+    ? sec.__template_kind
+    : "section";
   return {
     id: Number(row.id),
     name: row.name,
+    kind,
+    section_count:
+      kind === "page" && Array.isArray(sec.page_sections)
+        ? sec.page_sections.length
+        : 1,
     category: row.category || null,
     title: String(sec.title || ""),
     layout: String(sec.layout || "card"),
