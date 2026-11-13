@@ -229,6 +229,22 @@ function toIsoSafe(v) {
  * Returns: { id, title, start_at, end_at, type } OR null
  */
 async function getNextLiveFromDb(db) {
+  // Release 2.3: the site's Calendar (one-off and repeating live events, in the
+  // church's time zone) comes first; the older tables below are the fallback.
+  try {
+    const next = await require("../lib/liveSchedule").nextLive();
+    if (next)
+      return {
+        id: next.key,
+        title: next.title,
+        start_at: next.start_at.toISOString(),
+        end_at: next.end_at ? next.end_at.toISOString() : null,
+        type: "live",
+      };
+  } catch (_e) {
+    /* fall back to the older lookups */
+  }
+
   const now = new Date();
 
   // Candidate tables + column layouts we try in order.

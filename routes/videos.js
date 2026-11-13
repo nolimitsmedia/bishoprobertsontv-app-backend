@@ -700,6 +700,86 @@ function isPlaylistResponse(url, contentType) {
 // in key / init-segment / audio-track tags) at the preview proxy, signed.
 // Mobile/desktop fix: sub-playlists are rewritten too (they used to pass through
 // unchanged, so their relative piece addresses broke and playback stuck).
+// Release 2.3: public LISTS (catalog, related videos) only need what a card
+// shows. Playback addresses, Bunny ids, import details and storage keys are
+// removed, so the full videos can't be found from a list.
+const PRIVATE_FIELDS = [
+  "video_url",
+  "playback_url",
+  "embed_url",
+  "hls_url",
+  "bunny_video_id",
+  "provider_key",
+  "source_meta",
+  "wasabi_key",
+  "wasabi_bucket",
+  "wasabi_region",
+  "wasabi_endpoint",
+  "preview_video_url",
+  "preview_embed_url",
+  "preview_bunny_video_id",
+];
+const PRIVATE_META = [
+  "bunny_stream_import",
+  "bunny_stream_migration",
+  "wasabi_import",
+  "preview_clip",
+];
+function publicListItem(row) {
+  if (!row || typeof row !== "object") return row;
+  const out = { ...row };
+  for (const k of PRIVATE_FIELDS) delete out[k];
+  if (out.metadata && typeof out.metadata === "object") {
+    const m = { ...out.metadata };
+    for (const k of PRIVATE_META) delete m[k];
+    out.metadata = m;
+  }
+  return out;
+}
+
+// Signed-out view of a video that has a real preview clip (Release 2.3).
+function previewClipView(row, previewSeconds) {
+  const meta =
+    row.metadata && typeof row.metadata === "object" ? row.metadata : {};
+  const libraryId =
+    row.bunny_library_id ||
+    meta.bunny_stream_import?.bunny_library_id ||
+    row.source_meta?.bunny_library_id ||
+    process.env.BUNNY_STREAM_LIBRARY_ID ||
+    null;
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    short_description: row.short_description,
+    category_id: row.category_id,
+    category_name: row.category_name,
+    thumbnail_url: row.thumbnail_url,
+    published_at: row.published_at,
+    created_at: row.created_at,
+    duration_seconds: row.duration_seconds,
+    is_premium: row.is_premium,
+    is_published: row.is_published,
+    visibility: row.visibility,
+    status: row.status,
+    metadata: {
+      tags: meta.tags || [],
+      thumbnail_vertical_url: meta.thumbnail_vertical_url || "",
+      thumbnail_url: meta.thumbnail_url || "",
+    },
+    provider: "bunny_stream",
+    bunny_library_id: libraryId,
+    preview_bunny_video_id: row.preview_bunny_video_id,
+    preview_duration_seconds: row.preview_duration_seconds || previewSeconds,
+    free_preview_seconds: previewSeconds,
+    video_url: null,
+    playback_url: null,
+    embed_url: null,
+    requires_login: true,
+    preview_mode: "preview_clip",
+  };
+}
+
 function rewriteM3u8(
   text,
   sourceUrl,
@@ -866,7 +946,7 @@ router.get("/public/catalog", async (req, res) => {
         (row.category_id != null ? String(row.category_id) : "Videos");
       const title = row.category_name || "Videos";
       if (!map.has(key)) map.set(key, { title, items: [] });
-      map.get(key).items.push(row);
+      map.get(key).items.push(publicListItem(row));
     }
 
     res.setHeader(
@@ -928,7 +1008,7 @@ router.get("/public", async (req, res) => {
       "Cache-Control",
       "public, max-age=30, stale-while-revalidate=120",
     );
-    res.json({ items: r.rows });
+    res.json({ items: r.rows.map(publicListItem) });
   } catch (e) {
     console.error("[GET /videos/public] error:", e);
     res.status(500).json({ message: "Failed to fetch public videos" });
@@ -975,6 +1055,12 @@ router.get("/public/:id", async (req, res) => {
       row.embed_url = null;
       row.requires_login = true;
       return res.json(row);
+    }
+
+    // Release 2.3: a real preview clip exists — send ONLY the clip and basic
+    // details, never the full video's ids, player address or source.
+    if (row.preview_bunny_video_id) {
+      return res.json(previewClipView(row, previewSeconds));
     }
 
     const ttl = Math.min(Math.max(previewSeconds + 60, 120), 15 * 60);

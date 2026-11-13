@@ -150,23 +150,22 @@ async function sendDueReminders({
   apiBase = process.env.PUBLIC_API_URL || "",
   send,
 } = {}) {
+  // Every live service (one-off or repeating) starting within 30 minutes.
   let events = [];
   try {
-    const { rows } = await db.query(
-      `SELECT id, COALESCE(title, name) AS title, start_time
-         FROM admin_calendar_items
-        WHERE start_time > $1 AND start_time <= $1::timestamptz + interval '30 minutes'
-          AND COALESCE(type, category, '') ILIKE '%live%'
-        ORDER BY start_time ASC LIMIT 5`,
-      [now.toISOString()],
-    );
-    events = rows;
+    const schedule = require("../lib/liveSchedule");
+    events = (
+      await schedule.upcoming(
+        new Date(now.getTime() + 1000),
+        new Date(now.getTime() + 30 * 60000),
+      )
+    ).slice(0, 5);
   } catch {
-    return { sent: 0, events: 0 }; // no Calendar on this site
+    return { sent: 0, events: 0 };
   }
   let total = 0;
   for (const ev of events) {
-    const key = `cal:${ev.id}:${new Date(ev.start_time).toISOString()}`;
+    const key = `${ev.key}:${ev.start_at.toISOString()}`;
     // Claim the event first, so two servers or a restart never send twice.
     const { rowCount } = await db.query(
       "INSERT INTO live_reminder_sends (event_key) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -177,10 +176,11 @@ async function sendDueReminders({
       "SELECT email, token FROM live_reminders WHERE unsubscribed_at IS NULL ORDER BY id LIMIT 5000",
     );
     const sendFn = send || require("../services/email").sendEmail;
-    const when = new Date(ev.start_time).toLocaleTimeString("en-US", {
+    const when = ev.start_at.toLocaleTimeString("en-US", {
       hour: "numeric",
       minute: "2-digit",
       timeZoneName: "short",
+      timeZone: process.env.CALENDAR_TIMEZONE || "America/New_York",
     });
     const title = ev.title || "Live service";
     const watch = siteUrl

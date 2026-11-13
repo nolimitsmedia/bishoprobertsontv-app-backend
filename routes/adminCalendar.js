@@ -1,5 +1,6 @@
 // server-api/routes/adminCalendar.js
 const express = require("express");
+const recurrence = require("../lib/calendarRecurrence");
 const router = express.Router();
 
 /**
@@ -104,41 +105,18 @@ function weeksBetweenUTC(a, b) {
   return Math.floor(ms / (7 * 24 * 60 * 60 * 1000));
 }
 
-/** Build occurrence start/end for a given date using base series times */
+/** Build occurrence start/end for a given date — in the church's time zone
+ *  (lib/calendarRecurrence.js; the old version used UTC and drifted with DST). */
 function buildOccurrenceTimestamps(
   baseStartISO,
   baseEndISO,
   occurrenceDateOnly,
 ) {
-  const baseStart = new Date(baseStartISO);
-  const occDay = parseDateOnlyUTC(occurrenceDateOnly);
-
-  // Use baseStart time-of-day (UTC) on the occurrence day
-  const occStart = new Date(
-    Date.UTC(
-      occDay.getUTCFullYear(),
-      occDay.getUTCMonth(),
-      occDay.getUTCDate(),
-      baseStart.getUTCHours(),
-      baseStart.getUTCMinutes(),
-      baseStart.getUTCSeconds(),
-      baseStart.getUTCMilliseconds(),
-    ),
+  return recurrence.buildOccurrenceTimestamps(
+    baseStartISO,
+    baseEndISO,
+    occurrenceDateOnly,
   );
-
-  let occEnd = null;
-  if (baseEndISO) {
-    const baseEnd = new Date(baseEndISO);
-    const durationMs = baseEnd.getTime() - baseStart.getTime();
-    if (Number.isFinite(durationMs) && durationMs >= 0) {
-      occEnd = new Date(occStart.getTime() + durationMs);
-    }
-  }
-
-  return {
-    start_at: occStart.toISOString(),
-    end_at: occEnd ? occEnd.toISOString() : null,
-  };
 }
 
 /** Validate single event payload */
@@ -235,138 +213,9 @@ function validateRecurrence(rec) {
   };
 }
 
-/** Generate occurrence date-only strings within [from..to] inclusive */
+/** Occurrence dates (local, YYYY-MM-DD) within [from..to] — time-zone aware */
 function generateOccurrences(seriesRow, fromISO, toISO) {
-  const baseStartISO = seriesRow.start_at;
-  const baseEndISO = seriesRow.end_at || null;
-
-  const recurrence =
-    seriesRow.recurrence ||
-    seriesRow.recurrence_json ||
-    seriesRow.recurrence_rule ||
-    null;
-  const rec =
-    typeof recurrence === "string" ? safeJsonParse(recurrence) : recurrence;
-
-  const freq = String(rec?.freq || "weekly").toLowerCase();
-  const interval = Math.max(1, Number(rec?.interval) || 1);
-
-  const rangeFrom = new Date(fromISO);
-  const rangeTo = new Date(toISO);
-
-  // series can’t occur before base start day
-  const seriesStartDay = parseDateOnlyUTC(
-    toISODateOnly(new Date(baseStartISO)),
-  );
-
-  // cap by until if present
-  const untilISO = rec?.until ? new Date(rec.until).toISOString() : null;
-  const capTo = untilISO
-    ? new Date(Math.min(rangeTo.getTime(), new Date(untilISO).getTime()))
-    : rangeTo;
-
-  const fromDay = parseDateOnlyUTC(toISODateOnly(rangeFrom));
-  const toDay = parseDateOnlyUTC(toISODateOnly(capTo));
-
-  if (toDay.getTime() < fromDay.getTime()) return [];
-
-  // helper: map weekday to JS getUTCDay()
-  const mapDow = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
-
-  const occurrences = [];
-
-  if (freq === "weekly") {
-    let byweekday = Array.isArray(rec?.byweekday) ? rec.byweekday : [];
-    byweekday = byweekday
-      .map((x) =>
-        String(x || "")
-          .trim()
-          .toUpperCase(),
-      )
-      .filter(Boolean);
-
-    // if empty, default to base start weekday
-    if (!byweekday.length) {
-      const baseStart = new Date(baseStartISO);
-      const inv = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
-      byweekday = [inv[baseStart.getUTCDay()] || "SU"];
-    }
-
-    const allowedDowNums = new Set(
-      byweekday.map((k) => mapDow[k]).filter((n) => n !== undefined),
-    );
-
-    // Iterate day-by-day; include if weekday matches AND week offset matches interval
-    let d = new Date(fromDay);
-    while (d.getTime() <= toDay.getTime()) {
-      // must not occur before series start
-      if (d.getTime() >= seriesStartDay.getTime()) {
-        const dow = d.getUTCDay();
-        if (allowedDowNums.has(dow)) {
-          const w = weeksBetweenUTC(seriesStartDay, d);
-          if (w % interval === 0) {
-            occurrences.push(toISODateOnly(d));
-          }
-        }
-      }
-      d = addDaysUTC(d, 1);
-    }
-    return occurrences;
-  }
-
-  // monthly
-  // rule: repeat on the day-of-month of baseStart, every N months
-  const baseStart = new Date(baseStartISO);
-  const dom = baseStart.getUTCDate();
-
-  // find the first month occurrence >= fromDay
-  // start from series start month and step interval months until >= from
-  let cur = new Date(
-    Date.UTC(seriesStartDay.getUTCFullYear(), seriesStartDay.getUTCMonth(), 1),
-  );
-  // build occurrence in that month
-  function occInMonth(monthFirst) {
-    const lastDay = new Date(
-      Date.UTC(monthFirst.getUTCFullYear(), monthFirst.getUTCMonth() + 1, 0),
-    ).getUTCDate();
-    const day = Math.min(dom, lastDay);
-    return new Date(
-      Date.UTC(monthFirst.getUTCFullYear(), monthFirst.getUTCMonth(), day),
-    );
-  }
-
-  // Align months to interval based on series start month
-  const seriesMonth0 = new Date(
-    Date.UTC(seriesStartDay.getUTCFullYear(), seriesStartDay.getUTCMonth(), 1),
-  );
-
-  // move cur forward to at least fromDay
-  while (occInMonth(cur).getTime() < fromDay.getTime()) {
-    cur = addMonthsUTC(cur, 1);
-  }
-
-  // now iterate month-by-month and include only those matching interval
-  let monthIter = new Date(cur);
-  while (true) {
-    const occDay = occInMonth(monthIter);
-    if (occDay.getTime() > toDay.getTime()) break;
-
-    // interval check: months between seriesMonth0 and this monthIter
-    const monthsBetween =
-      (monthIter.getUTCFullYear() - seriesMonth0.getUTCFullYear()) * 12 +
-      (monthIter.getUTCMonth() - seriesMonth0.getUTCMonth());
-
-    if (monthsBetween >= 0 && monthsBetween % interval === 0) {
-      // must not occur before series start day
-      if (occDay.getTime() >= seriesStartDay.getTime()) {
-        occurrences.push(toISODateOnly(occDay));
-      }
-    }
-
-    monthIter = addMonthsUTC(monthIter, 1);
-  }
-
-  return occurrences;
+  return recurrence.generateOccurrences(seriesRow, fromISO, toISO);
 }
 
 function safeJsonParse(s) {
@@ -684,7 +533,7 @@ router.post("/series", async (req, res) => {
     ) {
       const baseStart = new Date(start_at);
       const inv = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
-      rec.byweekday = [inv[baseStart.getUTCDay()] || "SU"];
+      rec.byweekday = [recurrence.defaultWeekday(start_at)]; // local weekday
     }
 
     const q = `
@@ -744,7 +593,7 @@ router.put("/series/:id", async (req, res) => {
     ) {
       const baseStart = new Date(start_at);
       const inv = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
-      rec.byweekday = [inv[baseStart.getUTCDay()] || "SU"];
+      rec.byweekday = [recurrence.defaultWeekday(start_at)]; // local weekday
     }
 
     const q = `

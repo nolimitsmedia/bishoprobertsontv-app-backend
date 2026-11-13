@@ -261,6 +261,10 @@ router.get("/me/pages", requireUser, async (req, res) => {
 
 // Owner: get one page (for editor)
 router.get("/me/pages/:id", requireUser, async (req, res) => {
+  // A page id is a number; anything else (e.g. a slug like "about") is simply
+  // not found — no database error in the server log.
+  if (!/^\d+$/.test(String(req.params.id || "")))
+    return res.status(404).json({ ok: false, error: "not_found" });
   const client = await pool.connect();
   try {
     const { rows } = await client.query(

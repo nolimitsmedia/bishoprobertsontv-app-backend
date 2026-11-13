@@ -362,6 +362,9 @@ app.use("/api/viewer", require("./routes/viewer"));
   app.use("/api/live-reminders", reminders.router);
   reminders.startReminderWorker();
 }
+// Release 2.3 Part B: real preview clips (Content › Preview Clips).
+app.use("/api/admin/preview-clips", require("./routes/previewClips"));
+require("./services/previewClips").startAutoWorker();
 // Customer-editable public header navigation (separate from CMS pages).
 app.use("/api/navigation", require("./routes/navigation"));
 app.use("/api/site-design", require("./routes/siteDesign"));
@@ -435,42 +438,9 @@ if (tusRouter) {
 --------------------------------------------------------- */
 require("./routes/liveChat").attach(io); // Release 2.2: secured live page chat
 
-io.on("connection", (socket) => {
-  socket.on("chat:join", ({ eventId, name }) => {
-    if (!eventId) return;
-    socket.join(`live:${eventId}`);
-    socket.data.name = name || "Guest";
-  });
-
-  socket.on("chat:message", async (payload = {}, ack) => {
-    try {
-      const { eventId, message, userId, name } = payload;
-      if (!eventId || !message) return ack && ack({ ok: false });
-
-      const ins = await db.query(
-        `INSERT INTO live_chat_messages (event_id, user_id, name, message)
-         VALUES ($1,$2,$3,$4)
-         RETURNING id, created_at`,
-        [eventId, userId || null, name || socket.data.name || "Guest", message],
-      );
-
-      const msg = {
-        id: ins.rows[0].id,
-        event_id: eventId,
-        user_id: userId || null,
-        name: name || socket.data.name || "Guest",
-        message,
-        created_at: ins.rows[0].created_at,
-      };
-
-      io.to(`live:${eventId}`).emit("chat:new", msg);
-      ack && ack({ ok: true });
-    } catch (e) {
-      console.error("socket chat:message error", e);
-      ack && ack({ ok: false });
-    }
-  });
-});
+// Release 2.3: event-page chat moved to routes/liveChat.js (secured: names from
+// accounts, "(guest)" for guests, limits, staff moderation).
+require("./routes/liveChat").attachEventChat(io);
 
 /* --------------------------------------------------------
    ERRORS

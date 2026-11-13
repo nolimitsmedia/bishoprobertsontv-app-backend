@@ -170,29 +170,21 @@ function cleanInput(body, current) {
 }
 
 // ---------- schedule (Calendar) ----------
+// Content › Calendar: one-off and repeating "live" events (lib/liveSchedule.js).
 async function calendar(windowMinutes) {
-  let next = null;
-  let current = null;
-  try {
-    if (sc.getNextLiveFromDb) next = await sc.getNextLiveFromDb(db);
-  } catch {
-    next = null;
-  }
-  try {
-    const { rows } = await db.query(
-      `SELECT id, COALESCE(title, name) AS title, start_time AS start_at, end_time AS end_at
-         FROM admin_calendar_items
-        WHERE start_time IS NOT NULL AND start_time <= NOW()
-          AND COALESCE(end_time, start_time + ($1::text || ' minutes')::interval) > NOW()
-          AND (COALESCE(type, category, '') ILIKE '%live%')
-        ORDER BY start_time DESC LIMIT 1`,
-      [String(windowMinutes)],
-    );
-    current = rows[0] || null;
-  } catch {
-    current = null; // no Calendar table on this site
-  }
-  return { next, current };
+  const schedule = require("../lib/liveSchedule");
+  const iso = (e) =>
+    e && {
+      id: e.key,
+      title: e.title,
+      start_at: e.start_at.toISOString(),
+      end_at: e.end_at ? e.end_at.toISOString() : null,
+    };
+  const [next, current] = await Promise.all([
+    schedule.nextLive().catch(() => null),
+    schedule.currentLive(new Date(), windowMinutes).catch(() => null),
+  ]);
+  return { next: iso(next), current: iso(current) };
 }
 
 // ---------- providers ----------
