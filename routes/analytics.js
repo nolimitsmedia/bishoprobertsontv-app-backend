@@ -2,6 +2,10 @@
 const router = require("express").Router();
 const db = require("../db");
 const { requireAuth } = require("../middleware/auth"); // matches your auth.js exports
+// Site-wide statistics are for administrators (the admin menu shows Analytics to
+// administrators only). Recording events (/event) stays open to members.
+const { requireArea } = require("../lib/teamAccess");
+const adminOnly = requireArea();
 
 function clampInt(n, min, max) {
   const x = Number(n);
@@ -275,7 +279,7 @@ router.post("/event", requireAuth, async (req, res) => {
 });
 
 // ---------- GET /api/analytics/summary?days=30&ping_seconds=15&dedupe_plays=1 ----------
-router.get("/summary", requireAuth, async (req, res) => {
+router.get("/summary", adminOnly, async (req, res) => {
   try {
     const days = Math.max(1, Math.min(365, Number(req.query.days || 30)));
     const pingSeconds = Math.max(
@@ -453,9 +457,63 @@ router.get("/summary", requireAuth, async (req, res) => {
         ? watchSecondsFromProgress
         : completeDurationSeconds;
 
+    // Real daily numbers for the charts, and the previous period for trends.
+    const watchExpr = `COALESCE(SUM(CASE WHEN ${typeExpr}='video_progress' THEN COALESCE(${metaDeltaExpr}, $2::int) ELSE 0 END),0)::bigint`;
+    let daily = [];
+    let previous = null;
+    try {
+      const dq = await db.query(
+        `
+        WITH base AS (
+          SELECT * FROM analytics_events
+          WHERE ${timeExpr} >= date_trunc('day', NOW()) - (($1::int - 1) * INTERVAL '1 day')
+        ),
+        days AS (
+          SELECT generate_series(date_trunc('day', NOW()) - (($1::int - 1) * INTERVAL '1 day'), date_trunc('day', NOW()), INTERVAL '1 day') AS day
+        )
+        SELECT to_char(d.day, 'YYYY-MM-DD') AS day,
+               (SELECT ${playsExpr} FROM base WHERE date_trunc('day', ${timeExpr}) = d.day) AS plays,
+               (SELECT ${uniqueExpr} FROM base WHERE date_trunc('day', ${timeExpr}) = d.day AND ${typeExpr}='video_play') AS viewers,
+               (SELECT ${watchExpr} FROM base WHERE date_trunc('day', ${timeExpr}) = d.day) AS watch_seconds
+        FROM days d ORDER BY d.day
+        `,
+        [days, pingSeconds],
+      );
+      daily = dq.rows.map((x) => ({
+        day: x.day,
+        plays: Number(x.plays || 0),
+        viewers: Number(x.viewers || 0),
+        watch_seconds: Number(x.watch_seconds || 0),
+      }));
+      const pq = await db.query(
+        `
+        WITH base AS (
+          SELECT * FROM analytics_events
+          WHERE ${timeExpr} >= NOW() - (($1::int * 2) * INTERVAL '1 day') AND ${timeExpr} < NOW() - ($1::int * INTERVAL '1 day')
+        )
+        SELECT ${playsExpr} AS plays, ${uniqueExpr} AS unique_viewers,
+               COUNT(*) FILTER (WHERE ${typeExpr}='video_complete')::bigint AS completions,
+               ${watchExpr} AS watch_seconds
+        FROM base
+        `,
+        [days, pingSeconds],
+      );
+      const pr = pq.rows[0] || {};
+      previous = {
+        plays: Number(pr.plays || 0),
+        unique_viewers: Number(pr.unique_viewers || 0),
+        completions: Number(pr.completions || 0),
+        watch_seconds: Number(pr.watch_seconds || 0),
+      };
+    } catch (e) {
+      console.warn("[analytics] daily/previous unavailable:", e.message);
+    }
+
     res.json({
       ok: true,
       days,
+      daily,
+      previous,
       ping_seconds: pingSeconds,
       dedupe_plays: dedupePlays,
       watch_seconds: watchSeconds,
@@ -502,7 +560,7 @@ router.get("/summary", requireAuth, async (req, res) => {
 });
 
 // ---------- GET /api/analytics/live?minutes=10 ----------
-router.get("/live", requireAuth, async (req, res) => {
+router.get("/live", adminOnly, async (req, res) => {
   try {
     const minutes = Math.max(1, Math.min(180, Number(req.query.minutes || 10)));
     const s = await getAnalyticsSchema();
