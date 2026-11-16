@@ -364,6 +364,9 @@ app.use("/api/viewer", require("./routes/viewer"));
 }
 // Release 2.3 Part B: real preview clips (Content › Preview Clips).
 app.use("/api/admin/preview-clips", require("./routes/previewClips"));
+// Video durations from Bunny (Videos › More actions › Sync durations; automatic every 30 min)
+app.use("/api/admin/videos/durations", require("./routes/durationSync"));
+require("./services/durationSync").startAuto();
 require("./services/previewClips").startAutoWorker();
 // Customer-editable public header navigation (separate from CMS pages).
 app.use("/api/navigation", require("./routes/navigation"));
