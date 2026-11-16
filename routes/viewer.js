@@ -72,15 +72,29 @@ async function videoSql() {
     `${col("is_premium", "FALSE")} AS is_premium`,
     `${col("published_at", col("created_at"))} AS published_at`,
     `${col("category_id")} AS category_id`,
+    // category name for "2026 Messages · 52 min · Bishop Robertson"
+    c.has("category_id")
+      ? "(SELECT cn.name FROM categories cn WHERE cn.id = v.category_id) AS category_name"
+      : "NULL AS category_name",
   ].join(", ");
   const visible = [
     c.has("is_published") ? "v.is_published = TRUE" : "TRUE",
-    c.has("visibility") ? "v.visibility = 'public'" : "TRUE",
+    // Same rule as the Catalog: everything published except Unlisted. Members-only
+    // and Premium videos are listed; the watch page decides who can play them.
+    c.has("visibility")
+      ? "COALESCE(v.visibility, 'public') <> 'unlisted'"
+      : "TRUE",
   ].join(" AND ");
   const newest = c.has("published_at")
     ? "v.published_at DESC NULLS LAST, v.id DESC"
     : "v.id DESC";
-  return { select, visible, newest, hasCategory: c.has("category_id") };
+  return {
+    select,
+    visible,
+    newest,
+    hasCategory: c.has("category_id"),
+    hasUpdatedAt: c.has("updated_at") && c.has("created_at"),
+  };
 }
 
 const shape = (r, extra = {}) => ({
@@ -92,6 +106,7 @@ const shape = (r, extra = {}) => ({
     r.duration_seconds == null ? null : Number(r.duration_seconds),
   is_premium: !!r.is_premium,
   published_at: r.published_at,
+  category_name: r.category_name || "",
   ...extra,
 });
 
@@ -245,82 +260,139 @@ router.get("/search", async (req, res) => {
   }
 });
 
+// Public part of /browse (featured, New Releases, category rows), cached for 60 s
+// so most visits don't touch the database. Members' rows are never cached.
+let publicBrowseCache = { at: 0, value: null, version: null };
+const PUBLIC_BROWSE_TTL = 60 * 1000;
+
+// A quick "has anything changed?" check (one small query): number of videos,
+// latest video change, last Site Settings save. Any change refreshes the cache.
+async function contentVersion(sql) {
+  try {
+    const changed = sql.hasUpdatedAt
+      ? "MAX(GREATEST(COALESCE(v.updated_at, v.created_at), v.created_at))"
+      : "MAX(v.id)";
+    const { rows } = await db.query(
+      `SELECT (SELECT COUNT(*) FROM videos v) AS n, (SELECT ${changed} FROM videos v) AS m,
+              (SELECT MAX(updated_at) FROM site_design_settings WHERE setting_key = 'site_options') AS s`,
+    );
+    const r = rows[0] || {};
+    return `${r.n}|${r.m ? new Date(r.m).getTime() || r.m : ""}|${r.s ? new Date(r.s).getTime() : ""}`;
+  } catch {
+    return null; // can't tell: don't use the cache
+  }
+}
+
+async function publicBrowse(sql) {
+  const version = await contentVersion(sql);
+  if (
+    version &&
+    publicBrowseCache.value &&
+    publicBrowseCache.version === version &&
+    Date.now() - publicBrowseCache.at < PUBLIC_BROWSE_TTL
+  )
+    return publicBrowseCache.value;
+  const CAT_ROW = Math.max(ROW_SIZE, 30); // category rows: up to 30 (the full catalog has the rest)
+  // independent queries run at the same time
+  const [newestQ, picks, catVideosQ] = await Promise.all([
+    db.query(
+      `SELECT ${sql.select} FROM videos v WHERE ${sql.visible} ORDER BY ${sql.newest} LIMIT $1`,
+      [ROW_SIZE],
+    ),
+    featuredPicks(),
+    sql.hasCategory
+      ? // ONE query for all category rows (was one query per category)
+        db.query(
+          `WITH cats AS (
+             SELECT c.id, c.name, COUNT(*)::int AS n
+               FROM videos v JOIN categories c ON c.id = v.category_id
+              WHERE ${sql.visible}
+              GROUP BY c.id, c.name
+              ORDER BY n DESC, c.name ASC
+              LIMIT 20
+           ),
+           ranked AS (
+             SELECT ${sql.select}, v.category_id AS row_category_id,
+                    ROW_NUMBER() OVER (PARTITION BY v.category_id ORDER BY ${sql.newest}) AS rn
+               FROM videos v
+              WHERE ${sql.visible} AND v.category_id IN (SELECT id FROM cats)
+           )
+           SELECT r.*, c.name AS row_category_name, c.n AS row_category_total
+             FROM ranked r JOIN cats c ON c.id = r.row_category_id
+            WHERE r.rn <= $1
+            ORDER BY c.n DESC, c.name ASC, r.rn ASC`,
+          [CAT_ROW],
+        )
+      : Promise.resolve({ rows: [] }),
+  ]);
+  const newest = newestQ.rows;
+  // Featured (hero): chosen in Site Settings › Featured videos; else the newest.
+  let featured = [];
+  if (picks.length) {
+    const { rows: fv } = await db.query(
+      `SELECT ${sql.select} FROM videos v WHERE ${sql.visible} AND v.id = ANY($1::int[])`,
+      [picks.map((p) => p.video_id)],
+    );
+    const byId = new Map(fv.map((r) => [Number(r.id), r]));
+    featured = picks
+      .map(
+        (p) =>
+          byId.get(p.video_id) &&
+          shape(byId.get(p.video_id), { hero_image: p.image_url || "" }),
+      )
+      .filter(Boolean);
+  }
+  if (!featured.length)
+    featured = newest
+      .filter((r) => r.thumbnail)
+      .slice(0, 5)
+      .map((r) => shape(r));
+
+  const rows = [];
+  if (newest.length)
+    rows.push({
+      key: "new",
+      title: "New Releases",
+      items: newest.map((r) => shape(r)),
+    });
+  const byCat = new Map();
+  for (const r of catVideosQ.rows) {
+    const id = Number(r.row_category_id);
+    if (!byCat.has(id)) {
+      byCat.set(id, {
+        key: `category-${id}`,
+        title: r.row_category_name,
+        category_id: id,
+        total: Number(r.row_category_total),
+        items: [],
+      });
+      rows.push(byCat.get(id));
+    }
+    byCat.get(id).items.push(shape(r));
+  }
+  const value = { featured, rows };
+  publicBrowseCache = { at: Date.now(), value, version };
+  return value;
+}
+
 router.get("/browse", async (req, res) => {
   try {
     res.set("Cache-Control", "no-store");
     const userId = userIdFromToken(req);
     const sql = await videoSql();
+    // the public part and the member's own rows load at the same time
+    const [pub, cont, list] = await Promise.all([
+      publicBrowse(sql),
+      userId ? continueRows(userId, sql) : Promise.resolve([]),
+      userId ? listRows(userId, sql, ROW_SIZE) : Promise.resolve([]),
+    ]);
     const rows = [];
-
-    const { rows: newest } = await db.query(
-      `SELECT ${sql.select} FROM videos v WHERE ${sql.visible} ORDER BY ${sql.newest} LIMIT $1`,
-      [ROW_SIZE],
-    );
-    // Featured (hero): chosen in Site Settings › Featured videos; else the newest.
-    let featured = [];
-    const picks = await featuredPicks();
-    if (picks.length) {
-      const { rows: fv } = await db.query(
-        `SELECT ${sql.select} FROM videos v WHERE ${sql.visible} AND v.id = ANY($1::int[])`,
-        [picks.map((p) => p.video_id)],
-      );
-      const byId = new Map(fv.map((r) => [Number(r.id), r]));
-      featured = picks
-        .map(
-          (p) =>
-            byId.get(p.video_id) &&
-            shape(byId.get(p.video_id), { hero_image: p.image_url || "" }),
-        )
-        .filter(Boolean);
-    }
-    if (!featured.length)
-      featured = newest
-        .filter((r) => r.thumbnail)
-        .slice(0, 5)
-        .map((r) => shape(r));
-
-    if (userId) {
-      const cont = await continueRows(userId, sql);
-      if (cont.length)
-        rows.push({ key: "continue", title: "Continue Watching", items: cont });
-      const list = await listRows(userId, sql, ROW_SIZE);
-      if (list.length)
-        rows.push({ key: "my-list", title: "My List", items: list });
-    }
-    if (newest.length)
-      rows.push({
-        key: "new",
-        title: "New Releases",
-        items: newest.map((r) => shape(r)),
-      });
-
-    if (sql.hasCategory) {
-      // Categories with the most public videos, each newest first.
-      const { rows: cats } = await db.query(
-        `SELECT c.id, c.name, COUNT(*)::int AS n
-           FROM videos v JOIN categories c ON c.id = v.category_id
-          WHERE ${sql.visible}
-          GROUP BY c.id, c.name
-          HAVING COUNT(*) > 0
-          ORDER BY n DESC, c.name ASC
-          LIMIT 8`,
-      );
-      for (const cat of cats) {
-        const { rows: vids } = await db.query(
-          `SELECT ${sql.select} FROM videos v WHERE ${sql.visible} AND v.category_id = $1 ORDER BY ${sql.newest} LIMIT $2`,
-          [cat.id, ROW_SIZE],
-        );
-        if (vids.length)
-          rows.push({
-            key: `category-${cat.id}`,
-            title: cat.name,
-            category_id: Number(cat.id),
-            total: cat.n,
-            items: vids.map((r) => shape(r)),
-          });
-      }
-    }
-    res.json({ ok: true, signed_in: !!userId, featured, rows });
+    if (cont.length)
+      rows.push({ key: "continue", title: "Continue Watching", items: cont });
+    if (list.length)
+      rows.push({ key: "my-list", title: "My List", items: list });
+    rows.push(...pub.rows);
+    res.json({ ok: true, signed_in: !!userId, featured: pub.featured, rows });
   } catch (e) {
     console.error("[viewer] browse failed:", e);
     res.status(500).json({ ok: false, error: "Unable to load videos" });
