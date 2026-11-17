@@ -407,6 +407,178 @@ async function migrateOneLocalVideo(localVideo) {
   return { skipped: false, video: updated, bunnyVideoId: bunnyVideo.guid };
 }
 
+/* ------------------------------------------------------------------
+ * Retry a FAILED migration: Bunny Stream could not encode the copy (status
+ * error / failed), so the video shows "Processing video" forever. Remove the
+ * failed copy and have Bunny fetch the original file again.
+ * ------------------------------------------------------------------ */
+// Staff only (website / content / video uploader), unlike allowUploadRoles,
+// which also lets ordinary members through.
+const { requireArea } = require("../lib/teamAccess");
+const retryAccess = requireArea("website", "content", "video_upload");
+
+function isFailedStreamVideo(v) {
+  const st = String(v?.processing_status || "").toLowerCase();
+  return (
+    String(v?.provider || "").toLowerCase() === "bunny_stream" &&
+    (st === "error" || st === "failed")
+  );
+}
+function migrationSourceOf(v) {
+  let md = v?.metadata || {};
+  if (typeof md === "string") {
+    try {
+      md = JSON.parse(md);
+    } catch {
+      md = {};
+    }
+  }
+  const m = md.bunny_stream_migration || {};
+  return String(m.source_url || m.sourceUrl || "").trim();
+}
+
+async function retryFailedMigration(localVideo) {
+  if (!LIB_ID || !API_KEY) throw new Error("Bunny Stream env not configured.");
+  if (!localVideo) throw new Error("Video not found.");
+  if (!isFailedStreamVideo(localVideo)) {
+    return { skipped: true, reason: "not_failed", video: localVideo };
+  }
+  const original = migrationSourceOf(localVideo);
+  if (!original || !isHttpUrl(original)) {
+    throw new Error(
+      'The original file of this video is not known. Use "Migrate to Bunny Storage" to play it from storage.',
+    );
+  }
+  let clean = original;
+  try {
+    const u = new URL(original);
+    ["token", "expires", "token_path"].forEach((k) => u.searchParams.delete(k));
+    clean = u.toString();
+  } catch {
+    /* keep as is */
+  }
+  const sourceUrl = maybeResignBunnyStorageUrl(clean);
+
+  // remove the failed copy (ignore errors: it may already be gone)
+  const oldId = String(localVideo.bunny_video_id || "").trim();
+  if (oldId) {
+    try {
+      await fetch(
+        `https://video.bunnycdn.com/library/${LIB_ID}/videos/${oldId}`,
+        {
+          method: "DELETE",
+          headers: { AccessKey: API_KEY, Accept: "application/json" },
+        },
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const originalTitle =
+    String(localVideo.title || "Untitled").trim() || "Untitled";
+  const uniqueTitle = `${originalTitle} [NLM-RETRY-${localVideo.id}-${Date.now()}]`;
+  await bunnyJson(`https://video.bunnycdn.com/library/${LIB_ID}/videos/fetch`, {
+    method: "POST",
+    body: JSON.stringify({ url: sourceUrl, title: uniqueTitle, headers: {} }),
+  });
+  let bunnyVideo = null;
+  for (let i = 0; i < 10; i += 1) {
+    bunnyVideo = await findBunnyVideoByExactTitle(uniqueTitle);
+    if (bunnyVideo?.guid) break;
+    await sleep(800);
+  }
+  if (!bunnyVideo?.guid) {
+    throw new Error(
+      "Bunny started fetching the original again, but the new copy was not found yet. Wait a minute and refresh.",
+    );
+  }
+  await updateBunnyVideoTitle(bunnyVideo.guid, originalTitle);
+  const updated = await updateLocalVideoAfterBunnyMigration({
+    localVideo,
+    bunnyVideo,
+    sourceUrl,
+  });
+  return {
+    skipped: false,
+    video: updated,
+    bunnyVideoId: bunnyVideo.guid,
+    previousBunnyVideoId: oldId || null,
+  };
+}
+
+/**
+ * POST /api/bunny/stream/retry/:id   retry one failed migration
+ */
+router.post(
+  "/bunny/stream/retry/:id",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id))
+        return res.status(400).json({ ok: false, message: "Invalid video ID" });
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        id,
+      ]);
+      if (q.rowCount === 0)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      const result = await retryFailedMigration(q.rows[0]);
+      return res.json({ ok: true, ...result });
+    } catch (err) {
+      console.error("[bunnyStream] retry error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, message: err?.message || "Retry failed" });
+    }
+  },
+);
+
+/**
+ * POST /api/bunny/stream/retry-failed   retry every failed migration (one at a time, up to 50)
+ */
+router.post(
+  "/bunny/stream/retry-failed",
+  authenticate,
+  retryAccess,
+  async (_req, res) => {
+    try {
+      const { rows } = await db.query(
+        `SELECT * FROM videos
+        WHERE LOWER(COALESCE(provider, '')) = 'bunny_stream'
+          AND LOWER(COALESCE(processing_status, '')) IN ('error', 'failed')
+        ORDER BY id DESC LIMIT 50`,
+      );
+      const done = [];
+      const failed = [];
+      for (const row of rows) {
+        try {
+          const r = await retryFailedMigration(row);
+          if (!r.skipped) done.push({ id: row.id, title: row.title });
+        } catch (e) {
+          failed.push({
+            id: row.id,
+            title: row.title,
+            message: e?.message || "Retry failed",
+          });
+        }
+      }
+      return res.json({
+        ok: true,
+        found: rows.length,
+        retried: done.length,
+        failed,
+      });
+    } catch (err) {
+      console.error("[bunnyStream] retry-failed error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, message: err?.message || "Retry failed" });
+    }
+  },
+);
+
 /**
  * POST /api/bunny/stream/migrate/:id
  * Migrates one existing DB video URL into Bunny Stream using Bunny URL Fetch.

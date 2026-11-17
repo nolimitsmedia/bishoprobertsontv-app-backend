@@ -555,6 +555,30 @@ function getLoggedOutPreviewSource(row) {
   return String(row?.playback_url || row?.video_url || "").trim();
 }
 
+// A Bunny Stream copy whose encoding / migration FAILED cannot play (Bunny's
+// player shows "Processing video" forever). When the original file is known,
+// play that instead (until the migration is retried). Response only — the
+// database row is not changed.
+function isFailedStreamRow(row) {
+  const st = String(row?.processing_status || "").toLowerCase();
+  return isBunnyStreamRow(row) && (st === "error" || st === "failed");
+}
+function applyFailedStreamFallback(row) {
+  if (!isFailedStreamRow(row)) return false;
+  const original = getMigrationSourceUrl(row);
+  if (!original) return false;
+  const source = cleanBunnyUrl(original); // a fresh token is added when signing
+  row.provider = "bunny"; // same as a video stored in Bunny Storage
+  row.provider_key = null;
+  row.bunny_video_id = null;
+  row.bunny_library_id = null;
+  row.embed_url = null;
+  row.video_url = source;
+  row.playback_url = source;
+  row.stream_fallback = true;
+  return true;
+}
+
 function signPlaybackUrlForRow(row, inputUrl, ttlSeconds) {
   if (!inputUrl) return "";
 
@@ -1535,6 +1559,9 @@ router.get("/:id", authenticate, async (req, res) => {
     if (row.playback_url && !row.video_url) {
       row.video_url = row.playback_url;
     }
+
+    // failed Bunny Stream copy: play the original file instead
+    applyFailedStreamFallback(row);
 
     if (row.video_url || row.playback_url) {
       // ✅ Use Stream-safe signing. Bunny Stream URLs must stay clean because
