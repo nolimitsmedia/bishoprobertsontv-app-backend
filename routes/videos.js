@@ -579,6 +579,83 @@ function applyFailedStreamFallback(row) {
   return true;
 }
 
+// For a failed copy's original: storage tokens must match how Bunny reads the
+// file path; names with curly quotes / spaces can need the plain (decoded)
+// path. Try the forms and keep the one storage really serves (30 min cache).
+const fallbackPicks = new Map();
+function signWithPath(absoluteUrl, hashPath, ttlSeconds) {
+  const expires = Math.floor(Date.now() / 1000) + Math.max(30, ttlSeconds);
+  const tp = dirnamePath(hashPath);
+  const token = base64UrlNoPad(
+    crypto
+      .createHash("sha256")
+      .update(`${BUNNY_KEY}${hashPath}${expires}token_path=${tp}`)
+      .digest(),
+  );
+  const u = new URL(absoluteUrl);
+  u.searchParams.set("token", token);
+  u.searchParams.set("expires", String(expires));
+  u.searchParams.set("token_path", tp);
+  return u.toString();
+}
+async function pickPlayableOriginal(row, source, ttlSeconds) {
+  const cached = fallbackPicks.get(row.id);
+  if (cached && Date.now() - cached.at < 30 * 60 * 1000) {
+    return cached.how === "plain"
+      ? signWithPath(
+          source,
+          decodeURIComponent(getPathname(source)),
+          ttlSeconds,
+        )
+      : cached.how === "unsigned"
+        ? source
+        : bunnySignUrl(source, {
+            ttlSeconds,
+            tokenPath: dirnamePath(getPathname(source)),
+          });
+  }
+  const encoded = bunnySignUrl(source, {
+    ttlSeconds,
+    tokenPath: dirnamePath(getPathname(source)),
+  });
+  if (!BUNNY_ENABLED || !BUNNY_KEY) return encoded;
+  const candidates = [{ how: "encoded", url: encoded }];
+  let plainPath = getPathname(source);
+  try {
+    plainPath = decodeURIComponent(plainPath);
+  } catch {
+    /* keep */
+  }
+  if (plainPath !== getPathname(source))
+    candidates.push({
+      how: "plain",
+      url: signWithPath(source, plainPath, ttlSeconds),
+    });
+  candidates.push({ how: "unsigned", url: source });
+  const nodeFetch = require("node-fetch");
+  for (const c of candidates) {
+    try {
+      const r = await nodeFetch(c.url, {
+        method: "GET",
+        headers: { Range: "bytes=0-0" },
+        timeout: 8000,
+      });
+      try {
+        r.body?.destroy?.();
+      } catch {
+        /* ignore */
+      }
+      if (r.status === 200 || r.status === 206) {
+        fallbackPicks.set(row.id, { how: c.how, at: Date.now() });
+        return c.url;
+      }
+    } catch {
+      /* try the next form */
+    }
+  }
+  return encoded; // nothing confirmed: the usual form
+}
+
 function signPlaybackUrlForRow(row, inputUrl, ttlSeconds) {
   if (!inputUrl) return "";
 
@@ -1561,7 +1638,16 @@ router.get("/:id", authenticate, async (req, res) => {
     }
 
     // failed Bunny Stream copy: play the original file instead
-    applyFailedStreamFallback(row);
+    if (applyFailedStreamFallback(row)) {
+      const ttl = 6 * 3600;
+      const playable = await pickPlayableOriginal(row, row.playback_url, ttl);
+      row.video_url = playable;
+      row.playback_url = playable;
+      row.signed_ttl_seconds = ttl;
+      row.requires_login = false;
+      row.can_manage = ownerOrAdmin;
+      return res.json(row);
+    }
 
     if (row.video_url || row.playback_url) {
       // ✅ Use Stream-safe signing. Bunny Stream URLs must stay clean because

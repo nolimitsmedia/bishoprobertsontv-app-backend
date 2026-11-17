@@ -437,6 +437,88 @@ function migrationSourceOf(v) {
   return String(m.source_url || m.sourceUrl || "").trim();
 }
 
+// Sign a storage address with a chosen path form (Bunny token auth v2).
+function signStorageUrl(cleanUrl, hashPath) {
+  const url = new URL(cleanUrl);
+  const expires = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
+  const tokenPath = dirnamePath(hashPath);
+  const hashable = `${BUNNY_STORAGE_TOKEN_KEY}${hashPath}${expires}token_path=${tokenPath}`;
+  const token = base64UrlNoPad(
+    crypto.createHash("sha256").update(hashable).digest(),
+  );
+  url.searchParams.set("token", token);
+  url.searchParams.set("expires", String(expires));
+  url.searchParams.set("token_path", tokenPath);
+  return url.toString();
+}
+
+// Can this address actually be downloaded? (first byte only)
+async function probeDownload(url) {
+  try {
+    const r = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-0" },
+      timeout: 15000,
+      redirect: "follow",
+    });
+    try {
+      r.body?.destroy?.();
+    } catch {
+      /* ignore */
+    }
+    return r.status;
+  } catch (e) {
+    return `error (${e?.code || e?.message || "network"})`;
+  }
+}
+
+// Find an address of the original that Bunny Storage really serves. Tries the
+// token signed over the encoded path and over the plain path (file names with
+// curly quotes / spaces differ), unsigned, and the saved address.
+async function pickDownloadableSource(original) {
+  const clean = (() => {
+    try {
+      const u = new URL(original);
+      ["token", "expires", "token_path"].forEach((k) =>
+        u.searchParams.delete(k),
+      );
+      return u.toString();
+    } catch {
+      return original;
+    }
+  })();
+  const candidates = [];
+  if (BUNNY_STORAGE_TOKEN_ENABLED && BUNNY_STORAGE_TOKEN_KEY) {
+    const encodedPath = new URL(clean).pathname || "/";
+    let plainPath = encodedPath;
+    try {
+      plainPath = decodeURIComponent(encodedPath);
+    } catch {
+      /* keep encoded */
+    }
+    candidates.push({
+      how: "signed (encoded path)",
+      url: signStorageUrl(clean, encodedPath),
+    });
+    if (plainPath !== encodedPath)
+      candidates.push({
+        how: "signed (plain path)",
+        url: signStorageUrl(clean, plainPath),
+      });
+  }
+  candidates.push({ how: "unsigned", url: clean });
+  if (original !== clean)
+    candidates.push({ how: "saved address", url: original });
+  const tried = [];
+  for (const c of candidates) {
+    const status = await probeDownload(c.url);
+    tried.push(`${c.how}: ${status}`);
+    if (status === 200 || status === 206)
+      return { ok: true, url: c.url, how: c.how, tried };
+  }
+  return { ok: false, tried };
+}
+
 async function retryFailedMigration(localVideo) {
   if (!LIB_ID || !API_KEY) throw new Error("Bunny Stream env not configured.");
   if (!localVideo) throw new Error("Video not found.");
@@ -449,17 +531,19 @@ async function retryFailedMigration(localVideo) {
       'The original file of this video is not known. Use "Migrate to Bunny Storage" to play it from storage.',
     );
   }
-  let clean = original;
-  try {
-    const u = new URL(original);
-    ["token", "expires", "token_path"].forEach((k) => u.searchParams.delete(k));
-    clean = u.toString();
-  } catch {
-    /* keep as is */
+  // 1) make sure the original can really be downloaded — before changing anything
+  const pick = await pickDownloadableSource(original);
+  if (!pick.ok) {
+    const err = new Error(
+      `Bunny Storage refuses the original file, so Bunny Stream cannot fetch it (${pick.tried.join("; ")}). ` +
+        `Check that the file still exists in Bunny Storage and the token settings (BUNNY_TOKEN_AUTH_*). Nothing was changed.`,
+    );
+    err.tried = pick.tried;
+    throw err;
   }
-  const sourceUrl = maybeResignBunnyStorageUrl(clean);
+  const sourceUrl = pick.url;
 
-  // remove the failed copy (ignore errors: it may already be gone)
+  // 2) remove the failed copy (ignore errors: it may already be gone)
   const oldId = String(localVideo.bunny_video_id || "").trim();
   if (oldId) {
     try {
@@ -504,6 +588,7 @@ async function retryFailedMigration(localVideo) {
     video: updated,
     bunnyVideoId: bunnyVideo.guid,
     previousBunnyVideoId: oldId || null,
+    source: pick.how,
   };
 }
 
@@ -530,7 +615,11 @@ router.post(
       console.error("[bunnyStream] retry error:", err);
       return res
         .status(500)
-        .json({ ok: false, message: err?.message || "Retry failed" });
+        .json({
+          ok: false,
+          message: err?.message || "Retry failed",
+          tried: err?.tried || undefined,
+        });
     }
   },
 );
