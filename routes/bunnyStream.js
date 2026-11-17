@@ -569,6 +569,64 @@ async function retryFailedMigration(localVideo) {
       'The original file of this video is not known. Use "Migrate to Bunny Storage" to play it from storage.',
     );
   }
+  const oldId = String(localVideo.bunny_video_id || "").trim();
+
+  // 0) The "original" is itself a Bunny Stream video (vz-….b-cdn.net): the
+  //    message was uploaded straight to Bunny Stream and later "migrated" from
+  //    its own Stream address, which Stream refuses (403). There is nothing to
+  //    copy — link the message back to that first upload if it plays.
+  const streamGuid = (() => {
+    try {
+      const u = new URL(original);
+      if (!/^vz-[a-z0-9-]+\.b-cdn\.net$/i.test(u.hostname)) return "";
+      const m = u.pathname.match(
+        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+      );
+      return m ? m[0] : "";
+    } catch {
+      return "";
+    }
+  })();
+  if (streamGuid) {
+    const first =
+      streamGuid !== oldId ? await getBunnyVideoById(streamGuid) : null;
+    if (first && safeStreamStatusFromBunny(first) === "ready") {
+      const updated = await updateLocalVideoAfterBunnyMigration({
+        localVideo,
+        bunnyVideo: first,
+        sourceUrl: original,
+      });
+      if (oldId && oldId !== streamGuid) {
+        try {
+          await fetch(
+            `https://video.bunnycdn.com/library/${LIB_ID}/videos/${oldId}`,
+            {
+              method: "DELETE",
+              headers: { AccessKey: API_KEY, Accept: "application/json" },
+            },
+          );
+        } catch {
+          /* ignore */
+        }
+      }
+      return {
+        skipped: false,
+        relinked: true,
+        video: updated,
+        bunnyVideoId: streamGuid,
+        previousBunnyVideoId: oldId || null,
+        source: "its first Bunny Stream upload",
+      };
+    }
+    throw new Error(
+      `This message was uploaded straight to Bunny Stream, and that upload ` +
+        (first
+          ? `cannot play either (Bunny status ${first.status}).`
+          : `is no longer in the Bunny library.`) +
+        ` There is no other copy of the file to retry from: please upload the video file again. Nothing was changed.`,
+    );
+  }
+
   // 1) make sure the original can really be downloaded — before changing anything
   const pick = await pickDownloadableSource(original);
   if (!pick.ok) {
@@ -584,7 +642,6 @@ async function retryFailedMigration(localVideo) {
   const sourceUrl = pick.url;
 
   // 2) remove the failed copy (ignore errors: it may already be gone)
-  const oldId = String(localVideo.bunny_video_id || "").trim();
   if (oldId) {
     try {
       await fetch(

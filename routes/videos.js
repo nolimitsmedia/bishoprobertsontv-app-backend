@@ -567,6 +567,8 @@ function applyFailedStreamFallback(row) {
   if (!isFailedStreamRow(row)) return false;
   const original = getMigrationSourceUrl(row);
   if (!original) return false;
+  // a Bunny Stream address is not a usable original (Stream refuses direct downloads)
+  if (isBunnyStreamHost(original)) return false;
   const source = cleanBunnyUrl(original); // a fresh token is added when signing
   row.provider = "bunny"; // same as a video stored in Bunny Storage
   row.provider_key = null;
