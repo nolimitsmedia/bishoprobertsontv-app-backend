@@ -453,11 +453,11 @@ function signStorageUrl(cleanUrl, hashPath) {
 }
 
 // Can this address actually be downloaded? (first byte only)
-async function probeDownload(url) {
+async function probeDownload(url, extraHeaders = {}) {
   try {
     const r = await fetch(url, {
       method: "GET",
-      headers: { Range: "bytes=0-0" },
+      headers: { Range: "bytes=0-0", ...extraHeaders },
       timeout: 15000,
       redirect: "follow",
     });
@@ -509,14 +509,52 @@ async function pickDownloadableSource(original) {
   candidates.push({ how: "unsigned", url: clean });
   if (original !== clean)
     candidates.push({ how: "saved address", url: original });
+  // Hotlink protection ("Allowed Referrers") also answers 403 to requests that
+  // don't come from the website: try every form as coming from the site too.
+  const site = String(
+    process.env.PUBLIC_SITE_URL ||
+      "https://nolimitsmedia.github.io/bishoprobertsontv-app/",
+  ).trim();
+  const siteOrigin = (() => {
+    try {
+      return new URL(site).origin + "/";
+    } catch {
+      return "";
+    }
+  })();
   const tried = [];
   for (const c of candidates) {
     const status = await probeDownload(c.url);
     tried.push(`${c.how}: ${status}`);
     if (status === 200 || status === 206)
-      return { ok: true, url: c.url, how: c.how, tried };
+      return { ok: true, url: c.url, how: c.how, headers: {}, tried };
   }
-  return { ok: false, tried };
+  if (siteOrigin) {
+    for (const c of candidates) {
+      const headers = { Referer: siteOrigin };
+      const status = await probeDownload(c.url, headers);
+      tried.push(`${c.how} from the website: ${status}`);
+      if (status === 200 || status === 206)
+        return {
+          ok: true,
+          url: c.url,
+          how: `${c.how} (from the website)`,
+          headers,
+          tried,
+        };
+    }
+  }
+  let host = "";
+  try {
+    host = new URL(clean).hostname;
+  } catch {
+    /* ignore */
+  }
+  const signing =
+    BUNNY_STORAGE_TOKEN_ENABLED && BUNNY_STORAGE_TOKEN_KEY
+      ? "on"
+      : "OFF (BUNNY_TOKEN_AUTH_ENABLED=true and BUNNY_TOKEN_AUTH_KEY are not both set on the server)";
+  return { ok: false, tried, host, signing };
 }
 
 async function retryFailedMigration(localVideo) {
@@ -535,8 +573,10 @@ async function retryFailedMigration(localVideo) {
   const pick = await pickDownloadableSource(original);
   if (!pick.ok) {
     const err = new Error(
-      `Bunny Storage refuses the original file, so Bunny Stream cannot fetch it (${pick.tried.join("; ")}). ` +
-        `Check that the file still exists in Bunny Storage and the token settings (BUNNY_TOKEN_AUTH_*). Nothing was changed.`,
+      `Bunny Storage (${pick.host || "storage"}) refuses the original file, so Bunny Stream cannot fetch it. ` +
+        `Tried: ${pick.tried.join("; ")}. Token signing on the server: ${pick.signing}. ` +
+        `Check that the file still exists in Bunny Storage, and that the token key on the server is this pull zone's ` +
+        `"Token Authentication" key. Nothing was changed.`,
     );
     err.tried = pick.tried;
     throw err;
@@ -564,7 +604,11 @@ async function retryFailedMigration(localVideo) {
   const uniqueTitle = `${originalTitle} [NLM-RETRY-${localVideo.id}-${Date.now()}]`;
   await bunnyJson(`https://video.bunnycdn.com/library/${LIB_ID}/videos/fetch`, {
     method: "POST",
-    body: JSON.stringify({ url: sourceUrl, title: uniqueTitle, headers: {} }),
+    body: JSON.stringify({
+      url: sourceUrl,
+      title: uniqueTitle,
+      headers: pick.headers || {},
+    }),
   });
   let bunnyVideo = null;
   for (let i = 0; i < 10; i += 1) {
