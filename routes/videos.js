@@ -1458,6 +1458,12 @@ router.get("/", authenticate, async (req, res) => {
       where += ` AND v.is_published = TRUE`;
     } else if (String(status).toLowerCase() === "unpublished") {
       where += ` AND (v.is_published = FALSE OR v.is_published IS NULL)`;
+    } else if (String(status).toLowerCase() === "needs_reupload") {
+      // the Bunny Stream copy failed (or the video has no file at all)
+      where += ` AND (
+        (LOWER(COALESCE(v.provider, '')) = 'bunny_stream' AND LOWER(COALESCE(v.processing_status, '')) IN ('error', 'failed'))
+        OR (COALESCE(v.video_url, '') = '' AND COALESCE(v.playback_url, '') = '' AND COALESCE(v.bunny_video_id, '') = '')
+      )`;
     }
 
     const selectedSort = String(sortBy || sort || "newest").toLowerCase();

@@ -575,18 +575,48 @@ async function retryFailedMigration(localVideo) {
   //    message was uploaded straight to Bunny Stream and later "migrated" from
   //    its own Stream address, which Stream refuses (403). There is nothing to
   //    copy — link the message back to that first upload if it plays.
-  const streamGuid = (() => {
+  // the address without any token, for messages
+  const shownAddress = (() => {
     try {
       const u = new URL(original);
-      if (!/^vz-[a-z0-9-]+\.b-cdn\.net$/i.test(u.hostname)) return "";
-      const m = u.pathname.match(
-        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+      ["token", "expires", "token_path"].forEach((k) =>
+        u.searchParams.delete(k),
       );
-      return m ? m[0] : "";
+      return u.toString().replace(/bcdn_token=[^/]*/i, "bcdn_token=…");
     } catch {
-      return "";
+      return String(original).slice(0, 200);
     }
   })();
+  const isStreamAddress = (() => {
+    try {
+      const h = new URL(original).hostname;
+      return (
+        /^vz-[a-z0-9-]+\.b-cdn\.net$/i.test(h) || /mediadelivery\.net$/i.test(h)
+      );
+    } catch {
+      return false;
+    }
+  })();
+  // the Bunny video id can be anywhere in the address (path, token part, query)
+  const streamGuid = (() => {
+    if (!isStreamAddress) return "";
+    let all = String(original);
+    try {
+      all = decodeURIComponent(all);
+    } catch {
+      /* keep */
+    }
+    const m = all.match(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i,
+    );
+    return m ? m[0].toLowerCase() : "";
+  })();
+  if (isStreamAddress && !streamGuid) {
+    throw new Error(
+      `[retry v4] The saved "original" of this message is a Bunny Stream address without a video id (${shownAddress}). ` +
+        `It was uploaded straight to Bunny Stream; there is no other copy to retry from — please upload the video file again. Nothing was changed.`,
+    );
+  }
   if (streamGuid) {
     const first =
       streamGuid !== oldId ? await getBunnyVideoById(streamGuid) : null;
@@ -619,7 +649,7 @@ async function retryFailedMigration(localVideo) {
       };
     }
     throw new Error(
-      `This message was uploaded straight to Bunny Stream, and that upload ` +
+      `[retry v4] This message was uploaded straight to Bunny Stream (video ${streamGuid}), and that upload ` +
         (first
           ? `cannot play either (Bunny status ${first.status}).`
           : `is no longer in the Bunny library.`) +
@@ -631,7 +661,7 @@ async function retryFailedMigration(localVideo) {
   const pick = await pickDownloadableSource(original);
   if (!pick.ok) {
     const err = new Error(
-      `Bunny Storage (${pick.host || "storage"}) refuses the original file, so Bunny Stream cannot fetch it. ` +
+      `[retry v4] Bunny Storage (${pick.host || "storage"}) refuses the original file (${shownAddress}), so Bunny Stream cannot fetch it. ` +
         `Tried: ${pick.tried.join("; ")}. Token signing on the server: ${pick.signing}. ` +
         `Check that the file still exists in Bunny Storage, and that the token key on the server is this pull zone's ` +
         `"Token Authentication" key. Nothing was changed.`,
@@ -776,7 +806,7 @@ router.post(
 router.post(
   "/bunny/stream/migrate/:id",
   authenticate,
-  allowUploadRoles,
+  retryAccess, // staff only (allowUploadRoles also let members through)
   async (req, res) => {
     try {
       const id = Number(req.params.id);
@@ -810,7 +840,7 @@ router.post(
 router.post(
   "/bunny/stream/migrate-bulk",
   authenticate,
-  allowUploadRoles,
+  retryAccess, // staff only (allowUploadRoles also let members through)
   async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (!ids.length) {
@@ -981,7 +1011,7 @@ async function restoreOneBunnyStreamToStorage(localVideo) {
 router.post(
   "/bunny/stream/restore-storage/:id",
   authenticate,
-  allowUploadRoles,
+  retryAccess, // staff only (allowUploadRoles also let members through)
   async (req, res) => {
     try {
       const id = Number(req.params.id);
@@ -1015,7 +1045,7 @@ router.post(
 router.post(
   "/bunny/stream/restore-storage-bulk",
   authenticate,
-  allowUploadRoles,
+  retryAccess, // staff only (allowUploadRoles also let members through)
   async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (!ids.length) {
@@ -1250,5 +1280,298 @@ router.post(
     return res.json({ ok: failed === 0, synced: ok, failed, results });
   },
 );
+
+/* ------------------------------------------------------------------
+ * REPLACE VIDEO FILE — upload a new file into the SAME message, keeping its
+ * title, details, comments, viewing history, My List / playlists and address.
+ * The message keeps its current file until the new one is encoded and ready;
+ * then it switches over and the old Bunny copy is removed.
+ *   POST   /bunny/stream/replace/:id/start   → tus upload credentials
+ *   GET    /bunny/stream/replace/:id/status  → uploading / processing / done / error
+ *   DELETE /bunny/stream/replace/:id         → cancel
+ * ------------------------------------------------------------------ */
+function metaOf(v) {
+  let md = v?.metadata || {};
+  if (typeof md === "string") {
+    try {
+      md = JSON.parse(md);
+    } catch {
+      md = {};
+    }
+  }
+  return md && typeof md === "object" ? md : {};
+}
+
+async function deleteBunnyVideoQuietly(guid) {
+  if (!guid) return;
+  try {
+    await fetch(`https://video.bunnycdn.com/library/${LIB_ID}/videos/${guid}`, {
+      method: "DELETE",
+      headers: { AccessKey: API_KEY, Accept: "application/json" },
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+// Check a pending replacement; switch the message over when Bunny is ready.
+async function checkReplacement(row) {
+  const md = metaOf(row);
+  const pending = md.replace_pending;
+  if (!pending?.bunny_video_id) return { state: "none" };
+  const guid = String(pending.bunny_video_id);
+  const bv = await getBunnyVideoById(guid);
+  if (!bv) {
+    await db.query(
+      `UPDATE videos SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [
+        row.id,
+        JSON.stringify({
+          replace_pending: {
+            ...pending,
+            status: "error",
+            error: "The new upload is not in the Bunny library.",
+          },
+        }),
+      ],
+    );
+    return {
+      state: "error",
+      message:
+        "The new upload is not in the Bunny library. Please choose the file again.",
+    };
+  }
+  const st = safeStreamStatusFromBunny(bv);
+  if (st === "error") {
+    await db.query(
+      `UPDATE videos SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [
+        row.id,
+        JSON.stringify({
+          replace_pending: {
+            ...pending,
+            status: "error",
+            error: `Bunny could not encode the new file (status ${bv.status}).`,
+          },
+        }),
+      ],
+    );
+    return {
+      state: "error",
+      message: `Bunny could not encode the new file (status ${bv.status}). The message still uses its old file. Try another file.`,
+    };
+  }
+  if (st !== "ready") {
+    return {
+      state:
+        Number(bv.status) <= 1 && !Number(bv.encodeProgress)
+          ? "uploading"
+          : "processing",
+      progress: Number(bv.encodeProgress || 0),
+    };
+  }
+
+  // ready → switch the message to the new file
+  const urls = buildPlaybackUrls(guid);
+  const oldGuid = String(row.bunny_video_id || "").trim();
+  const length = Math.round(Number(bv.length) || 0);
+  const preview =
+    md.preview_clip && typeof md.preview_clip === "object"
+      ? { ...md.preview_clip, status: "outdated" }
+      : undefined;
+  const nextMeta = { ...md };
+  delete nextMeta.replace_pending;
+  if (nextMeta.bunny_stream_migration) {
+    nextMeta.previous_migration = nextMeta.bunny_stream_migration;
+    delete nextMeta.bunny_stream_migration;
+  }
+  if (preview) nextMeta.preview_clip = preview;
+  nextMeta.file_replaced = {
+    at: new Date().toISOString(),
+    previous_bunny_video_id: oldGuid || null,
+    previous_video_url: row.video_url || null,
+    filename: pending.filename || null,
+  };
+  // keep a custom thumbnail; drop one that pointed at the old Bunny copy
+  const thumb =
+    row.thumbnail_url && oldGuid && String(row.thumbnail_url).includes(oldGuid)
+      ? null
+      : row.thumbnail_url || null;
+  const { rows } = await db.query(
+    `UPDATE videos
+        SET provider = 'bunny_stream',
+            provider_key = $2,
+            bunny_video_id = $2,
+            bunny_library_id = $3,
+            video_url = $4,
+            playback_url = $4,
+            embed_url = $5,
+            processing_status = 'ready',
+            duration_seconds = CASE WHEN $6::int > 0 THEN $6::int ELSE duration_seconds END,
+            thumbnail_url = $7,
+            metadata = $8::jsonb,
+            updated_at = NOW()
+      WHERE id = $1
+      RETURNING *`,
+    [
+      row.id,
+      guid,
+      String(LIB_ID),
+      urls.playbackUrl || urls.hlsUrl || "",
+      urls.embedUrl || "",
+      length,
+      thumb,
+      JSON.stringify(nextMeta),
+    ],
+  );
+  if (oldGuid && oldGuid !== guid) await deleteBunnyVideoQuietly(oldGuid);
+  return { state: "done", video: rows[0] };
+}
+
+router.post(
+  "/bunny/stream/replace/:id/start",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      if (!LIB_ID || !API_KEY)
+        return res
+          .status(500)
+          .json({ ok: false, message: "Bunny Stream env not configured." });
+      const id = Number(req.params.id);
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        id,
+      ]);
+      if (!q.rowCount)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      const row = q.rows[0];
+      const md = metaOf(row);
+      // a previous unfinished replacement is discarded
+      if (
+        md.replace_pending?.bunny_video_id &&
+        md.replace_pending.status !== "done"
+      )
+        await deleteBunnyVideoQuietly(md.replace_pending.bunny_video_id);
+      const created = await bunnyJson(
+        `https://video.bunnycdn.com/library/${LIB_ID}/videos`,
+        {
+          method: "POST",
+          body: JSON.stringify({ title: String(row.title || "Untitled") }),
+        },
+      );
+      const videoId = created?.guid || created?.videoId || created?.id;
+      if (!videoId)
+        return res
+          .status(500)
+          .json({ ok: false, message: "Bunny did not return a video id." });
+      const expires = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
+      const signature = crypto
+        .createHash("sha256")
+        .update(`${LIB_ID}${API_KEY}${expires}${videoId}`)
+        .digest("hex");
+      const pending = {
+        bunny_video_id: videoId,
+        status: "uploading",
+        started_at: new Date().toISOString(),
+        filename: String(req.body?.filename || "").slice(0, 200) || null,
+      };
+      await db.query(
+        `UPDATE videos SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+        [id, JSON.stringify({ replace_pending: pending })],
+      );
+      return res.json({
+        ok: true,
+        videoId,
+        libraryId: String(LIB_ID),
+        signature,
+        expires,
+        tusEndpoint: "https://video.bunnycdn.com/tusupload",
+      });
+    } catch (err) {
+      console.error("[bunnyStream] replace start error:", err);
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          message: err?.message || "Could not start the replacement",
+        });
+    }
+  },
+);
+
+router.get(
+  "/bunny/stream/replace/:id/status",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      res.set("Cache-Control", "no-store");
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        Number(req.params.id),
+      ]);
+      if (!q.rowCount)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      const r = await checkReplacement(q.rows[0]);
+      return res.json({ ok: true, ...r });
+    } catch (err) {
+      console.error("[bunnyStream] replace status error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, message: err?.message || "Status check failed" });
+    }
+  },
+);
+
+router.delete(
+  "/bunny/stream/replace/:id",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        id,
+      ]);
+      if (!q.rowCount)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      const pending = metaOf(q.rows[0]).replace_pending;
+      if (pending?.bunny_video_id)
+        await deleteBunnyVideoQuietly(pending.bunny_video_id);
+      await db.query(
+        `UPDATE videos SET metadata = COALESCE(metadata, '{}'::jsonb) - 'replace_pending', updated_at = NOW() WHERE id = $1`,
+        [id],
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      return res
+        .status(500)
+        .json({ ok: false, message: err?.message || "Cancel failed" });
+    }
+  },
+);
+
+// Finish replacements in the background (the admin may close the page while
+// Bunny is still encoding). Every 5 minutes.
+async function finishPendingReplacements() {
+  if (!LIB_ID || !API_KEY) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM videos WHERE metadata ? 'replace_pending' AND COALESCE(metadata->'replace_pending'->>'status', '') <> 'error' LIMIT 50`,
+    );
+    for (const row of rows) {
+      try {
+        await checkReplacement(row);
+      } catch (e) {
+        console.warn("[bunnyStream] replacement check:", e.message);
+      }
+    }
+  } catch (e) {
+    console.warn("[bunnyStream] replacement checks:", e.message);
+  }
+}
+if (process.env.NODE_ENV !== "test") {
+  const t = setInterval(finishPendingReplacements, 5 * 60 * 1000);
+  t.unref?.();
+}
 
 module.exports = router;
