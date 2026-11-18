@@ -1645,8 +1645,9 @@ router.get("/:id", authenticate, async (req, res) => {
       row.video_url = row.playback_url;
     }
 
-    // failed Bunny Stream copy: play the original file instead
-    if (applyFailedStreamFallback(row)) {
+    // failed Bunny Stream copy: viewers play the original file instead. Not for
+    // staff who manage the video: the edit page must see (and save) the real record.
+    if (!ownerOrAdmin && applyFailedStreamFallback(row)) {
       const ttl = 6 * 3600;
       const playable = await pickPlayableOriginal(row, row.playback_url, ttl);
       row.video_url = playable;
