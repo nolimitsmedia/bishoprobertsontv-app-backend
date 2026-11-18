@@ -1550,6 +1550,203 @@ router.delete(
   },
 );
 
+/* ------------------------------------------------------------------
+ * REPLACE FROM WASABI — Bunny Stream fetches the file straight from Wasabi
+ * (signed 24-hour link) into the SAME message; then the normal Replace flow
+ * (switch-over when ready, old copy removed) takes over.
+ *   GET  /bunny/stream/replace/:id/wasabi-suggest  → the message's saved Wasabi file
+ *   POST /bunny/stream/replace/:id/from-wasabi     { key }
+ *   POST /bunny/stream/replace-failed-from-wasabi  every failed message with a known Wasabi file
+ * ------------------------------------------------------------------ */
+function wasabiKeyOf(row) {
+  const md = metaOf(row);
+  let sm = row?.source_meta || {};
+  if (typeof sm === "string") {
+    try {
+      sm = JSON.parse(sm);
+    } catch {
+      sm = {};
+    }
+  }
+  const imp =
+    md.wasabi_import && typeof md.wasabi_import === "object"
+      ? md.wasabi_import
+      : {};
+  const k = [
+    row?.wasabi_key,
+    sm.wasabi_key,
+    sm.key,
+    sm.original_key,
+    md.wasabi_key,
+    md.source_key,
+    md.original_key,
+    imp.key,
+    imp.wasabi_key,
+  ]
+    .map((x) => String(x || "").trim())
+    .find((x) => x && !/^https?:/i.test(x));
+  return k || "";
+}
+
+async function startReplaceFromWasabi(row, key) {
+  if (!LIB_ID || !API_KEY) throw new Error("Bunny Stream env not configured.");
+  const wasabi = require("../services/wasabi");
+  const cleanKey = String(key || "")
+    .trim()
+    .replace(/^\/+/, "");
+  if (!cleanKey) throw new Error("Choose a file from Wasabi.");
+  try {
+    await wasabi.headObject(cleanKey);
+  } catch (e) {
+    throw new Error(
+      `The file "${cleanKey}" was not found in Wasabi. Nothing was changed.`,
+    );
+  }
+  const url = await wasabi.signGetUrl(cleanKey, 24 * 60 * 60);
+  // make sure Wasabi really serves the link before asking Bunny
+  const status = await probeDownload(url);
+  if (status !== 200 && status !== 206) {
+    throw new Error(
+      `Wasabi refused the download link for "${cleanKey}" (${status}). Check the Wasabi keys on the server. Nothing was changed.`,
+    );
+  }
+  // a previous unfinished replacement is discarded
+  const md = metaOf(row);
+  if (
+    md.replace_pending?.bunny_video_id &&
+    md.replace_pending.status !== "done"
+  )
+    await deleteBunnyVideoQuietly(md.replace_pending.bunny_video_id);
+
+  const originalTitle = String(row.title || "Untitled").trim() || "Untitled";
+  const uniqueTitle = `${originalTitle} [NLM-WASABI-${row.id}-${Date.now()}]`;
+  await bunnyJson(`https://video.bunnycdn.com/library/${LIB_ID}/videos/fetch`, {
+    method: "POST",
+    body: JSON.stringify({ url, title: uniqueTitle, headers: {} }),
+  });
+  let bunnyVideo = null;
+  for (let i = 0; i < 10; i += 1) {
+    bunnyVideo = await findBunnyVideoByExactTitle(uniqueTitle);
+    if (bunnyVideo?.guid) break;
+    await sleep(800);
+  }
+  if (!bunnyVideo?.guid)
+    throw new Error(
+      "Bunny started fetching from Wasabi, but the new copy was not found yet. Wait a minute and check again.",
+    );
+  await updateBunnyVideoTitle(bunnyVideo.guid, originalTitle);
+  const pending = {
+    bunny_video_id: bunnyVideo.guid,
+    status: "processing",
+    started_at: new Date().toISOString(),
+    source: "wasabi",
+    wasabi_key: cleanKey,
+  };
+  await db.query(
+    `UPDATE videos SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+    [row.id, JSON.stringify({ replace_pending: pending })],
+  );
+  return { started: true, bunnyVideoId: bunnyVideo.guid, key: cleanKey };
+}
+
+router.get(
+  "/bunny/stream/replace/:id/wasabi-suggest",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        Number(req.params.id),
+      ]);
+      if (!q.rowCount)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      return res.json({ ok: true, key: wasabiKeyOf(q.rows[0]) || null });
+    } catch (err) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          message: err?.message || "Could not read the video",
+        });
+    }
+  },
+);
+
+router.post(
+  "/bunny/stream/replace/:id/from-wasabi",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        Number(req.params.id),
+      ]);
+      if (!q.rowCount)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      const r = await startReplaceFromWasabi(q.rows[0], req.body?.key);
+      return res.json({ ok: true, ...r });
+    } catch (err) {
+      console.error(
+        "[bunnyStream] replace from Wasabi error:",
+        err?.message || err,
+      );
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          message: err?.message || "Could not start the import from Wasabi",
+        });
+    }
+  },
+);
+
+router.post(
+  "/bunny/stream/replace-failed-from-wasabi",
+  authenticate,
+  retryAccess,
+  async (_req, res) => {
+    try {
+      const { rows } = await db.query(
+        `SELECT * FROM videos
+        WHERE LOWER(COALESCE(provider, '')) = 'bunny_stream'
+          AND LOWER(COALESCE(processing_status, '')) IN ('error', 'failed')
+        ORDER BY id DESC LIMIT 50`,
+      );
+      const started = [];
+      const unmatched = [];
+      const failed = [];
+      for (const row of rows) {
+        const key = wasabiKeyOf(row);
+        if (!key) {
+          unmatched.push({ id: row.id, title: row.title });
+          continue;
+        }
+        try {
+          await startReplaceFromWasabi(row, key);
+          started.push({ id: row.id, title: row.title, key });
+        } catch (e) {
+          failed.push({
+            id: row.id,
+            title: row.title,
+            message: e?.message || "failed",
+          });
+        }
+      }
+      return res.json({
+        ok: true,
+        found: rows.length,
+        started: started.length,
+        unmatched,
+        failed,
+      });
+    } catch (err) {
+      return res
+        .status(500)
+        .json({ ok: false, message: err?.message || "Re-import failed" });
+    }
+  },
+);
+
 // Finish replacements in the background (the admin may close the page while
 // Bunny is still encoding). Every 5 minutes.
 async function finishPendingReplacements() {
