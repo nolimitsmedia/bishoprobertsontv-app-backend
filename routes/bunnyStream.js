@@ -12,13 +12,15 @@ const router = express.Router();
 const authenticate = require("../middleware/authenticate");
 const db = require("../db");
 
-const LIB_ID = String(process.env.BUNNY_STREAM_LIBRARY_ID || "").trim();
-const API_KEY = String(process.env.BUNNY_STREAM_API_KEY || "").trim();
+// let (not const): a Bunny connection saved on the Cloud Storage page replaces
+// these at run time (lib/bunnyConfig.js › refreshBunnyConfig below).
+let LIB_ID = String(process.env.BUNNY_STREAM_LIBRARY_ID || "").trim();
+let API_KEY = String(process.env.BUNNY_STREAM_API_KEY || "").trim();
 
 // Bunny Stream HLS CDN host.
 // If Bunny gives you a custom Stream CDN hostname, set:
 // BUNNY_STREAM_CDN_HOST=your-stream-host.b-cdn.net
-const STREAM_CDN_HOST = String(
+let STREAM_CDN_HOST = String(
   process.env.BUNNY_STREAM_CDN_HOST ||
     process.env.BUNNY_STREAM_PULL_ZONE_URL ||
     `vz-${LIB_ID}.b-cdn.net`,
@@ -1588,6 +1590,27 @@ function wasabiKeyOf(row) {
   return k || "";
 }
 
+// Wasabi files are named by the service date (BRTV-042626_1.mp4 for 4-26-26).
+// Find the files whose name has the date from the message title.
+async function wasabiCandidatesByDate(row) {
+  const m = String(row?.title || "").match(
+    /(\d{1,2})-(\d{1,2})-(\d{2}|\d{4})(?!.*\d{1,2}-\d{1,2}-\d{2})/,
+  );
+  if (!m) return [];
+  const code = `${m[1].padStart(2, "0")}${m[2].padStart(2, "0")}${m[3].slice(-2)}`;
+  try {
+    const { rows } = await db.query(
+      `SELECT DISTINCT key FROM wasabi_object_index
+        WHERE key ~* $1 AND key ~* '\\.(mp4|mov|m4v)$'
+        ORDER BY key LIMIT 10`,
+      [`(^|/)BRTV-${code}([_.-]|$)`],
+    );
+    return rows.map((r) => r.key);
+  } catch {
+    return []; // the Wasabi file list has not been created yet
+  }
+}
+
 async function startReplaceFromWasabi(row, key) {
   if (!LIB_ID || !API_KEY) throw new Error("Bunny Stream env not configured.");
   const wasabi = require("../services/wasabi");
@@ -1660,7 +1683,12 @@ router.get(
       ]);
       if (!q.rowCount)
         return res.status(404).json({ ok: false, message: "Video not found" });
-      return res.json({ ok: true, key: wasabiKeyOf(q.rows[0]) || null });
+      const saved = wasabiKeyOf(q.rows[0]);
+      if (saved) return res.json({ ok: true, key: saved });
+      const candidates = await wasabiCandidatesByDate(q.rows[0]);
+      if (candidates.length === 1)
+        return res.json({ ok: true, key: candidates[0], matchedByDate: true });
+      return res.json({ ok: true, key: null, candidates });
     } catch (err) {
       return res
         .status(500)
@@ -1716,14 +1744,26 @@ router.post(
       const unmatched = [];
       const failed = [];
       for (const row of rows) {
-        const key = wasabiKeyOf(row);
+        let key = wasabiKeyOf(row);
+        let byDate = false;
         if (!key) {
-          unmatched.push({ id: row.id, title: row.title });
-          continue;
+          const candidates = await wasabiCandidatesByDate(row);
+          if (candidates.length === 1) {
+            key = candidates[0];
+            byDate = true;
+          } else {
+            unmatched.push({ id: row.id, title: row.title, candidates });
+            continue;
+          }
         }
         try {
           await startReplaceFromWasabi(row, key);
-          started.push({ id: row.id, title: row.title, key });
+          started.push({
+            id: row.id,
+            title: row.title,
+            key,
+            matchedByDate: byDate,
+          });
         } catch (e) {
           failed.push({
             id: row.id,
@@ -1771,4 +1811,19 @@ if (process.env.NODE_ENV !== "test") {
   t.unref?.();
 }
 
+// called by lib/bunnyConfig.js when the Bunny connection changes
+function refreshBunnyConfig() {
+  LIB_ID = String(process.env.BUNNY_STREAM_LIBRARY_ID || "").trim();
+  API_KEY = String(process.env.BUNNY_STREAM_API_KEY || "").trim();
+  STREAM_CDN_HOST = String(
+    process.env.BUNNY_STREAM_CDN_HOST ||
+      process.env.BUNNY_STREAM_PULL_ZONE_URL ||
+      `vz-${LIB_ID}.b-cdn.net`,
+  )
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/g, "");
+}
+
 module.exports = router;
+module.exports.refreshBunnyConfig = refreshBunnyConfig;

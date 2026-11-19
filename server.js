@@ -400,6 +400,14 @@ app.use("/api/admin/wasabi", contentStaff, require("./routes/wasabiImport")); //
 // app.use("/api/storage", require("./routes/storage"));
 app.use("/api/admin/storage", require("./routes/storage"));
 app.use("/api/admin/import-jobs", require("./routes/importJobs"));
+// Cloud Storage: connect any cloud storage + the customer's own Bunny Stream library
+app.use(
+  "/api/admin/cloud-storage",
+  requireArea("website", "content"),
+  require("./routes/cloudStorage"),
+);
+// a Bunny Stream library saved on the Cloud Storage page replaces the env settings
+require("./lib/bunnyConfig").load();
 // app.use("/api/admin/wasabi", adminWasabiImport);
 // app.use("/api/admin/wasabi", adminWasabi);
 

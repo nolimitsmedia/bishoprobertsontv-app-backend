@@ -507,6 +507,74 @@ async function syncWasabiIndex({ db, prefixWithSlash, full = false }) {
 /**
  * GET /api/admin/wasabi/index/status?prefix=drm
  */
+
+/* ---------- same-date safety (Skip / Replace never create duplicates) ---------- */
+// "BRTV-042626_1.mp4" or "BRTV-4-8-26.mp4" → { month, day, yy, tag }; null when
+// the name has no clear date (e.g. "BRTV-4526.mp4").
+function dateFromWasabiKey(key) {
+  const name = String(key || "")
+    .split("/")
+    .pop()
+    .replace(/\.[^.]+$/, "");
+  let m = name.match(/BRTV[-_ ]?(\d{2})(\d{2})(\d{2})(?!\d)/i);
+  let month;
+  let day;
+  let yy;
+  if (m) {
+    month = Number(m[1]);
+    day = Number(m[2]);
+    yy = m[3];
+  } else {
+    m = name.match(/BRTV[-_ ]?(\d{1,2})-(\d{1,2})-(\d{2}|\d{4})(?!\d)/i);
+    if (!m) return null;
+    month = Number(m[1]);
+    day = Number(m[2]);
+    yy = m[3].slice(-2);
+  }
+  if (!month || month > 12 || !day || day > 31) return null;
+  // a place tag after the date, e.g. "-Emporia"
+  const rest = name
+    .replace(m[0], "")
+    .replace(/_\d+$/, "")
+    .replace(/[-_]+/g, " ")
+    .trim();
+  const tag = /[a-z]{3,}/i.test(rest) ? rest.match(/[a-z]{3,}/i)[0] : "";
+  return { month, day, yy, tag };
+}
+
+async function findMessagesByFileDate(db, key) {
+  const d = dateFromWasabiKey(key);
+  if (!d) return [];
+  // titles write dates like 4-26-26, 04-26-26 or 4-26-2026
+  const re = `(^|[^0-9])0?${d.month}-0?${d.day}-(20)?${d.yy}([^0-9]|$)`;
+  const params = [re];
+  let tagSql = "";
+  if (d.tag) {
+    params.push(`%${d.tag}%`);
+    tagSql = " AND title ILIKE $2";
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT id, title, provider, processing_status, video_url, playback_url, bunny_video_id
+         FROM videos WHERE title ~* $1${tagSql} ORDER BY id DESC LIMIT 5`,
+      params,
+    );
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+// a message whose Bunny Stream copy failed, or that has no file at all
+function isFailedMessage(v) {
+  const st = String(v?.processing_status || "").toLowerCase();
+  const failed =
+    String(v?.provider || "").toLowerCase() === "bunny_stream" &&
+    (st === "error" || st === "failed");
+  const noFile = !v?.video_url && !v?.playback_url && !v?.bunny_video_id;
+  return failed || noFile;
+}
+
 router.get("/index/status", async (req, res) => {
   try {
     const db = req.db;
@@ -983,7 +1051,9 @@ router.post("/import", async (req, res) => {
     const dryRun = !!body.dryRun;
 
     const mode = String(body.mode || "replace").toLowerCase(); // replace | skip
-    const dupMode = mode === "skip" ? "skip" : "replace";
+    // replace | skip | new ("Import as new (allow duplicates)")
+    const dupMode =
+      mode === "skip" ? "skip" : mode === "new" ? "new" : "replace";
 
     const category_id = String(body.category_id || "").trim()
       ? Number(body.category_id)
@@ -1025,6 +1095,32 @@ router.post("/import", async (req, res) => {
 
           const existing = await findExistingWasabiVideo(db, key);
 
+          // Safer than "already imported": a file never imported from Wasabi may
+          // still be a message on the site (uploaded another way). Look for a
+          // message with the file's service date (BRTV-042626_1 = 4-26-26):
+          //   one FAILED message → put the file into it (safe Replace flow)
+          //   otherwise → skip it, naming the message (no duplicates)
+          // Only "Import as new (allow duplicates)" turns this off.
+          let dateTarget = null;
+          if (!existing && dupMode !== "new") {
+            const matches = await findMessagesByFileDate(db, key);
+            if (matches.length) {
+              if (matches.length === 1 && isFailedMessage(matches[0])) {
+                dateTarget = matches[0];
+              } else {
+                return {
+                  key,
+                  status: "skipped",
+                  reason: "same_date_message",
+                  id: matches[0].id,
+                  matched: matches
+                    .slice(0, 3)
+                    .map((m) => ({ id: m.id, title: m.title })),
+                };
+              }
+            }
+          }
+
           if (existing && dupMode === "skip") {
             return {
               key,
@@ -1041,8 +1137,9 @@ router.post("/import", async (req, res) => {
               status: "dryRun",
               provider: "bunny_stream",
               title,
-              wouldReplace: !!existing,
-              matchedExistingId: existing?.id || null,
+              wouldReplace: !!(existing || dateTarget),
+              matchedExistingId: (existing || dateTarget)?.id || null,
+              matchedByDate: !!dateTarget,
             };
           }
 
@@ -1102,53 +1199,49 @@ router.post("/import", async (req, res) => {
             },
           };
 
-          if (existing) {
-            const id = existing.id;
-
+          const target = existing || dateTarget;
+          if (target) {
+            const id = target.id;
+            // Re-import into an EXISTING message: keep its title, visibility and
+            // category (they may have been edited), and use the safe Replace flow —
+            // the message keeps playing its current file until Bunny has encoded
+            // the new copy, then switches over and the old copy is removed
+            // (server-api/routes/bunnyStream.js › checkReplacement).
+            const pendingPatch = {
+              ...metadataPatch,
+              replace_pending: {
+                bunny_video_id: bunny.videoId,
+                status: "processing",
+                started_at: importedAt,
+                source: "wasabi",
+                wasabi_key: key,
+                filename,
+              },
+            };
             await db.query(
               `
             UPDATE videos
             SET
-              title = COALESCE($2, title),
-              video_url = COALESCE($3, video_url),
-              playback_url = COALESCE($3, playback_url),
-              embed_url = COALESCE($4, embed_url),
-              category_id = COALESCE($5, category_id),
-              visibility = COALESCE($6, visibility),
-              created_by = COALESCE(created_by, $7),
-              wasabi_bucket = $8,
-              wasabi_key = $9,
-              source_type = 'bunny_stream',
-              source_meta = $10::jsonb,
-              bunny_video_id = $11,
-              bunny_library_id = $12,
-              provider = 'bunny_stream',
-              provider_key = $11,
-              processing_status = 'processing',
-              metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || $13::jsonb,
+              wasabi_bucket = $2,
+              wasabi_key = $3,
+              source_meta = $4::jsonb,
+              metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || $5::jsonb,
               updated_at = now()
             WHERE id = $1
           `,
               [
                 id,
-                title,
-                playbackUrl,
-                bunny.embedUrl,
-                category_id,
-                vis,
-                actorUserId,
                 bucket,
                 key,
                 JSON.stringify(sourceMeta),
-                bunny.videoId,
-                bunny.libraryId,
-                JSON.stringify(metadataPatch),
+                JSON.stringify(pendingPatch),
               ],
             );
-
             return {
               key,
-              status: "replaced",
+              status: "replacing", // switches over when Bunny is ready
+              matched_by_date: !!dateTarget,
+              title: target.title || null,
               id,
               provider: "bunny_stream",
               bunny_video_id: bunny.videoId,
@@ -1232,8 +1325,18 @@ router.post("/import", async (req, res) => {
       concurrency,
       selected: mp4Keys.length,
       imported: details.filter((d) => d.status === "imported").length,
-      replaced: details.filter((d) => d.status === "replaced").length,
+      replaced: details.filter(
+        (d) => d.status === "replaced" || d.status === "replacing",
+      ).length,
       skipped: details.filter((d) => d.status === "skipped").length,
+      // skipped because a message with the same date is already on the site
+      skipped_same_date: details
+        .filter((d) => d.reason === "same_date_message")
+        .map((d) => ({ key: d.key, message: d.matched?.[0]?.title || null })),
+      // failed messages fixed with their file (matched by date)
+      fixed_by_date: details
+        .filter((d) => d.matched_by_date)
+        .map((d) => ({ key: d.key, message: d.title || null })),
       errors: details.filter((d) => d.status === "error").length,
       details,
     };
