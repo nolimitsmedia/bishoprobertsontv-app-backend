@@ -1787,6 +1787,136 @@ router.post(
   },
 );
 
+/* ------------------------------------------------------------------
+ * SOURCE FILE — every file name this message has had, and the Wasabi files
+ * that may be its original (same name, or the date in the title).
+ *   GET /bunny/stream/source/:id
+ * ------------------------------------------------------------------ */
+const MEDIA_EXT =
+  /\.(mp4|m4v|mov|mkv|webm|avi|wmv|mpg|mpeg|mts|m2ts|flv|3gp)$/i;
+function fileNameFrom(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  let path = raw;
+  try {
+    if (/^https?:\/\//i.test(raw)) path = new URL(raw).pathname;
+  } catch {
+    /* not a URL */
+  }
+  let name = path.split("/").filter(Boolean).pop() || "";
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    /* keep */
+  }
+  return MEDIA_EXT.test(name) ? name : "";
+}
+function pathFrom(value) {
+  try {
+    if (/^https?:\/\//i.test(String(value))) {
+      const u = new URL(String(value));
+      return `${u.hostname}${decodeURIComponent(u.pathname)}`;
+    }
+  } catch {
+    /* ignore */
+  }
+  return String(value || "");
+}
+
+router.get(
+  "/bunny/stream/source/:id",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    try {
+      const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+        Number(req.params.id),
+      ]);
+      if (!q.rowCount)
+        return res.status(404).json({ ok: false, message: "Video not found" });
+      const row = q.rows[0];
+      const md = metaOf(row);
+      let sm = row.source_meta || {};
+      if (typeof sm === "string") {
+        try {
+          sm = JSON.parse(sm);
+        } catch {
+          sm = {};
+        }
+      }
+      const found = [];
+      const add = (label, value) => {
+        const name = fileNameFrom(value);
+        if (!name || found.some((f) => f.name === name && f.label === label))
+          return;
+        found.push({ label, name, path: pathFrom(value) });
+      };
+      // where the message's files came from, most useful first
+      for (const m of [md.bunny_stream_migration, md.previous_migration])
+        if (m?.source_url) add("Original file (Bunny Storage)", m.source_url);
+      if (row.wasabi_key) add("Wasabi file", row.wasabi_key);
+      if (md.wasabi_import?.key) add("Wasabi file", md.wasabi_import.key);
+      if (md.cloud_import?.key) add("Cloud storage file", md.cloud_import.key);
+      if (md.file_replaced?.filename)
+        add("Uploaded file (replaced)", md.file_replaced.filename);
+      if (md.file_replaced?.previous_video_url)
+        add("Earlier file", md.file_replaced.previous_video_url);
+      // any other saved file name / address
+      const scan = (obj, depth = 0) => {
+        if (!obj || typeof obj !== "object" || depth > 3) return;
+        for (const [k, v] of Object.entries(obj)) {
+          if (
+            typeof v === "string" &&
+            /(file|name|key|url|source|path)/i.test(k)
+          )
+            add(
+              /url|path/i.test(k) && /^https?:/i.test(v)
+                ? "File address"
+                : "File name",
+              v,
+            );
+          else if (v && typeof v === "object") scan(v, depth + 1);
+        }
+      };
+      scan(sm);
+      scan(md);
+      const isStreamAddress = (u) =>
+        /mediadelivery\.net|vz-[a-z0-9-]+\.b-cdn\.net/i.test(String(u || ""));
+      if (row.video_url && !isStreamAddress(row.video_url))
+        add("Current file address", row.video_url);
+
+      // Wasabi files that may be the original: same name (without the extension), or the title's date
+      const wasabi = new Set();
+      try {
+        for (const f of found) {
+          const base = f.name.replace(MEDIA_EXT, "");
+          if (base.length < 4) continue;
+          const { rows } = await db.query(
+            `SELECT DISTINCT key FROM wasabi_object_index WHERE key ILIKE $1 ORDER BY key LIMIT 5`,
+            [`%${base}%`],
+          );
+          rows.forEach((r) => wasabi.add(r.key));
+        }
+      } catch {
+        /* no Wasabi file list yet */
+      }
+      for (const k of await wasabiCandidatesByDate(row)) wasabi.add(k);
+      return res.json({
+        ok: true,
+        files: found,
+        wasabi_matches: [...wasabi].slice(0, 10),
+      });
+    } catch (err) {
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          message: err?.message || "Could not read the source file",
+        });
+    }
+  },
+);
+
 // Finish replacements in the background (the admin may close the page while
 // Bunny is still encoding). Every 5 minutes.
 async function finishPendingReplacements() {
