@@ -1971,6 +1971,244 @@ router.get(
   },
 );
 
+/* ------------------------------------------------------------------
+ * QUICK REPAIR & RE-IMPORT — for files Bunny cannot encode ("Transcoding
+ * failed"). The server reads the original (Wasabi file, else the original
+ * Bunny Storage file), repairs it with ffmpeg (services/repairVideo.js: timing,
+ * index and sound; the picture is copied as is), uploads it to Bunny and the
+ * safe Replace flow switches the message over when Bunny is ready.
+ * One repair at a time.
+ *   POST /bunny/stream/repair/:id    start (or join the queue)
+ *   GET  /bunny/stream/repair/:id    queued / repairing / uploading / encoding / done / error
+ * ------------------------------------------------------------------ */
+const repairJobs = new Map(); // video id -> { state, progress, message, bunny_video_id }
+const repairQueue = [];
+let repairRunning = false;
+const setRepair = (id, patch) =>
+  repairJobs.set(Number(id), {
+    ...(repairJobs.get(Number(id)) || {}),
+    ...patch,
+    at: Date.now(),
+  });
+
+async function repairSourceUrl(row) {
+  const key =
+    wasabiKeyOf(row) ||
+    ((await wasabiCandidatesByDate(row)).length === 1
+      ? (await wasabiCandidatesByDate(row))[0]
+      : "");
+  if (key) {
+    try {
+      const wasabi = require("../services/wasabi");
+      await wasabi.headObject(key);
+      const url = await wasabi.signGetUrl(key, 6 * 60 * 60);
+      const st = await probeDownload(url);
+      if (st === 200 || st === 206)
+        return { url, from: `Wasabi (${key.split("/").pop()})` };
+    } catch {
+      /* try the next source */
+    }
+  }
+  const md = metaOf(row);
+  for (const m of [md.bunny_stream_migration, md.previous_migration]) {
+    const original = String(m?.source_url || "").trim();
+    if (
+      !original ||
+      /vz-[a-z0-9-]+\.b-cdn\.net|mediadelivery\.net/i.test(original)
+    )
+      continue;
+    const pick = await pickDownloadableSource(original);
+    if (pick.ok)
+      return { url: pick.url, from: "the original Bunny Storage file" };
+  }
+  throw new Error(
+    "No original file could be read for this message (Wasabi or Bunny Storage). Convert the file on a computer and use “Choose new file”.",
+  );
+}
+
+async function uploadFileToBunny(guid, filePath, onProgress) {
+  const fs = require("fs");
+  const size = fs.statSync(filePath).size;
+  let sent = 0;
+  const stream = fs.createReadStream(filePath);
+  stream.on("data", (chunk) => {
+    sent += chunk.length;
+    onProgress(Math.min(99, Math.round((sent / size) * 100)));
+  });
+  const r = await fetch(
+    `https://video.bunnycdn.com/library/${LIB_ID}/videos/${guid}`,
+    {
+      method: "PUT",
+      headers: {
+        AccessKey: API_KEY,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": String(size),
+      },
+      body: stream,
+    },
+  );
+  if (!r.ok)
+    throw new Error(`Bunny did not accept the repaired file (${r.status}).`);
+  onProgress(100);
+}
+
+async function runRepair(id) {
+  const os = require("os");
+  const path = require("path");
+  const fs = require("fs");
+  const { quickRepair } = require("../services/repairVideo");
+  const tmp = path.join(os.tmpdir(), `brtv-repair-${id}-${Date.now()}.mp4`);
+  try {
+    const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+      id,
+    ]);
+    const row = q.rows[0];
+    if (!row) throw new Error("Video not found.");
+    setRepair(id, {
+      state: "repairing",
+      progress: 0,
+      message: "Reading the original file…",
+    });
+    const src = await repairSourceUrl(row);
+    setRepair(id, { message: `Repairing the file from ${src.from}…` });
+    await quickRepair(src.url, tmp, (p) => setRepair(id, { progress: p }));
+
+    setRepair(id, {
+      state: "uploading",
+      progress: 0,
+      message: "Sending the repaired file to Bunny…",
+    });
+    const created = await bunnyJson(
+      `https://video.bunnycdn.com/library/${LIB_ID}/videos`,
+      {
+        method: "POST",
+        body: JSON.stringify({ title: String(row.title || "Untitled") }),
+      },
+    );
+    const guid = created?.guid || created?.videoId || created?.id;
+    if (!guid) throw new Error("Bunny did not return a video id.");
+    await uploadFileToBunny(guid, tmp, (p) => setRepair(id, { progress: p }));
+
+    // the safe Replace flow takes over (switch-over when ready, old copy removed)
+    const md = metaOf(row);
+    if (
+      md.replace_pending?.bunny_video_id &&
+      md.replace_pending.bunny_video_id !== guid &&
+      md.replace_pending.status !== "done"
+    ) {
+      await deleteBunnyVideoQuietly(md.replace_pending.bunny_video_id);
+    }
+    await db.query(
+      `UPDATE videos SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [
+        id,
+        JSON.stringify({
+          replace_pending: {
+            bunny_video_id: guid,
+            status: "processing",
+            started_at: new Date().toISOString(),
+            source: "repair",
+            filename: "repaired.mp4",
+          },
+        }),
+      ],
+    );
+    setRepair(id, {
+      state: "encoding",
+      progress: 0,
+      bunny_video_id: guid,
+      message: "Bunny is encoding the repaired file…",
+    });
+  } catch (e) {
+    setRepair(id, {
+      state: "error",
+      message: e.message || "The repair failed.",
+    });
+  } finally {
+    fs.promises.unlink(tmp).catch(() => {});
+  }
+}
+
+async function pumpRepairs() {
+  if (repairRunning) return;
+  const id = repairQueue.shift();
+  if (id == null) return;
+  repairRunning = true;
+  try {
+    await runRepair(id);
+  } finally {
+    repairRunning = false;
+    pumpRepairs();
+  }
+}
+
+router.post(
+  "/bunny/stream/repair/:id",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id))
+      return res.status(400).json({ ok: false, message: "Invalid video ID" });
+    if (!LIB_ID || !API_KEY)
+      return res
+        .status(500)
+        .json({ ok: false, message: "Bunny Stream env not configured." });
+    const cur = repairJobs.get(id);
+    if (cur && ["queued", "repairing", "uploading"].includes(cur.state))
+      return res.json({ ok: true, ...cur });
+    setRepair(id, {
+      state: "queued",
+      progress: 0,
+      message: repairRunning
+        ? "Waiting for another repair to finish…"
+        : "Starting…",
+      bunny_video_id: null,
+    });
+    repairQueue.push(id);
+    pumpRepairs();
+    return res.json({ ok: true, ...repairJobs.get(id) });
+  },
+);
+
+router.get(
+  "/bunny/stream/repair/:id",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const id = Number(req.params.id);
+    const job = repairJobs.get(id);
+    if (!job) return res.json({ ok: true, state: "none" });
+    if (job.state === "encoding") {
+      try {
+        const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
+          id,
+        ]);
+        const r = q.rows[0]
+          ? await checkReplacement(q.rows[0])
+          : { state: "none" };
+        if (r.state === "done")
+          setRepair(id, {
+            state: "done",
+            progress: 100,
+            message: "Repaired — the message now plays the repaired file.",
+          });
+        else if (r.state === "error")
+          setRepair(id, {
+            state: "error",
+            message: `Bunny still could not encode the repaired file.${r.reasons?.length ? ` Bunny says: ${r.reasons.join(" · ")}.` : ""} It needs a full conversion: HandBrake (“Fast 1080p30”, MP4), then “Choose new file”.`,
+          });
+        else if (r.state === "processing" || r.state === "uploading")
+          setRepair(id, { progress: Number(r.progress) || 0 });
+      } catch {
+        /* try again next time */
+      }
+    }
+    return res.json({ ok: true, ...repairJobs.get(id) });
+  },
+);
+
 // Finish replacements in the background (the admin may close the page while
 // Bunny is still encoding). Every 5 minutes.
 async function finishPendingReplacements() {
