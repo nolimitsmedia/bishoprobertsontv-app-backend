@@ -31,6 +31,20 @@ const FIELD_TYPES = new Set([
   "select",
   "checkbox",
 ]);
+
+// The built-in Contact page's form (/contact). Submissions appear in Admin ›
+// Form Submissions as "Contact page"; CONTACT_NOTIFY_EMAIL (optional) also
+// receives each message by email.
+const BUILTIN_CONTACT = {
+  id: "contact",
+  title: "Contact page",
+  fields: [
+    { id: "name", label: "Name", type: "text", required: true },
+    { id: "email", label: "Email", type: "email", required: true },
+    { id: "phone", label: "Phone", type: "phone" },
+    { id: "message", label: "Message", type: "textarea", required: true },
+  ],
+};
 const MAX_LEN = {
   text: 200,
   email: 200,
@@ -131,15 +145,26 @@ router.post("/submit", express.json({ limit: "64kb" }), async (req, res) => {
       .slice(0, 120);
     if (!formId || (!Number.isFinite(pageId) && !slug))
       return res.status(400).json({ ok: false, error: "Unknown form" });
-    const { rows } = await db.query(
-      `SELECT id, slug, COALESCE(published_json, content_json) AS content_json
-         FROM pages
-        WHERE status = 'published' AND ${Number.isFinite(pageId) ? "id = $1" : "slug = $1"}
-        LIMIT 1`,
-      [Number.isFinite(pageId) ? pageId : slug],
-    );
-    const page = rows[0];
-    const form = page ? findForm(page.content_json, formId) : null;
+    let page = null;
+    let form = null;
+    if (formId === BUILTIN_CONTACT.id && slug === "contact") {
+      // the built-in Contact page (not an admin "Pages" page)
+      page = { id: null, slug: "contact" };
+      form = {
+        ...BUILTIN_CONTACT,
+        notify_email: process.env.CONTACT_NOTIFY_EMAIL || "",
+      };
+    } else {
+      const { rows } = await db.query(
+        `SELECT id, slug, COALESCE(published_json, content_json) AS content_json
+           FROM pages
+          WHERE status = 'published' AND ${Number.isFinite(pageId) ? "id = $1" : "slug = $1"}
+          LIMIT 1`,
+        [Number.isFinite(pageId) ? pageId : slug],
+      );
+      page = rows[0] || null;
+      form = page ? findForm(page.content_json, formId) : null;
+    }
     if (!form)
       return res
         .status(404)

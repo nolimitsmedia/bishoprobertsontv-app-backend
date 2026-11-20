@@ -1991,7 +1991,7 @@ const setRepair = (id, patch) =>
     at: Date.now(),
   });
 
-async function repairSourceUrl(row) {
+async function repairSourceUrl(row, { allowStreamOriginal = false } = {}) {
   const key =
     wasabiKeyOf(row) ||
     ((await wasabiCandidatesByDate(row)).length === 1
@@ -2021,8 +2021,21 @@ async function repairSourceUrl(row) {
     if (pick.ok)
       return { url: pick.url, from: "the original Bunny Storage file" };
   }
+  // Bunny Stream keeps the uploaded original when "Keep original files" is on
+  if (
+    allowStreamOriginal &&
+    row.bunny_video_id &&
+    String(row.processing_status || "").toLowerCase() !== "error"
+  ) {
+    const url = `https://${STREAM_CDN_HOST}/${row.bunny_video_id}/original`;
+    const st = await probeDownload(url);
+    if (st === 200 || st === 206)
+      return { url, from: "the Bunny Stream original" };
+  }
   throw new Error(
-    "No original file could be read for this message (Wasabi or Bunny Storage). Convert the file on a computer and use “Choose new file”.",
+    allowStreamOriginal
+      ? "No original file could be read for this message (Wasabi, Bunny Storage, or Bunny Stream’s kept original). Trimming needs the original file."
+      : "No original file could be read for this message (Wasabi or Bunny Storage). Convert the file on a computer and use “Choose new file”.",
   );
 }
 
@@ -2056,7 +2069,9 @@ async function runRepair(id) {
   const os = require("os");
   const path = require("path");
   const fs = require("fs");
-  const { quickRepair } = require("../services/repairVideo");
+  const { quickRepair, trimFile } = require("../services/repairVideo");
+  const job = repairJobs.get(id) || {};
+  const isTrim = job.kind === "trim";
   const tmp = path.join(os.tmpdir(), `brtv-repair-${id}-${Date.now()}.mp4`);
   try {
     const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
@@ -2069,14 +2084,23 @@ async function runRepair(id) {
       progress: 0,
       message: "Reading the original file…",
     });
-    const src = await repairSourceUrl(row);
-    setRepair(id, { message: `Repairing the file from ${src.from}…` });
-    await quickRepair(src.url, tmp, (p) => setRepair(id, { progress: p }));
+    const src = await repairSourceUrl(row, { allowStreamOriginal: isTrim });
+    if (isTrim) {
+      setRepair(id, { message: `Cutting the video from ${src.from}…` });
+      await trimFile(src.url, tmp, job.start, job.end, (p) =>
+        setRepair(id, { progress: p }),
+      );
+    } else {
+      setRepair(id, { message: `Repairing the file from ${src.from}…` });
+      await quickRepair(src.url, tmp, (p) => setRepair(id, { progress: p }));
+    }
 
     setRepair(id, {
       state: "uploading",
       progress: 0,
-      message: "Sending the repaired file to Bunny…",
+      message: isTrim
+        ? "Sending the trimmed video to Bunny…"
+        : "Sending the repaired file to Bunny…",
     });
     const created = await bunnyJson(
       `https://video.bunnycdn.com/library/${LIB_ID}/videos`,
@@ -2107,8 +2131,11 @@ async function runRepair(id) {
             bunny_video_id: guid,
             status: "processing",
             started_at: new Date().toISOString(),
-            source: "repair",
-            filename: "repaired.mp4",
+            source: isTrim ? "trim" : "repair",
+            filename: isTrim ? "trimmed.mp4" : "repaired.mp4",
+            ...(isTrim
+              ? { trim: { start: job.start, end: job.end, from: src.from } }
+              : {}),
           },
         }),
       ],
@@ -2117,12 +2144,15 @@ async function runRepair(id) {
       state: "encoding",
       progress: 0,
       bunny_video_id: guid,
-      message: "Bunny is encoding the repaired file…",
+      message: isTrim
+        ? "Bunny is encoding the trimmed video…"
+        : "Bunny is encoding the repaired file…",
     });
   } catch (e) {
     setRepair(id, {
       state: "error",
-      message: e.message || "The repair failed.",
+      message:
+        e.message || (isTrim ? "The trim failed." : "The repair failed."),
     });
   } finally {
     fs.promises.unlink(tmp).catch(() => {});
@@ -2158,10 +2188,91 @@ router.post(
     if (cur && ["queued", "repairing", "uploading"].includes(cur.state))
       return res.json({ ok: true, ...cur });
     setRepair(id, {
+      kind: "repair",
       state: "queued",
       progress: 0,
       message: repairRunning
         ? "Waiting for another repair to finish…"
+        : "Starting…",
+      bunny_video_id: null,
+    });
+    repairQueue.push(id);
+    pumpRepairs();
+    return res.json({ ok: true, ...repairJobs.get(id) });
+  },
+);
+
+// Trim: keep only start → end (seconds) of the message's original file.
+router.post(
+  "/bunny/stream/trim/:id",
+  authenticate,
+  retryAccess,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id))
+      return res.status(400).json({ ok: false, message: "Invalid video ID" });
+    if (!LIB_ID || !API_KEY)
+      return res
+        .status(500)
+        .json({ ok: false, message: "Bunny Stream env not configured." });
+    const start = Number(req.body?.start);
+    const end = Number(req.body?.end);
+    const q = await db.query(
+      "SELECT id, duration_seconds FROM videos WHERE id = $1",
+      [id],
+    );
+    if (!q.rowCount)
+      return res.status(404).json({ ok: false, message: "Video not found" });
+    const duration = Number(q.rows[0].duration_seconds) || 0;
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start < 0 ||
+      end <= start
+    )
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          message: "Enter a start time and an end time after it.",
+        });
+    if (end - start < 10)
+      return res
+        .status(400)
+        .json({ ok: false, message: "Keep at least 10 seconds of video." });
+    if (duration && end > duration + 1)
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          message: `The end time is after the end of the video (${duration} s).`,
+        });
+    if (start === 0 && duration && end >= duration)
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          message: "Nothing to trim: the times cover the whole video.",
+        });
+    const cur = repairJobs.get(id);
+    if (
+      cur &&
+      ["queued", "repairing", "uploading", "encoding"].includes(cur.state)
+    )
+      return res
+        .status(409)
+        .json({
+          ok: false,
+          message: "This message already has a repair or trim in progress.",
+        });
+    setRepair(id, {
+      kind: "trim",
+      start,
+      end,
+      state: "queued",
+      progress: 0,
+      message: repairRunning
+        ? "Waiting for another job to finish…"
         : "Starting…",
       bunny_video_id: null,
     });
@@ -2180,6 +2291,7 @@ router.get(
     const id = Number(req.params.id);
     const job = repairJobs.get(id);
     if (!job) return res.json({ ok: true, state: "none" });
+    // (shared by "Repair & re-import" and "Trim video": job.kind)
     if (job.state === "encoding") {
       try {
         const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
@@ -2192,12 +2304,18 @@ router.get(
           setRepair(id, {
             state: "done",
             progress: 100,
-            message: "Repaired — the message now plays the repaired file.",
+            message:
+              job.kind === "trim"
+                ? "Trimmed — the message now plays the trimmed video. (Undo: Replace video file › From Wasabi › Re-import.)"
+                : "Repaired — the message now plays the repaired file.",
           });
         else if (r.state === "error")
           setRepair(id, {
             state: "error",
-            message: `Bunny still could not encode the repaired file.${r.reasons?.length ? ` Bunny says: ${r.reasons.join(" · ")}.` : ""} It needs a full conversion: HandBrake (“Fast 1080p30”, MP4), then “Choose new file”.`,
+            message:
+              job.kind === "trim"
+                ? `Bunny could not encode the trimmed video.${r.reasons?.length ? ` Bunny says: ${r.reasons.join(" · ")}.` : ""} The message still plays its full video.`
+                : `Bunny still could not encode the repaired file.${r.reasons?.length ? ` Bunny says: ${r.reasons.join(" · ")}.` : ""} It needs a full conversion: HandBrake (“Fast 1080p30”, MP4), then “Choose new file”.`,
           });
         else if (r.state === "processing" || r.state === "uploading")
           setRepair(id, { progress: Number(r.progress) || 0 });
