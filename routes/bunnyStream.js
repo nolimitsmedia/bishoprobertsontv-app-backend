@@ -2069,10 +2069,18 @@ async function runRepair(id) {
   const os = require("os");
   const path = require("path");
   const fs = require("fs");
-  const { quickRepair, trimFile } = require("../services/repairVideo");
+  const {
+    quickRepair,
+    trimFile,
+    downloadToFile,
+  } = require("../services/repairVideo");
   const job = repairJobs.get(id) || {};
   const isTrim = job.kind === "trim";
   const tmp = path.join(os.tmpdir(), `brtv-repair-${id}-${Date.now()}.mp4`);
+  const tmpIn = path.join(
+    os.tmpdir(),
+    `brtv-repair-${id}-${Date.now()}-original`,
+  );
   try {
     const q = await db.query("SELECT * FROM videos WHERE id = $1 LIMIT 1", [
       id,
@@ -2085,14 +2093,22 @@ async function runRepair(id) {
       message: "Reading the original file…",
     });
     const src = await repairSourceUrl(row, { allowStreamOriginal: isTrim });
+    // download first: ffmpeg only reads local files (see services/repairVideo.js)
+    setRepair(id, {
+      state: "downloading",
+      progress: 0,
+      message: `Downloading the original file from ${src.from}…`,
+    });
+    await downloadToFile(src.url, tmpIn, (p) => setRepair(id, { progress: p }));
+    setRepair(id, { state: "repairing", progress: 0 });
     if (isTrim) {
-      setRepair(id, { message: `Cutting the video from ${src.from}…` });
-      await trimFile(src.url, tmp, job.start, job.end, (p) =>
+      setRepair(id, { message: `Cutting the video…` });
+      await trimFile(tmpIn, tmp, job.start, job.end, (p) =>
         setRepair(id, { progress: p }),
       );
     } else {
-      setRepair(id, { message: `Repairing the file from ${src.from}…` });
-      await quickRepair(src.url, tmp, (p) => setRepair(id, { progress: p }));
+      setRepair(id, { message: `Repairing the file…` });
+      await quickRepair(tmpIn, tmp, (p) => setRepair(id, { progress: p }));
     }
 
     setRepair(id, {
@@ -2156,6 +2172,7 @@ async function runRepair(id) {
     });
   } finally {
     fs.promises.unlink(tmp).catch(() => {});
+    fs.promises.unlink(tmpIn).catch(() => {});
   }
 }
 
@@ -2185,7 +2202,10 @@ router.post(
         .status(500)
         .json({ ok: false, message: "Bunny Stream env not configured." });
     const cur = repairJobs.get(id);
-    if (cur && ["queued", "repairing", "uploading"].includes(cur.state))
+    if (
+      cur &&
+      ["queued", "downloading", "repairing", "uploading"].includes(cur.state)
+    )
       return res.json({ ok: true, ...cur });
     setRepair(id, {
       kind: "repair",
@@ -2257,7 +2277,9 @@ router.post(
     const cur = repairJobs.get(id);
     if (
       cur &&
-      ["queued", "repairing", "uploading", "encoding"].includes(cur.state)
+      ["queued", "downloading", "repairing", "uploading", "encoding"].includes(
+        cur.state,
+      )
     )
       return res
         .status(409)

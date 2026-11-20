@@ -21,6 +21,12 @@ const toSeconds = (hms) => {
   return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
 };
 
+function stoppedMessage(signal) {
+  if (signal === "SIGKILL")
+    return "The server stopped the video tool (SIGKILL) — usually because it ran out of memory. Try again when the site is quiet.";
+  return `The video tool crashed (${signal || "no exit code"}). The file may be damaged, or the server’s video tool cannot handle it — convert the file on a computer (HandBrake, “Fast 1080p30”, MP4) and use “Choose new file”.`;
+}
+
 // onProgress(percent 0–100)
 function quickRepair(inputUrl, outFile, onProgress = () => {}) {
   const args = [
@@ -102,12 +108,7 @@ function quickRepair(inputUrl, outFile, onProgress = () => {}) {
     );
     p.on("close", (code, signal) => {
       if (signal || code === null) {
-        reject(
-          new Error(
-            `The repair was stopped by the server (${signal || "killed"}) — usually because the server ran out of memory. ` +
-              "Try again when the site is quiet, or convert the file on a computer (HandBrake, “Fast 1080p30”, MP4) and use “Choose new file”.",
-          ),
-        );
+        reject(new Error(stoppedMessage(signal)));
         return;
       }
       if (code === 0) {
@@ -217,11 +218,7 @@ function runFfmpeg(args, totalSeconds, onProgress, verb) {
     );
     p.on("close", (code, signal) => {
       if (signal || code === null) {
-        reject(
-          new Error(
-            `The server stopped the video tool (${signal || "killed"}) — usually because it ran out of memory. Try again when the site is quiet.`,
-          ),
-        );
+        reject(new Error(stoppedMessage(signal)));
         return;
       }
       if (code === 0) {
@@ -245,4 +242,40 @@ function runFfmpeg(args, totalSeconds, onProgress, verb) {
   });
 }
 
-module.exports = { quickRepair, trimFile, ffmpegPath };
+// Download a (signed) web address to a local file first: the static ffmpeg
+// build used on Render can crash (SIGSEGV) when it opens web addresses itself
+// (name lookups in static builds), so ffmpeg only ever reads local files.
+async function downloadToFile(url, filePath, onProgress = () => {}) {
+  const fs = require("fs");
+  const fetch = require("node-fetch");
+  const r = await fetch(url, { timeout: 0 });
+  if (!r.ok)
+    throw new Error(`The original file could not be downloaded (${r.status}).`);
+  const total = Number(r.headers.get("content-length")) || 0;
+  let got = 0;
+  await new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(filePath);
+    r.body.on("data", (chunk) => {
+      got += chunk.length;
+      if (total) onProgress(Math.min(99, Math.round((got / total) * 100)));
+    });
+    r.body.on("error", reject);
+    out.on("error", (e) =>
+      reject(
+        e.code === "ENOSPC"
+          ? new Error("The server ran out of disk space for this file.")
+          : e,
+      ),
+    );
+    out.on("finish", resolve);
+    r.body.pipe(out);
+  });
+  if (total && got < total)
+    throw new Error(
+      "The download of the original file was cut off. Try again.",
+    );
+  onProgress(100);
+  return got;
+}
+
+module.exports = { quickRepair, trimFile, downloadToFile, ffmpegPath };

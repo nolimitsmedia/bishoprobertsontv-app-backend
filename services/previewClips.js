@@ -80,7 +80,27 @@ function ffmpegPath() {
   }
 }
 
-function cutClip(srcUrl, seconds, outPath) {
+// ffmpeg only reads LOCAL files: the static ffmpeg build used on Render can
+// crash (SIGSEGV) when it opens web addresses itself, so the source is
+// downloaded first (services/repairVideo.js › downloadToFile), then deleted.
+async function cutClip(srcUrl, seconds, outPath) {
+  if (!/^https?:\/\//i.test(String(srcUrl)))
+    return cutClipDirect(srcUrl, seconds, outPath);
+  const os = require("os");
+  const path = require("path");
+  const tmpIn = path.join(
+    os.tmpdir(),
+    `brtv-clip-src-${process.pid}-${Date.now()}`,
+  );
+  try {
+    await require("./repairVideo").downloadToFile(srcUrl, tmpIn);
+    return await cutClipDirect(tmpIn, seconds, outPath);
+  } finally {
+    fs.promises.unlink(tmpIn).catch(() => {});
+  }
+}
+
+function cutClipDirect(srcUrl, seconds, outPath) {
   return new Promise((resolve, reject) => {
     const args = [
       "-hide_banner",
@@ -117,7 +137,7 @@ function cutClip(srcUrl, seconds, outPath) {
       clearTimeout(timer);
       reject(new Error(`Video tool could not start: ${e.message}`));
     });
-    p.on("close", (code) => {
+    p.on("close", (code, signal) => {
       clearTimeout(timer);
       if (
         code === 0 &&
@@ -125,6 +145,12 @@ function cutClip(srcUrl, seconds, outPath) {
         fs.statSync(outPath).size > 1024
       )
         resolve();
+      else if (signal)
+        reject(
+          new Error(
+            `Cutting failed: the video tool ${signal === "SIGKILL" ? "was stopped" : "crashed"} (${signal})`,
+          ),
+        );
       else
         reject(
           new Error(
