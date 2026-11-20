@@ -2071,6 +2071,7 @@ async function runRepair(id) {
   const fs = require("fs");
   const {
     quickRepair,
+    fullConvert,
     trimFile,
     downloadToFile,
   } = require("../services/repairVideo");
@@ -2106,9 +2107,35 @@ async function runRepair(id) {
       await trimFile(tmpIn, tmp, job.start, job.end, (p) =>
         setRepair(id, { progress: p }),
       );
+    } else if (job.mode === "full") {
+      setRepair(id, {
+        message: "Converting the file (full conversion — slow)…",
+      });
+      await fullConvert(tmpIn, tmp, (p) => setRepair(id, { progress: p }));
     } else {
-      setRepair(id, { message: `Repairing the file…` });
-      await quickRepair(tmpIn, tmp, (p) => setRepair(id, { progress: p }));
+      setRepair(id, { message: "Repairing the file…" });
+      try {
+        await quickRepair(tmpIn, tmp, (p) => setRepair(id, { progress: p }));
+      } catch (first) {
+        if (first.crashed) throw first;
+        // second attempt: rebuild the timing from scratch
+        setRepair(id, {
+          progress: 0,
+          message: "Repairing the file (second attempt)…",
+        });
+        try {
+          await quickRepair(tmpIn, tmp, (p) => setRepair(id, { progress: p }), {
+            attempt: 2,
+          });
+        } catch (second) {
+          if (second.crashed) throw second;
+          const e = new Error(
+            `${second.message} Quick repair cannot fix this file — use “Full conversion” (slow), which re-encodes the picture too.`,
+          );
+          e.suggestFull = true;
+          throw e;
+        }
+      }
     }
 
     setRepair(id, {
@@ -2167,6 +2194,8 @@ async function runRepair(id) {
   } catch (e) {
     setRepair(id, {
       state: "error",
+      suggestFull:
+        !!e.suggestFull || (!isTrim && job.mode !== "full" && !e.crashed),
       message:
         e.message || (isTrim ? "The trim failed." : "The repair failed."),
     });
@@ -2207,12 +2236,15 @@ router.post(
       ["queued", "downloading", "repairing", "uploading"].includes(cur.state)
     )
       return res.json({ ok: true, ...cur });
+    const mode = req.body?.mode === "full" ? "full" : "quick";
     setRepair(id, {
       kind: "repair",
+      mode,
+      suggestFull: false,
       state: "queued",
       progress: 0,
       message: repairRunning
-        ? "Waiting for another repair to finish…"
+        ? "Waiting for another job to finish…"
         : "Starting…",
       bunny_video_id: null,
     });
@@ -2329,7 +2361,9 @@ router.get(
             message:
               job.kind === "trim"
                 ? "Trimmed — the message now plays the trimmed video. (Undo: Replace video file › From Wasabi › Re-import.)"
-                : "Repaired — the message now plays the repaired file.",
+                : job.mode === "full"
+                  ? "Converted — the message now plays the converted file."
+                  : "Repaired — the message now plays the repaired file.",
           });
         else if (r.state === "error")
           setRepair(id, {
