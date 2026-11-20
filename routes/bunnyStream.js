@@ -1316,6 +1316,25 @@ async function deleteBunnyVideoQuietly(guid) {
   }
 }
 
+// Bunny's own explanation of a failed encode (video.transcodingMessages:
+// level 2 = warning, 3 = error), e.g. "unsupported codec".
+function bunnyReasons(bv) {
+  const list = Array.isArray(bv?.transcodingMessages)
+    ? bv.transcodingMessages
+    : [];
+  const out = list
+    .filter(
+      (m) =>
+        Number(m?.level) >= 2 ||
+        /error|fail|unsupported|invalid|corrupt|unable/i.test(
+          String(m?.message || ""),
+        ),
+    )
+    .map((m) => [m?.message, m?.value].filter(Boolean).join(": ").trim())
+    .filter(Boolean);
+  return [...new Set(out)].slice(0, 3);
+}
+
 // Check a pending replacement; switch the message over when Bunny is ready.
 async function checkReplacement(row) {
   const md = metaOf(row);
@@ -1353,14 +1372,19 @@ async function checkReplacement(row) {
           replace_pending: {
             ...pending,
             status: "error",
-            error: `Bunny could not encode the new file (status ${bv.status}).`,
+            error: `Bunny could not encode the new file (status ${bv.status}).${bunnyReasons(bv).length ? ` Bunny says: ${bunnyReasons(bv).join(" · ")}` : ""}`,
           },
         }),
       ],
     );
+    const why = bunnyReasons(bv);
     return {
       state: "error",
-      message: `Bunny could not encode the new file (status ${bv.status}). The message still uses its old file. Try another file.`,
+      reasons: why,
+      message:
+        `Bunny could not encode the new file (status ${bv.status}).` +
+        (why.length ? ` Bunny says: ${why.join(" · ")}.` : "") +
+        ` The message still uses its old file. Converting the file (e.g. HandBrake, “Fast 1080p30”, MP4) and uploading it usually fixes this.`,
     };
   }
   if (st !== "ready") {
@@ -1901,10 +1925,40 @@ router.get(
         /* no Wasabi file list yet */
       }
       for (const k of await wasabiCandidatesByDate(row)) wasabi.add(k);
+      // why Bunny could not encode the message's current copy (and the last replacement)
+      const bunny_errors = [];
+      const st = String(row.processing_status || "").toLowerCase();
+      const ids = [];
+      if ((st === "error" || st === "failed") && row.bunny_video_id)
+        ids.push(["Current copy", row.bunny_video_id]);
+      if (
+        md.replace_pending?.bunny_video_id &&
+        md.replace_pending.status === "error"
+      )
+        ids.push(["Last replacement", md.replace_pending.bunny_video_id]);
+      for (const [label, guid] of ids) {
+        try {
+          const bv = await getBunnyVideoById(guid);
+          if (!bv)
+            bunny_errors.push({
+              label,
+              reasons: ["No longer in the Bunny library."],
+            });
+          else
+            bunny_errors.push({
+              label,
+              status: bv.status,
+              reasons: bunnyReasons(bv),
+            });
+        } catch {
+          /* Bunny unreachable: skip */
+        }
+      }
       return res.json({
         ok: true,
         files: found,
         wasabi_matches: [...wasabi].slice(0, 10),
+        bunny_errors,
       });
     } catch (err) {
       return res
