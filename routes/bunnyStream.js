@@ -1417,7 +1417,48 @@ async function checkReplacement(row) {
     previous_bunny_video_id: oldGuid || null,
     previous_video_url: row.video_url || null,
     filename: pending.filename || null,
+    // where the video now playing came from: upload | wasabi | cloud | repair | trim | migration
+    source: pending.source || "upload",
+    ...(pending.trim ? { trim: pending.trim } : {}),
   };
+  // Trims are always cut from the full recording: remember the current trim
+  // and the full length, so later trims use the same (full) timeline.
+  if (pending.source === "trim" && pending.trim) {
+    const full =
+      Number(md.trim_state?.full_duration) ||
+      Number(row.duration_seconds) ||
+      null;
+    const isRestore = pending.trim.restore === true;
+    if (isRestore) delete nextMeta.trim_state;
+    else
+      nextMeta.trim_state = {
+        start: pending.trim.start,
+        end: pending.trim.end,
+        full_duration: full,
+        at: new Date().toISOString(),
+      };
+  } else {
+    delete nextMeta.trim_state; // a new file: no trim any more
+  }
+  // A trim cut from Bunny's kept original: keep the FULL-length Bunny video
+  // (not shown on the site) so the message can be trimmed again or restored.
+  const trimmedFromBunny =
+    pending.source === "trim" &&
+    /bunny stream original|full-length/i.test(String(pending.trim?.from || ""));
+  let keepOld = false;
+  if (trimmedFromBunny) {
+    if (!md.full_original?.bunny_video_id && oldGuid) {
+      nextMeta.full_original = {
+        bunny_video_id: oldGuid,
+        kept_at: new Date().toISOString(),
+      };
+      keepOld = true;
+    }
+  } else if (md.full_original?.bunny_video_id && pending.source !== "trim") {
+    // a brand-new file replaces the message: the kept full-length copy is no longer needed
+    delete nextMeta.full_original;
+    await deleteBunnyVideoQuietly(md.full_original.bunny_video_id);
+  }
   // keep a custom thumbnail; drop one that pointed at the old Bunny copy
   const thumb =
     row.thumbnail_url && oldGuid && String(row.thumbnail_url).includes(oldGuid)
@@ -1450,7 +1491,13 @@ async function checkReplacement(row) {
       JSON.stringify(nextMeta),
     ],
   );
-  if (oldGuid && oldGuid !== guid) await deleteBunnyVideoQuietly(oldGuid);
+  if (
+    oldGuid &&
+    oldGuid !== guid &&
+    !keepOld &&
+    oldGuid !== md.full_original?.bunny_video_id
+  )
+    await deleteBunnyVideoQuietly(oldGuid);
   return { state: "done", video: rows[0] };
 }
 
@@ -1959,6 +2006,7 @@ router.get(
         files: found,
         wasabi_matches: [...wasabi].slice(0, 10),
         bunny_errors,
+        trim: md.trim_state || null,
       });
     } catch (err) {
       return res
@@ -1992,6 +2040,31 @@ const setRepair = (id, patch) =>
   });
 
 async function repairSourceUrl(row, { allowStreamOriginal = false } = {}) {
+  // For a trim: if the video now playing did not come from the Wasabi file
+  // (an upload, a repair, a Cloud Storage import, or an earlier trim cut from
+  // Bunny), the Wasabi file is out of date — use Bunny's kept original instead.
+  if (allowStreamOriginal) {
+    const mdx = metaOf(row);
+    const src = String(mdx.file_replaced?.source || "");
+    const fromBunny =
+      mdx.full_original?.bunny_video_id ||
+      (src && !["wasabi", "trim", "migration"].includes(src));
+    if (fromBunny) {
+      for (const [guid, label] of [
+        [mdx.full_original?.bunny_video_id, "the full-length Bunny copy"],
+        [row.bunny_video_id, "the Bunny Stream original"],
+      ]) {
+        if (!guid) continue;
+        const url = `https://${STREAM_CDN_HOST}/${guid}/original`;
+        const st = await probeDownload(url);
+        if (st === 200 || st === 206) return { url, from: label };
+      }
+      throw new Error(
+        "This message’s current video was uploaded or replaced outside Wasabi, and Bunny does not keep its original file. " +
+          "Turn on “Keep original files” in the Bunny Stream library (Encoding settings) for new uploads, or upload the full video again with “Choose new file”.",
+      );
+    }
+  }
   const key =
     wasabiKeyOf(row) ||
     ((await wasabiCandidatesByDate(row)).length === 1
@@ -2177,7 +2250,14 @@ async function runRepair(id) {
             source: isTrim ? "trim" : "repair",
             filename: isTrim ? "trimmed.mp4" : "repaired.mp4",
             ...(isTrim
-              ? { trim: { start: job.start, end: job.end, from: src.from } }
+              ? {
+                  trim: {
+                    start: job.start,
+                    end: job.end,
+                    from: src.from,
+                    ...(job.restore ? { restore: true } : {}),
+                  },
+                }
               : {}),
           },
         }),
@@ -2267,15 +2347,29 @@ router.post(
       return res
         .status(500)
         .json({ ok: false, message: "Bunny Stream env not configured." });
-    const start = Number(req.body?.start);
-    const end = Number(req.body?.end);
+    let start = Number(req.body?.start);
+    let end = Number(req.body?.end);
     const q = await db.query(
-      "SELECT id, duration_seconds FROM videos WHERE id = $1",
+      "SELECT id, duration_seconds, metadata FROM videos WHERE id = $1",
       [id],
     );
     if (!q.rowCount)
       return res.status(404).json({ ok: false, message: "Video not found" });
-    const duration = Number(q.rows[0].duration_seconds) || 0;
+    const trimState = metaOf(q.rows[0]).trim_state || null;
+    // times are on the FULL recording (a trimmed message is always cut from it)
+    const duration =
+      Number(trimState?.full_duration) ||
+      Number(q.rows[0].duration_seconds) ||
+      0;
+    const restore = req.body?.restore === true;
+    if (restore) {
+      if (!trimState)
+        return res
+          .status(400)
+          .json({ ok: false, message: "This message is not trimmed." });
+      start = 0;
+      end = duration || 24 * 3600;
+    }
     if (
       !Number.isFinite(start) ||
       !Number.isFinite(end) ||
@@ -2299,12 +2393,14 @@ router.post(
           ok: false,
           message: `The end time is after the end of the video (${duration} s).`,
         });
-    if (start === 0 && duration && end >= duration)
+    if (!restore && start === 0 && duration && end >= duration)
       return res
         .status(400)
         .json({
           ok: false,
-          message: "Nothing to trim: the times cover the whole video.",
+          message: trimState
+            ? "To bring back the whole video, use “Restore full video”."
+            : "Nothing to trim: the times cover the whole video.",
         });
     const cur = repairJobs.get(id);
     if (
@@ -2323,6 +2419,7 @@ router.post(
       kind: "trim",
       start,
       end,
+      restore,
       state: "queued",
       progress: 0,
       message: repairRunning
@@ -2360,7 +2457,9 @@ router.get(
             progress: 100,
             message:
               job.kind === "trim"
-                ? "Trimmed — the message now plays the trimmed video. (Undo: Replace video file › From Wasabi › Re-import.)"
+                ? job.restore
+                  ? "Restored — the message plays the full video again."
+                  : "Trimmed — the message now plays the trimmed video. Change the times and trim again, or use “Restore full video”."
                 : job.mode === "full"
                   ? "Converted — the message now plays the converted file."
                   : "Repaired — the message now plays the repaired file.",
