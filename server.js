@@ -327,6 +327,17 @@ app.use("/api/channels", channelsRouter);
 
 app.use("/api/pages", require("./routes/pagesPublic"));
 app.use("/api/admin/pages", require("./routes/adminPages"));
+// once: Contact, Terms and Privacy become editable pages in Admin › Pages
+require("./routes/adminPages")
+  .seedBuiltinPages()
+  .then(
+    (r) =>
+      r?.added?.length &&
+      console.log("[pages] added editable pages:", r.added.join(", ")),
+  )
+  .catch((e) =>
+    console.warn("[pages] could not add the built-in pages:", e.message),
+  );
 // Phase 7-2: publish scheduled pages: shortly after start-up, then every minute.
 {
   const { runDueSchedules } = require("./routes/adminPages");

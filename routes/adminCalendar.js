@@ -20,6 +20,7 @@ const router = express.Router();
  *   POST   /api/admin/calendar/series
  *   PUT    /api/admin/calendar/series/:id
  *   DELETE /api/admin/calendar/series/:id
+ *   POST   /api/admin/calendar/series/:id/end        (this and all future dates)
  *   POST   /api/admin/calendar/series/:id/exceptions
  */
 
@@ -640,39 +641,117 @@ router.put("/series/:id", async (req, res) => {
    DELETE /api/admin/calendar/series/:id
 ========================================================== */
 router.delete("/series/:id", async (req, res) => {
-  const db = req.db;
   const id = Number(req.params.id);
-
   if (!Number.isFinite(id)) {
     return res.status(400).json({ ok: false, message: "Invalid series id." });
   }
-
+  // one connection for the whole transaction (BEGIN / COMMIT through the pool
+  // could run on different connections and leave one stuck in a transaction)
+  const client =
+    typeof req.db.connect === "function" ? await req.db.connect() : req.db;
   try {
-    await db.query("BEGIN");
-
-    // delete exceptions first (unless you have ON DELETE CASCADE)
-    await db.query(
+    await client.query("BEGIN");
+    await client.query(
       `DELETE FROM calendar_series_exceptions WHERE series_id = $1`,
       [id],
     );
-
-    const r = await db.query(
+    const r = await client.query(
       `DELETE FROM calendar_series WHERE id = $1 RETURNING id`,
       [id],
     );
     if (r.rowCount === 0) {
-      await db.query("ROLLBACK");
+      await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, message: "Series not found." });
     }
-
-    await db.query("COMMIT");
+    await client.query("COMMIT");
     return res.json({ ok: true });
   } catch (e) {
     try {
-      await db.query("ROLLBACK");
+      await client.query("ROLLBACK");
     } catch {}
     console.error("[adminCalendar] DELETE /series/:id error:", e);
-    return res.status(500).json({ ok: false, message: "Server error" });
+    return res
+      .status(500)
+      .json({
+        ok: false,
+        message: `Could not delete the series: ${e.detail || e.message || "database error"}`,
+      });
+  } finally {
+    client.release?.();
+  }
+});
+
+/* =======================================================
+   POST /api/admin/calendar/series/:id/end   { date: 'YYYY-MM-DD' }
+   "This and all future dates": the series ends the day before `date`; earlier
+   dates stay in the calendar. Ending at or before its first date deletes it.
+========================================================== */
+router.post("/series/:id/end", async (req, res) => {
+  const id = Number(req.params.id);
+  const date = String(req.body?.date || "").slice(0, 10);
+  if (!Number.isFinite(id) || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res
+      .status(400)
+      .json({ ok: false, message: "Invalid series or date." });
+  }
+  const client =
+    typeof req.db.connect === "function" ? await req.db.connect() : req.db;
+  try {
+    await client.query("BEGIN");
+    const q = await client.query(
+      `SELECT id, start_at, recurrence_json FROM calendar_series WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (!q.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, message: "Series not found." });
+    }
+    const row = q.rows[0];
+    const firstDay = new Date(row.start_at).toISOString().slice(0, 10);
+    if (date <= firstDay) {
+      await client.query(
+        `DELETE FROM calendar_series_exceptions WHERE series_id = $1`,
+        [id],
+      );
+      await client.query(`DELETE FROM calendar_series WHERE id = $1`, [id]);
+      await client.query("COMMIT");
+      return res.json({ ok: true, deleted: true });
+    }
+    const dayBefore = new Date(`${date}T00:00:00.000Z`);
+    dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
+    const until = `${dayBefore.toISOString().slice(0, 10)}T23:59:59.999Z`;
+    let rec = row.recurrence_json || {};
+    if (typeof rec === "string") {
+      try {
+        rec = JSON.parse(rec);
+      } catch {
+        rec = {};
+      }
+    }
+    const nextRec = { ...rec, until };
+    await client.query(
+      `UPDATE calendar_series SET recurrence_json = $2::jsonb WHERE id = $1`,
+      [id, JSON.stringify(nextRec)],
+    );
+    await client.query(
+      `DELETE FROM calendar_series_exceptions WHERE series_id = $1 AND date >= $2::date`,
+      [id, date],
+    );
+    await client.query("COMMIT");
+    return res.json({ ok: true, until });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("[adminCalendar] POST /series/:id/end error:", e);
+    return res
+      .status(500)
+      .json({
+        ok: false,
+        message: `Could not end the series: ${e.detail || e.message || "database error"}`,
+      });
+  } finally {
+    client.release?.();
   }
 });
 

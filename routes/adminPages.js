@@ -161,6 +161,52 @@ router.get("/", async (req, res) => {
 });
 
 // Create page
+// Insert a new page with `seed` as its draft content (not published).
+async function insertDraftPage(s, { title, slug, seed }) {
+  // Build INSERT columns based on schema
+  const cols = ["title", "slug"];
+  const vals = ["$1", "$2"];
+  const params = [title, slug];
+
+  if (s.draftJsonCol) {
+    cols.push(s.draftJsonCol);
+    params.push(JSON.stringify(seed));
+    vals.push(`$${params.length}::jsonb`);
+  }
+  if (s.draftHtmlCol) {
+    cols.push(s.draftHtmlCol);
+    vals.push(`''`);
+  }
+
+  if (s.statusCol) {
+    cols.push("status");
+    vals.push(`'draft'`);
+  }
+
+  if (s.htmlCol && s.htmlCol !== s.draftHtmlCol) {
+    cols.push(s.htmlCol);
+    vals.push(`''`);
+  }
+
+  if (s.updatedAtCol) {
+    cols.push("updated_at");
+    vals.push(nowSql());
+  }
+
+  const sql = `
+      INSERT INTO pages (${cols.join(", ")})
+      VALUES (${vals.join(", ")})
+      RETURNING
+        id, title, slug,
+        ${defaultStatusExpr(s)} AS status,
+        ${updatedAtSelectExpr(s)},
+        ${publishedSelectExpr(s)}
+    `;
+
+  const { rows } = await db.query(sql, params);
+  return rows[0];
+}
+
 router.post("/", async (req, res) => {
   try {
     const s = await getPagesSchema();
@@ -175,11 +221,6 @@ router.post("/", async (req, res) => {
     if (!slug)
       return res.status(400).json({ ok: false, error: "Slug is required" });
 
-    // Build INSERT columns based on schema
-    const cols = ["title", "slug"];
-    const vals = ["$1", "$2"];
-    const params = [title, slug];
-
     // Initialize the page builder draft without publishing it.
     const seed =
       req.body.content_json &&
@@ -187,43 +228,8 @@ router.post("/", async (req, res) => {
       !Array.isArray(req.body.content_json)
         ? req.body.content_json
         : { extra_sections: [] };
-    if (s.draftJsonCol) {
-      cols.push(s.draftJsonCol);
-      params.push(JSON.stringify(seed));
-      vals.push(`$${params.length}::jsonb`);
-    }
-    if (s.draftHtmlCol) {
-      cols.push(s.draftHtmlCol);
-      vals.push(`''`);
-    }
-
-    if (s.statusCol) {
-      cols.push("status");
-      vals.push(`'draft'`);
-    }
-
-    if (s.htmlCol && s.htmlCol !== s.draftHtmlCol) {
-      cols.push(s.htmlCol);
-      vals.push(`''`);
-    }
-
-    if (s.updatedAtCol) {
-      cols.push("updated_at");
-      vals.push(nowSql());
-    }
-
-    const sql = `
-      INSERT INTO pages (${cols.join(", ")})
-      VALUES (${vals.join(", ")})
-      RETURNING
-        id, title, slug,
-        ${defaultStatusExpr(s)} AS status,
-        ${updatedAtSelectExpr(s)},
-        ${publishedSelectExpr(s)}
-    `;
-
-    const { rows } = await db.query(sql, params);
-    res.json({ ok: true, page: rows[0] });
+    const page = await insertDraftPage(s, { title, slug, seed });
+    res.json({ ok: true, page });
   } catch (e) {
     if (String(e?.code) === "23505") {
       return res.status(409).json({ ok: false, error: "Slug already exists" });
@@ -932,6 +938,51 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
+/* -----------------------------
+   Contact, Terms and Privacy as editable pages (once)
+----------------------------- */
+// Adds the three pages (published) the first time the server starts with this
+// code, so they appear in Admin › Pages and can be edited visually. A page is
+// skipped if its address is already used; the step never runs again (a page
+// the admin deletes later is not recreated — the site then shows its built-in
+// version).
+async function seedBuiltinPages() {
+  const MARK = "builtin_pages_seeded_v1";
+  await db.query(`CREATE TABLE IF NOT EXISTS site_design_settings (
+    setting_key text PRIMARY KEY, draft_json jsonb, published_json jsonb, updated_at timestamptz DEFAULT now())`);
+  const done = await db.query(
+    "SELECT 1 FROM site_design_settings WHERE setting_key = $1",
+    [MARK],
+  );
+  if (done.rowCount) return { skipped: "already done" };
+  const s = await getPagesSchema();
+  if (!canPublishSafely(s))
+    return { skipped: "pages table has no draft/published columns" };
+  const { BUILTIN_PAGES } = require("../lib/builtinPages");
+  const added = [];
+  for (const p of BUILTIN_PAGES) {
+    const exists = await db.query(
+      "SELECT 1 FROM pages WHERE slug = $1 LIMIT 1",
+      [p.slug],
+    );
+    if (exists.rowCount) continue;
+    const row = await insertDraftPage(s, {
+      title: p.title,
+      slug: p.slug,
+      seed: p.content(),
+    });
+    await publishPageById(s, row.id, null);
+    added.push(p.slug);
+  }
+  await db.query(
+    `INSERT INTO site_design_settings (setting_key, published_json, updated_at) VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (setting_key) DO NOTHING`,
+    [MARK, JSON.stringify({ added, at: new Date().toISOString() })],
+  );
+  return { added };
+}
+
 module.exports = router;
 // Phase 7-2: used by server.js (timer) and pagesPublic.js (visitor check).
 module.exports.runDueSchedules = runDueSchedules;
+module.exports.seedBuiltinPages = seedBuiltinPages;
