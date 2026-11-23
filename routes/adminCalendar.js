@@ -1,6 +1,7 @@
 // server-api/routes/adminCalendar.js
 const express = require("express");
 const recurrence = require("../lib/calendarRecurrence");
+const { dateKey } = require("../lib/dateKey");
 const router = express.Router();
 
 /**
@@ -298,7 +299,9 @@ router.get("/events", async (req, res) => {
 
     const excBySeriesDate = new Map();
     for (const ex of excRows) {
-      const key = `${ex.series_id}::${ex.date}`;
+      // ex.date is a Date object from PostgreSQL: use its calendar day, or the
+      // key never matches and skipped / changed dates are ignored
+      const key = `${ex.series_id}::${dateKey(ex.date)}`;
       excBySeriesDate.set(key, ex);
     }
 
