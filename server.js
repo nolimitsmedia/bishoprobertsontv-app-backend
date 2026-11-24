@@ -286,6 +286,8 @@ if (String(process.env.USE_BUNNY_STORAGE || "").toLowerCase() === "true") {
 
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/collections", attachTeamAccess, collectionsRoutes);
+// Series / program pages (admin collections shown as a series)
+app.use("/api/series", attachTeamAccess, require("./routes/series"));
 
 app.use("/api/live", attachTeamAccess, liveRoutes);
 app.use("/api/streamcontrol", streamcontrolRoutes); // keep clean single mount
@@ -327,17 +329,28 @@ app.use("/api/channels", channelsRouter);
 
 app.use("/api/pages", require("./routes/pagesPublic"));
 app.use("/api/admin/pages", require("./routes/adminPages"));
-// once: Contact, Terms and Privacy become editable pages in Admin › Pages
-require("./routes/adminPages")
-  .seedBuiltinPages()
-  .then(
-    (r) =>
-      r?.added?.length &&
-      console.log("[pages] added editable pages:", r.added.join(", ")),
-  )
-  .catch((e) =>
-    console.warn("[pages] could not add the built-in pages:", e.message),
-  );
+// once: Contact, Terms and Privacy become editable pages in Admin › Pages.
+// Never stops the server: a missing / older routes/adminPages.js only warns.
+try {
+  const { seedBuiltinPages } = require("./routes/adminPages");
+  if (typeof seedBuiltinPages === "function") {
+    seedBuiltinPages()
+      .then(
+        (r) =>
+          r?.added?.length &&
+          console.log("[pages] added editable pages:", r.added.join(", ")),
+      )
+      .catch((e) =>
+        console.warn("[pages] could not add the built-in pages:", e.message),
+      );
+  } else {
+    console.warn(
+      "[pages] routes/adminPages.js is an older copy — copy the new one to add Contact / Terms / Privacy to Pages.",
+    );
+  }
+} catch (e) {
+  console.warn("[pages] could not add the built-in pages:", e.message);
+}
 // Phase 7-2: publish scheduled pages: shortly after start-up, then every minute.
 {
   const { runDueSchedules } = require("./routes/adminPages");
