@@ -21,7 +21,8 @@ router.post(
       } else {
         result = await sendEmail({
           to,
-          subject: subject || "Test Email from Bishop Robertson App",
+          subject:
+            subject || `Test email from ${process.env.SITE_NAME || "the site"}`,
           text: text || "This is a test email sent via Mailgun.",
           html:
             html ||
@@ -42,7 +43,7 @@ router.post(
         error: err.message || "Email send failed",
       });
     }
-  }
+  },
 );
 
 module.exports = router;

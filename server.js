@@ -1,5 +1,24 @@
 // server-api/server.js
 require("dotenv").config();
+
+// Every ministry's server needs its own JWT_SECRET: some code falls back to a
+// well-known development value without it, which would let anyone forge a
+// sign-in. Refuse to start in production rather than run unsafely.
+{
+  const secret = process.env.JWT_SECRET || "";
+  const production =
+    process.env.NODE_ENV === "production" || !!process.env.RENDER;
+  if (!secret && production) {
+    console.error(
+      "[boot] JWT_SECRET is not set. Add a long random value in the server's environment settings (e.g. node -e \"console.log(require('crypto').randomBytes(48).toString('hex'))\") and restart.",
+    );
+    process.exit(1);
+  }
+  if (secret && secret.length < 32)
+    console.warn(
+      "[boot] JWT_SECRET is short; use at least 32 random characters.",
+    );
+}
 console.log("[boot] server.js path:", __filename);
 const express = require("express");
 const cors = require("cors");
@@ -457,7 +476,7 @@ app.use("/api/public/collections", (req, res, next) => {
 /* --------------------------------------------------------
    HEALTH
 --------------------------------------------------------- */
-app.get("/", (_req, res) => res.send("Bishop Robertson API Running"));
+app.get("/", (_req, res) => res.send("API running"));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 /* --------------------------------------------------------

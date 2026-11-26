@@ -13,7 +13,7 @@ function defaultSettings() {
       custom_theme: false,
       logo_url: null,
       favicon_url: null,
-      name: "BishopTV",
+      name: process.env.SITE_NAME || "Our Ministry",
     },
     navigation: {
       menu: [
@@ -53,10 +53,10 @@ async function ensureTables() {
     );
   `);
   await db.query(
-    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS favicon_url TEXT;`
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS favicon_url TEXT;`,
   );
   await db.query(
-    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS site_name TEXT;`
+    `ALTER TABLE site_settings ADD COLUMN IF NOT EXISTS site_name TEXT;`,
   );
 
   await db.query(`
@@ -84,7 +84,7 @@ async function ensureTables() {
 async function hasColumn(table, column) {
   const { rows } = await db.query(
     `SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2 LIMIT 1`,
-    [table, column]
+    [table, column],
   );
   return rows.length > 0;
 }
@@ -96,14 +96,14 @@ async function readSettingsCompat() {
   if (await hasColumn("site_settings", "settings")) {
     try {
       const { rows } = await db.query(
-        "SELECT settings FROM site_settings ORDER BY id DESC LIMIT 1"
+        "SELECT settings FROM site_settings ORDER BY id DESC LIMIT 1",
       );
       if (rows[0]?.settings) return rows[0].settings;
     } catch {}
   }
 
   const { rows } = await db.query(
-    "SELECT * FROM site_settings ORDER BY id DESC LIMIT 1"
+    "SELECT * FROM site_settings ORDER BY id DESC LIMIT 1",
   );
   const r = rows[0];
   if (!r) return defaultSettings();
@@ -141,7 +141,7 @@ async function saveSettingsCompat(incoming) {
     color_scheme: s.branding?.theme ?? "light",
     logo_url: s.branding?.logo_url ?? null,
     favicon_url: s.branding?.favicon_url ?? null,
-    site_name: s.branding?.name ?? "BishopTV",
+    site_name: s.branding?.name ?? (process.env.SITE_NAME || "Our Ministry"),
     maintenance: !!s.advanced?.maintenance,
   };
 
@@ -165,7 +165,7 @@ async function saveSettingsCompat(incoming) {
       flat.favicon_url,
       flat.site_name,
       flat.maintenance,
-    ]
+    ],
   );
 
   if (upd.rowCount === 0) {
@@ -181,7 +181,7 @@ async function saveSettingsCompat(incoming) {
         flat.favicon_url,
         flat.site_name,
         flat.maintenance,
-      ]
+      ],
     );
   }
   return { ok: true, mode: "flat" };
@@ -208,7 +208,7 @@ router.put("/settings", authenticate, async (req, res) => {
         theme: b.color_scheme ?? "light",
         logo_url: b.logo_url ?? null,
         favicon_url: b.favicon_url ?? null,
-        name: b.site_name ?? "BishopTV",
+        name: b.site_name ?? (process.env.SITE_NAME || "Our Ministry"),
       },
       advanced: { ...defaultSettings().advanced, maintenance: !!b.maintenance },
     };
@@ -243,7 +243,7 @@ router.get("/nav", async (_req, res) => {
   try {
     await ensureTables();
     const { rows } = await db.query(
-      "SELECT * FROM site_nav ORDER BY sort ASC, id ASC"
+      "SELECT * FROM site_nav ORDER BY sort ASC, id ASC",
     );
     res.json(rows);
   } catch (e) {
@@ -261,11 +261,11 @@ router.put("/nav", authenticate, async (req, res) => {
       const it = items[i];
       await db.query(
         "INSERT INTO site_nav (label, url, sort) VALUES ($1,$2,$3)",
-        [it.label, it.url, i]
+        [it.label, it.url, i],
       );
     }
     const { rows } = await db.query(
-      "SELECT * FROM site_nav ORDER BY sort ASC, id ASC"
+      "SELECT * FROM site_nav ORDER BY sort ASC, id ASC",
     );
     res.json(rows);
   } catch (e) {
@@ -280,16 +280,16 @@ router.get("/pages", async (req, res) => {
     await ensureTables();
     const q = (req.query.q || "").toLowerCase();
     const { rows } = await db.query(
-      "SELECT * FROM site_pages ORDER BY updated_at DESC, id DESC"
+      "SELECT * FROM site_pages ORDER BY updated_at DESC, id DESC",
     );
     res.json(
       q
         ? rows.filter(
             (r) =>
               r.title?.toLowerCase().includes(q) ||
-              r.slug?.toLowerCase().includes(q)
+              r.slug?.toLowerCase().includes(q),
           )
-        : rows
+        : rows,
     );
   } catch (e) {
     console.error("GET /site/pages error:", e);
@@ -311,7 +311,7 @@ router.post("/pages", authenticate, async (req, res) => {
     while (true) {
       const { rows } = await db.query(
         "SELECT 1 FROM site_pages WHERE slug=$1",
-        [candidate]
+        [candidate],
       );
       if (rows.length === 0) break;
       attempt++;
@@ -321,7 +321,7 @@ router.post("/pages", authenticate, async (req, res) => {
     const ins = await db.query(
       `INSERT INTO site_pages (title, slug, status, blocks)
        VALUES ($1,$2,$3,$4) RETURNING *`,
-      [title, candidate, status, JSON.stringify(blocks)]
+      [title, candidate, status, JSON.stringify(blocks)],
     );
     res.json(ins.rows[0]);
   } catch (e) {
@@ -363,7 +363,7 @@ router.put("/pages/:id", authenticate, async (req, res) => {
         status,
         blocks ? JSON.stringify(blocks) : null,
         req.params.id,
-      ]
+      ],
     );
     if (!rows[0]) return res.status(404).json({ message: "Not found" });
     res.json(rows[0]);
@@ -396,7 +396,7 @@ router.post("/pages/:id/duplicate", authenticate, async (req, res) => {
     const ins = await db.query(
       `INSERT INTO site_pages (title, slug, status, blocks)
        VALUES ($1,$2,$3,$4) RETURNING *`,
-      [`${src.title} (Copy)`, newSlug, src.status, src.blocks]
+      [`${src.title} (Copy)`, newSlug, src.status, src.blocks],
     );
     res.json(ins.rows[0]);
   } catch (e) {
@@ -469,7 +469,7 @@ router.get("/public/:slug", async (req, res) => {
        ORDER BY p.published_at DESC NULLS LAST, p.updated_at DESC
        LIMIT 1
       `,
-      [slug]
+      [slug],
     );
 
     if (ch.rows[0]) {
@@ -503,7 +503,7 @@ router.get("/public/:slug", async (req, res) => {
          FROM site_pages
         WHERE slug = $1 AND status <> 'archived'
         LIMIT 1`,
-      [slug]
+      [slug],
     );
 
     if (site.rows[0]) {

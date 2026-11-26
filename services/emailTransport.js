@@ -211,7 +211,11 @@ function envConfig() {
           s(e.MAILGUN_FROM_EMAIL) ||
           (EMAIL_RE.test(from.email) ? from.email : "") ||
           `postmaster@${s(e.MAILGUN_DOMAIN)}`,
-        from_name: s(e.MAILGUN_FROM_NAME) || from.name || "Bishop Robertson TV",
+        from_name:
+          s(e.MAILGUN_FROM_NAME) ||
+          from.name ||
+          s(e.SITE_NAME) ||
+          "Our Ministry",
         notify_to: s(e.NOTIFY_TO),
       },
       secrets: { api_key: s(e.MAILGUN_API_KEY) },
@@ -234,7 +238,7 @@ function envConfig() {
             : "starttls",
         username: s(e.SMTP_USER),
         from_email: from.email || s(e.SMTP_USER),
-        from_name: from.name || "Bishop Robertson TV",
+        from_name: from.name || s(e.SITE_NAME) || "Our Ministry",
         notify_to: s(e.NOTIFY_TO),
       },
       secrets: { password: s(e.SMTP_PASS) },

@@ -907,7 +907,7 @@ router.get("/events/:id/register", async (req, res) => {
       const ics = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//BishopTV//Live//EN",
+        "PRODID:-//MinistryTV//Live//EN",
         "BEGIN:VEVENT",
         `UID:live-${row.id}@bishop.tv`,
         `DTSTAMP:${dt(new Date())}`,

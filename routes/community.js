@@ -233,14 +233,27 @@ async function uploadCommunityImage({ postId, mediaFolder, file }) {
   return toPublicUrl(rel.replace(/\\/g, "/"));
 }
 
-/* A tiny helper to compute author_name for POSTS consistently */
-const AUTHOR_NAME_SQL = `
+/* author_name for POSTS: admins post as the ministry (Site Settings › Brand name) */
+const { siteName } = require("../lib/siteIdentity");
+function authorNameSql(ministry) {
+  const safe = String(ministry || "Admin").replace(/'/g, "''");
+  return `
   CASE
     WHEN lower(COALESCE(u.role,'')) = 'admin'
-      THEN 'Bishop Robertson TV'
+      THEN '${safe}'
     ELSE COALESCE(pr.display_name, 'Member')
   END
 `;
+}
+let AUTHOR_NAME_SQL = authorNameSql("Admin");
+router.use(async (_req, _res, next) => {
+  try {
+    AUTHOR_NAME_SQL = authorNameSql(await siteName());
+  } catch {
+    /* keep the last value */
+  }
+  next();
+});
 
 /* -------------------------------------------------------------------------- */
 /* GET /api/community/posts                                                   */
@@ -778,13 +791,25 @@ router.post("/posts/:id/comments", requireAuth, async (req, res) => {
 /* -------------------------------------------------------------------------- */
 /* Channels                                                                   */
 /* -------------------------------------------------------------------------- */
+// Which channels are listed: COMMUNITY_CHANNELS (comma-separated slugs, in the
+// server's settings); without it, every public channel.
 router.get("/channels", async (_req, res) => {
   try {
+    const slugs = String(process.env.COMMUNITY_CHANNELS || "")
+      .split(",")
+      .map((x) => x.trim().toLowerCase())
+      .filter(Boolean);
     const { rows } = await db.query(
-      `SELECT id, slug, name, is_public, sort_order
-         FROM public.community_channels
-        WHERE slug IN ('bishoprobertsontv','techsupport')
-        ORDER BY sort_order, name`,
+      slugs.length
+        ? `SELECT id, slug, name, is_public, sort_order
+             FROM public.community_channels
+            WHERE slug = ANY($1::text[])
+            ORDER BY sort_order, name`
+        : `SELECT id, slug, name, is_public, sort_order
+             FROM public.community_channels
+            WHERE is_public = TRUE
+            ORDER BY sort_order, name`,
+      slugs.length ? [slugs] : [],
     );
     res.json({ items: rows });
   } catch (e) {

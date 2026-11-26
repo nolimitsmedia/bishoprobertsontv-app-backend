@@ -409,7 +409,7 @@ const SAMPLE = {
   member_email: "grace@example.com",
   video_title: "Walking in Faith, Part 1",
   video_description:
-    "Bishop Robertson opens a new series on trusting God in every season.",
+    "Our pastor opens a new series on trusting God in every season.",
   video_count: "3",
   minutes_left: "24",
   trial_end_date: "December 3",
@@ -535,25 +535,18 @@ let brandCache = { at: 0, value: null };
 async function getBrand() {
   if (brandCache.value && Date.now() - brandCache.at < 60000)
     return brandCache.value;
-  let row = {};
-  try {
-    const r = await db.query(
-      "SELECT site_name, brand_color, logo_url FROM site_settings ORDER BY id DESC LIMIT 1",
-    );
-    row = r.rows[0] || {};
-  } catch {
-    /* table may not exist yet */
-  }
+  // Site Settings › Brand first, then the older site_settings row, then SITE_NAME.
+  const row = await require("../lib/siteIdentity").siteBrand();
   let logo = s(row.logo_url);
   if (logo && !/^https?:\/\//i.test(logo)) {
     const base = logo.startsWith("/uploads") ? apiUrl() : siteUrl();
     logo = base ? `${base}/${logo.replace(/^\/+/, "")}` : "";
   }
-  // Email inboxes need a full https address; default: the site's wide logo.
-  if (!/^https:\/\//i.test(logo)) logo = `${siteUrl()}/bishop-robertson-tv.png`;
-  const color = HEX.test(s(row.brand_color)) ? s(row.brand_color) : "#7c3aed";
+  // Email inboxes need a full https address; default: the site's own logo file.
+  if (!/^https:\/\//i.test(logo)) logo = `${siteUrl()}/brand-logo.png`;
+  const color = HEX.test(s(row.color)) ? s(row.color) : "#7c3aed";
   const value = {
-    site_name: s(row.site_name) || "BishopRobertson.TV",
+    site_name: s(row.name),
     color,
     logo,
   };

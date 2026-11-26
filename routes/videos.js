@@ -711,7 +711,7 @@ async function fetchBunnyAsset(
   const allowedOrigin = requestOrigin || fallbackOrigin;
 
   const baseHeaders = {
-    "User-Agent": "Mozilla/5.0 BishopRobertsonTVPreviewProxy/1.0",
+    "User-Agent": "Mozilla/5.0 MinistryTVPreviewProxy/1.0",
     // Bunny Stream domain rules check the referrer. Do not send a Node Origin
     // header here because it can make Bunny treat the proxy request like a
     // browser CORS request.

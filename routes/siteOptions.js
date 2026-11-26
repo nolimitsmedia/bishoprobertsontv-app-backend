@@ -124,6 +124,8 @@ function cleanBrand(b) {
     name: str(b.name, 80),
     logo_url: image(b.logo_url),
     tagline: str(b.tagline, 160),
+    // Phase 2B: used for the play-button image when a video has no thumbnail.
+    color: /^#[0-9a-fA-F]{6}$/.test(str(b.color, 7)) ? str(b.color, 7) : "",
     contact_email: /^[^\s@<>]+@[^\s@<>]+\.[A-Za-z]{2,}$/.test(
       str(b.contact_email, 200),
     )
@@ -267,12 +269,10 @@ router.put("/admin", requireArea("website"), async (req, res) => {
       next.featured = cleanFeatured(req.body.featured);
     if (req.body?.custom_css !== undefined) {
       if (String(req.body.custom_css || "").length > MAX_CSS)
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            error: `Custom CSS is limited to ${MAX_CSS} characters`,
-          });
+        return res.status(400).json({
+          ok: false,
+          error: `Custom CSS is limited to ${MAX_CSS} characters`,
+        });
       next.custom_css = cleanCss(req.body.custom_css);
     }
     await db.query(
