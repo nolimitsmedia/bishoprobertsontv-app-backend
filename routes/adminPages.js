@@ -520,12 +520,10 @@ router.post("/:id/schedule", async (req, res) => {
           "Scheduling is not set up yet. Run the 20261105_06_page_schedule.sql migration.",
       });
     if (!canPublishSafely(s))
-      return res
-        .status(503)
-        .json({
-          ok: false,
-          error: "Draft/published columns are required for safe publishing",
-        });
+      return res.status(503).json({
+        ok: false,
+        error: "Draft/published columns are required for safe publishing",
+      });
     const when = new Date(String(req.body?.publish_at || ""));
     const now = Date.now();
     if (Number.isNaN(when.getTime()))
@@ -533,12 +531,10 @@ router.post("/:id/schedule", async (req, res) => {
         .status(400)
         .json({ ok: false, error: "Choose a valid date and time" });
     if (when.getTime() < now + SCHEDULE_MIN_LEAD_MS)
-      return res
-        .status(400)
-        .json({
-          ok: false,
-          error: "Choose a time at least one minute from now",
-        });
+      return res.status(400).json({
+        ok: false,
+        error: "Choose a time at least one minute from now",
+      });
     if (when.getTime() > now + SCHEDULE_MAX_AHEAD_MS)
       return res
         .status(400)
@@ -821,12 +817,10 @@ router.post("/:id/revisions/:revId/restore", async (req, res) => {
   try {
     const s = await getPagesSchema();
     if (!s.draftHtmlCol || !s.draftJsonCol)
-      return res
-        .status(503)
-        .json({
-          ok: false,
-          error: "Draft columns are required to restore safely",
-        });
+      return res.status(503).json({
+        ok: false,
+        error: "Draft columns are required to restore safely",
+      });
     const { rows: revs } = await db.query(
       `SELECT * FROM cms_page_revisions WHERE page_id = $1 AND id = $2`,
       [id, revId],
@@ -959,6 +953,14 @@ async function seedBuiltinPages() {
   if (!canPublishSafely(s))
     return { skipped: "pages table has no draft/published columns" };
   const { BUILTIN_PAGES } = require("../lib/builtinPages");
+  const ministry = await require("../lib/siteIdentity").siteName();
+  // {{SITE_NAME}} in the built-in wording → this ministry's name.
+  const fillSiteName = (seed) =>
+    JSON.parse(
+      JSON.stringify(seed)
+        .split("{{SITE_NAME}}")
+        .join(JSON.stringify(ministry).slice(1, -1)),
+    );
   const added = [];
   for (const p of BUILTIN_PAGES) {
     const exists = await db.query(
@@ -969,7 +971,7 @@ async function seedBuiltinPages() {
     const row = await insertDraftPage(s, {
       title: p.title,
       slug: p.slug,
-      seed: p.content(),
+      seed: fillSiteName(p.content()),
     });
     await publishPageById(s, row.id, null);
     added.push(p.slug);
