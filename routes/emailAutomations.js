@@ -2,7 +2,7 @@
 // Admin › Email › Automations. Mount: app.use("/api/admin/email/automations", …)
 //
 // GET  /                 every automated email: on/off, wording, fill-ins, 30-day counts
-// PUT  /settings         footer (mailing address, note)
+// PUT  /settings         footer + timing (roundup day/hour, continue/miss days)
 // GET  /log              sent-emails log (?key= &status= &q= &limit= &offset=)
 // PUT  /:key             { enabled?, subject?, heading?, body?, button?, reset? }
 // POST /:key/preview     { subject?, heading?, body?, button? } → { subject, html, text }
@@ -91,6 +91,10 @@ router.put("/settings", async (req, res) => {
     const settings = await T.saveSettings(req.body || {});
     res.json({ ok: true, settings });
   } catch (e) {
+    if (/^Invalid value/.test(e?.message || ""))
+      return res
+        .status(400)
+        .json({ ok: false, error: "One of the settings isn’t a valid value." });
     console.error("[emailAutomations] settings error:", e);
     res.status(500).json({ ok: false, error: "Could not save." });
   }

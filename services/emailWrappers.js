@@ -154,7 +154,102 @@ module.exports = function makeEmailWrappers({ throwOnError = false } = {}) {
     });
   }
 
+  // Billing emails (Release 2.1 calls these; each is off until switched on).
+  const billingUrl = () => T.sitePage("account");
+  const sendTrialEndingEmail = ({
+    to,
+    name,
+    planName,
+    trialEndDate,
+    amount,
+    currency,
+    interval,
+  } = {}) =>
+    send("trial_ending", {
+      to,
+      vars: {
+        name: name || "",
+        plan_name: planName || "your plan",
+        trial_end_date: trialEndDate || "",
+        amount: money(amount, currency),
+        interval_label: intervalLabel(interval),
+        billing_url: billingUrl(),
+      },
+    });
+  const sendPaymentFailedEmail = ({
+    to,
+    name,
+    planName,
+    amount,
+    currency,
+  } = {}) =>
+    send("payment_failed", {
+      to,
+      vars: {
+        name: name || "",
+        plan_name: planName || "your",
+        amount: money(amount, currency),
+        billing_url: billingUrl(),
+      },
+    });
+  const sendRenewalReminderEmail = ({
+    to,
+    name,
+    planName,
+    renewalDate,
+    amount,
+    currency,
+  } = {}) =>
+    send("renewal_reminder", {
+      to,
+      vars: {
+        name: name || "",
+        plan_name: planName || "your",
+        renewal_date: renewalDate || "",
+        amount: money(amount, currency),
+        billing_url: billingUrl(),
+      },
+    });
+  const sendSubscriptionCancelledEmail = ({
+    to,
+    name,
+    planName,
+    accessUntil,
+  } = {}) =>
+    send("subscription_cancelled", {
+      to,
+      vars: {
+        name: name || "",
+        plan_name: planName || "your",
+        access_until: accessUntil || "",
+        billing_url: billingUrl(),
+      },
+    });
+  const sendGiftReceivedEmail = ({
+    to,
+    name,
+    giftFrom,
+    planName,
+    giftMessage,
+    redeemUrl,
+  } = {}) =>
+    send("gift_received", {
+      to,
+      vars: {
+        name: name || "",
+        gift_from: giftFrom || "Someone",
+        plan_name: planName || "",
+        gift_message: giftMessage || "",
+        redeem_url: redeemUrl || billingUrl(),
+      },
+    });
+
   return {
+    sendTrialEndingEmail,
+    sendPaymentFailedEmail,
+    sendRenewalReminderEmail,
+    sendSubscriptionCancelledEmail,
+    sendGiftReceivedEmail,
     sendWelcomeEmail,
     sendPasswordResetEmail,
     sendLiveReminderEmail,

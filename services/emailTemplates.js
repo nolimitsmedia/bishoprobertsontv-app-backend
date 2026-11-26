@@ -153,6 +153,193 @@ const CATALOG = [
       "site_name",
     ],
   },
+
+  /* ── Package B: automations (all start OFF) ── */
+  {
+    key: "welcome_followup",
+    name: "Welcome follow-up",
+    category: "updates",
+    list: "news",
+    when: "3 days after someone creates an account (people who signed up in the last week).",
+    default_on: false,
+    subject: "Getting the most from {site_name}",
+    heading: "Glad you’re with us, {first_name}",
+    body:
+      "Here are three ways to stay close to the Word this week:\n\n" +
+      "Watch on any screen — your phone, tablet, computer or TV. On your phone, add {site_name} to your home screen and it opens like an app.\n\n" +
+      "Join us live — tap “Notify me” on the Live page and we’ll email you before each service.\n\n" +
+      "Pick up where you left off — every message remembers where you stopped.",
+    button: "Explore the messages",
+    action: "site_url",
+    fields: ["first_name", "name", "site_name", "site_url"],
+  },
+  {
+    key: "new_video",
+    name: "New sermon alert",
+    category: "updates",
+    list: "updates",
+    when: "When a new video is published (sent within 2 days; at most 3 a day per person). Use this or the weekly roundup.",
+    default_on: false,
+    subject: "New: {video_title}",
+    heading: "{video_title}",
+    body: "A new message is now on {site_name}.\n\n{video_description}",
+    button: "Watch now",
+    action: "video_url",
+    image: "thumbnail_url",
+    fields: [
+      "first_name",
+      "video_title",
+      "video_description",
+      "video_url",
+      "site_name",
+    ],
+  },
+  {
+    key: "weekly_roundup",
+    name: "Weekly roundup",
+    category: "updates",
+    list: "updates",
+    when: "Once a week (day and time in Settings), listing the videos added that week. Skipped in weeks with nothing new.",
+    default_on: false,
+    subject: "This week on {site_name}",
+    heading: "New this week",
+    body: "Here’s what was added this week, {first_name}. Take a moment and be refreshed.",
+    button: "See everything",
+    action: "site_url",
+    items: true,
+    fields: ["first_name", "video_count", "site_name", "site_url"],
+  },
+  {
+    key: "continue_watching",
+    name: "Continue watching",
+    category: "updates",
+    list: "activity",
+    when: "When someone left a video part-way and hasn’t watched for a few days (Settings). At most once a week.",
+    default_on: false,
+    subject: "Pick up where you left off: {video_title}",
+    heading: "Ready when you are",
+    body: "You were part-way through “{video_title}” — about {minutes_left} minutes left. Press the button and it starts right where you stopped.",
+    button: "Keep watching",
+    action: "video_url",
+    image: "thumbnail_url",
+    fields: [
+      "first_name",
+      "video_title",
+      "minutes_left",
+      "video_url",
+      "site_name",
+    ],
+  },
+  {
+    key: "we_miss_you",
+    name: "We miss you",
+    category: "updates",
+    list: "activity",
+    when: "When a member hasn’t visited for a while (Settings). Once per absence.",
+    default_on: false,
+    subject: "We miss you, {first_name}",
+    heading: "We miss you, {first_name}",
+    body: "It’s been a little while since your last visit. Here are some of the newest messages — come back and be encouraged.",
+    button: "Come back and watch",
+    action: "site_url",
+    items: true,
+    fields: ["first_name", "site_name", "site_url"],
+  },
+
+  /* ── Billing (sent by monetization, Release 2.1; off until then) ── */
+  {
+    key: "trial_ending",
+    name: "Free trial ending",
+    category: "billing",
+    when: "3 days before a free trial ends.",
+    default_on: false,
+    subject: "Your free trial ends on {trial_end_date}",
+    heading: "Your trial ends soon",
+    body: "Hi {first_name}, your free trial of {plan_name} ends on {trial_end_date}. After that your subscription continues at {amount} {interval_label} — nothing for you to do.\n\nIf you’d rather not continue, you can cancel any time before then.",
+    button: "Manage subscription",
+    action: "billing_url",
+    fields: [
+      "first_name",
+      "plan_name",
+      "trial_end_date",
+      "amount",
+      "interval_label",
+      "billing_url",
+      "site_name",
+    ],
+  },
+  {
+    key: "payment_failed",
+    name: "Payment failed",
+    category: "billing",
+    when: "When a subscription payment doesn’t go through.",
+    default_on: false,
+    subject: "Action needed: your payment didn’t go through",
+    heading: "Please update your payment",
+    body: "Hi {first_name}, we couldn’t take the {amount} payment for your {plan_name} subscription. Please update your card so you keep full access.",
+    button: "Update payment",
+    action: "billing_url",
+    fields: ["first_name", "plan_name", "amount", "billing_url", "site_name"],
+  },
+  {
+    key: "renewal_reminder",
+    name: "Renewal reminder",
+    category: "billing",
+    when: "7 days before a yearly subscription renews.",
+    default_on: false,
+    subject: "Your {plan_name} subscription renews on {renewal_date}",
+    heading: "Renewal coming up",
+    body: "Hi {first_name}, your {plan_name} subscription renews on {renewal_date} for {amount}. Thank you for standing with this ministry.",
+    button: "Manage subscription",
+    action: "billing_url",
+    fields: [
+      "first_name",
+      "plan_name",
+      "renewal_date",
+      "amount",
+      "billing_url",
+      "site_name",
+    ],
+  },
+  {
+    key: "subscription_cancelled",
+    name: "Subscription cancelled",
+    category: "billing",
+    when: "When someone cancels their subscription.",
+    default_on: false,
+    subject: "Your subscription has been cancelled",
+    heading: "Sorry to see you go, {first_name}",
+    body: "Your {plan_name} subscription is cancelled. You still have full access until {access_until}.\n\nYou’re welcome back any time.",
+    button: "Restart my subscription",
+    action: "billing_url",
+    fields: [
+      "first_name",
+      "plan_name",
+      "access_until",
+      "billing_url",
+      "site_name",
+    ],
+  },
+  {
+    key: "gift_received",
+    name: "Gift subscription received",
+    category: "billing",
+    when: "When someone gives a subscription as a gift.",
+    default_on: false,
+    subject: "{gift_from} gave you {site_name}",
+    heading: "You’ve received a gift!",
+    body: "{gift_from} gave you a {plan_name} subscription to {site_name}.\n\n{gift_message}",
+    button: "Claim your gift",
+    action: "redeem_url",
+    fields: [
+      "first_name",
+      "gift_from",
+      "plan_name",
+      "gift_message",
+      "redeem_url",
+      "site_name",
+    ],
+  },
 ];
 const BY_KEY = Object.fromEntries(CATALOG.map((t) => [t.key, t]));
 
@@ -192,6 +379,18 @@ const FIELD_LABELS = {
   watch_url: "Watch link",
   member_name: "Member name",
   member_email: "Member email",
+  video_title: "Video title",
+  video_description: "Video description",
+  video_url: "Video link",
+  video_count: "Number of videos",
+  minutes_left: "Minutes left",
+  trial_end_date: "Trial end date",
+  renewal_date: "Renewal date",
+  access_until: "Access until",
+  billing_url: "Billing page link",
+  gift_from: "Gift from",
+  gift_message: "Gift message",
+  redeem_url: "Gift link",
 };
 
 const SAMPLE = {
@@ -208,6 +407,21 @@ const SAMPLE = {
   watch_url: "",
   member_name: "Grace Johnson",
   member_email: "grace@example.com",
+  video_title: "Walking in Faith, Part 1",
+  video_description:
+    "Bishop Robertson opens a new series on trusting God in every season.",
+  video_count: "3",
+  minutes_left: "24",
+  trial_end_date: "December 3",
+  renewal_date: "December 10",
+  access_until: "December 31",
+  gift_from: "Michael Johnson",
+  gift_message: "Thinking of you this season!",
+  _items: [
+    { title: "Walking in Faith, Part 1", subtitle: "Sunday service · 52 min" },
+    { title: "The Power of Prayer", subtitle: "Bible study · 38 min" },
+    { title: "Christmas Hope", subtitle: "Special · 45 min" },
+  ],
 };
 
 /* ───────────────────────── schema ───────────────────────── */
@@ -227,6 +441,10 @@ function ensureSchema() {
           updated_by BIGINT,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )`);
+      // When an automation was last switched on: it never reaches back before that.
+      await db.query(
+        "ALTER TABLE email_automations ADD COLUMN IF NOT EXISTS enabled_at TIMESTAMPTZ",
+      );
       await db.query(`
         CREATE TABLE IF NOT EXISTS email_settings (
           key TEXT PRIMARY KEY,
@@ -269,15 +487,40 @@ function ensureSchema() {
 async function getSettings() {
   await ensureSchema();
   const { rows } = await db.query("SELECT key, value FROM email_settings");
-  const out = { footer_address: "", footer_note: "" };
+  const out = { ...SETTING_DEFAULTS };
   for (const r of rows) out[r.key] = r.value || "";
   return out;
 }
 
+const SETTING_DEFAULTS = {
+  footer_address: "",
+  footer_note: "",
+  roundup_day: "mon", // weekly roundup day (sun…sat)
+  roundup_hour: "9", // local hour 0–23 (CALENDAR_TIMEZONE)
+  continue_after_days: "3",
+  miss_after_days: "30",
+};
+const DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+function cleanSetting(k, v) {
+  const t = s(v);
+  if (k === "roundup_day") return DAYS.includes(t) ? t : null;
+  if (k === "roundup_hour")
+    return /^\d+$/.test(t) && +t >= 0 && +t <= 23 ? String(+t) : null;
+  if (k === "continue_after_days")
+    return /^\d+$/.test(t) && +t >= 1 && +t <= 30 ? String(+t) : null;
+  if (k === "miss_after_days")
+    return /^\d+$/.test(t) && +t >= 14 && +t <= 365 ? String(+t) : null;
+  return t.slice(0, 400);
+}
+
 async function saveSettings(patch) {
   await ensureSchema();
-  for (const k of ["footer_address", "footer_note"]) {
+  for (const k of Object.keys(SETTING_DEFAULTS)) {
     if (patch[k] === undefined) continue;
+    const val = cleanSetting(k, patch[k]);
+    if (val === null) throw new Error(`Invalid value for ${k}`);
+    patch = { ...patch, [k]: val };
     await db.query(
       `INSERT INTO email_settings (key, value, updated_at) VALUES ($1,$2,NOW())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
@@ -338,6 +581,7 @@ async function getTemplate(key) {
     body: s(r.body) || def.body,
     button: r.button == null ? def.button : s(r.button),
     customized: !!(r.subject || r.heading || r.body || r.button != null),
+    enabled_at: r.enabled_at || null,
     updated_at: r.updated_at || null,
   };
 }
@@ -354,7 +598,7 @@ async function saveTemplate(key, patch, userId) {
     await db.query("DELETE FROM email_automations WHERE key = $1", [key]);
     if (patch.enabled !== undefined && def.category !== "essential")
       await db.query(
-        "INSERT INTO email_automations (key, enabled, updated_by) VALUES ($1,$2,$3)",
+        "INSERT INTO email_automations (key, enabled, updated_by, enabled_at) VALUES ($1,$2,$3, CASE WHEN $2 THEN NOW() END)",
         [key, !!patch.enabled, userId || null],
       );
     return getTemplate(key);
@@ -375,10 +619,12 @@ async function saveTemplate(key, patch, userId) {
         ? null
         : !!patch.enabled;
   await db.query(
-    `INSERT INTO email_automations (key, enabled, subject, heading, body, button, updated_by, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `INSERT INTO email_automations (key, enabled, subject, heading, body, button, updated_by, updated_at, enabled_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), CASE WHEN $2 IS TRUE THEN NOW() END)
      ON CONFLICT (key) DO UPDATE SET
        enabled = COALESCE($2, email_automations.enabled),
+       enabled_at = CASE WHEN $2 IS TRUE AND email_automations.enabled IS NOT TRUE THEN NOW()
+                         ELSE email_automations.enabled_at END,
        subject = COALESCE($3, email_automations.subject),
        heading = COALESCE($4, email_automations.heading),
        body    = COALESCE($5, email_automations.body),
@@ -444,6 +690,28 @@ function renderEmail({
   const footerAddress = s(settings.footer_address);
   const footerNote = s(settings.footer_note);
   const btnText = onColor(brand.color);
+  const image =
+    tpl.image && /^https:\/\//i.test(s(vars[tpl.image]))
+      ? s(vars[tpl.image])
+      : "";
+  const items =
+    tpl.items && Array.isArray(vars._items) ? vars._items.slice(0, 8) : [];
+  const itemsHtml = items.length
+    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:4px 0 18px">${items
+        .map((it) => {
+          const url = /^https?:\/\//i.test(s(it.url)) ? s(it.url) : "";
+          const img = /^https:\/\//i.test(s(it.image)) ? s(it.image) : "";
+          const title = esc(it.title || "");
+          return `<tr><td style="padding:8px 0;border-bottom:1px solid #ebe7f0">
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr>
+${img ? `<td width="128" valign="top" style="padding-right:14px">${url ? `<a href="${esc(url)}">` : ""}<img src="${esc(img)}" width="128" alt="" style="display:block;width:128px;height:auto;border-radius:8px;border:0">${url ? "</a>" : ""}</td>` : ""}
+<td valign="top" style="font-family:Arial,Helvetica,sans-serif">
+<p style="margin:0 0 4px;font-size:16px;font-weight:700;line-height:1.35">${url ? `<a href="${esc(url)}" style="color:#16111c;text-decoration:none">${title}</a>` : `<span style="color:#16111c">${title}</span>`}</p>
+${it.subtitle ? `<p style="margin:0;font-size:13.5px;color:#6b6475">${esc(it.subtitle)}</p>` : ""}
+</td></tr></table></td></tr>`;
+        })
+        .join("")}</table>`
+    : "";
 
   const pHtml = paragraphs
     .map(
@@ -482,8 +750,10 @@ function renderEmail({
       <a href="${esc(siteUrl())}" style="text-decoration:none"><img src="${esc(brand.logo)}" alt="${esc(brand.site_name)}" width="220" style="display:block;width:220px;max-width:100%;height:auto;border:0;color:#ffffff;font:700 20px Arial,sans-serif"></a>
     </td></tr>
     <tr><td style="background:#ffffff;padding:30px 28px 14px;font-family:Arial,Helvetica,sans-serif">
+      ${image ? `<img src="${esc(image)}" alt="" width="504" style="display:block;width:100%;max-width:504px;height:auto;border-radius:10px;margin:0 0 20px;border:0">` : ""}
       ${heading ? `<h1 style="margin:0 0 18px;font-size:24px;line-height:1.3;color:#16111c;font-weight:700">${esc(heading)}</h1>` : ""}
       ${pHtml}
+      ${itemsHtml}
       ${
         showButton
           ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:6px 0 20px"><tr><td style="border-radius:999px;background:${brand.color}">
@@ -503,6 +773,8 @@ function renderEmail({
     heading,
     "",
     ...paragraphs.flatMap((p) => [p, ""]),
+    ...items.map((it) => `- ${it.title}${it.url ? `: ${it.url}` : ""}`),
+    items.length ? "" : null,
     showButton ? `${buttonLabel}: ${actionUrl}\n` : "",
     "—",
     footerNote,
@@ -691,7 +963,7 @@ async function sendTemplated(
           subject: tpl.subject,
           status: "skipped",
           detail: "Unsubscribed",
-          dedupe: null,
+          dedupe: dedupe || null,
         });
         return { ok: false, status: "unsubscribed" };
       }
@@ -786,6 +1058,9 @@ async function previewTemplate(key, draft = {}) {
     site_url: siteUrl(),
     site: siteUrl(),
     watch_url: sitePage("live-streaming"),
+    video_url: sitePage("watch/1"),
+    billing_url: sitePage("account"),
+    redeem_url: sitePage("account"),
     reset_url: sitePage("reset-password?token=sample"),
   };
   const sampleLink = sitePage("email-preferences");

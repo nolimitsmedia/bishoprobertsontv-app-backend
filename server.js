@@ -387,6 +387,13 @@ app.use("/api/viewer", require("./routes/viewer"));
   const reminders = require("./routes/liveReminders");
   app.use("/api/live-reminders", reminders.router);
   reminders.startReminderWorker();
+  // Package B: welcome follow-up, new sermon alerts, weekly roundup,
+  // continue watching, we miss you (each switched on in Email Automations).
+  try {
+    require("./services/emailAutomationWorker").startEmailAutomationWorker();
+  } catch (e) {
+    console.warn("[emailAutomations] not started:", e?.message || e);
+  }
 }
 // Release 2.3 Part B: real preview clips (Content › Preview Clips).
 app.use("/api/admin/preview-clips", require("./routes/previewClips"));

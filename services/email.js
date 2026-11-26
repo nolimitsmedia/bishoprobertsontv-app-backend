@@ -92,6 +92,11 @@ const {
   sendNewUserAlert,
   sendPurchaseReceipt,
   sendNewSubscriberAlert,
+  sendTrialEndingEmail,
+  sendPaymentFailedEmail,
+  sendRenewalReminderEmail,
+  sendSubscriptionCancelledEmail,
+  sendGiftReceivedEmail,
 } = require("./emailWrappers")({ throwOnError: true });
 
 module.exports = {
@@ -108,4 +113,10 @@ module.exports = {
   sendNewSubscriberAlert,
   // internal alert
   sendNewUserAlert,
+  // billing (Release 2.1; each off until switched on in Email Automations)
+  sendTrialEndingEmail,
+  sendPaymentFailedEmail,
+  sendRenewalReminderEmail,
+  sendSubscriptionCancelledEmail,
+  sendGiftReceivedEmail,
 };
