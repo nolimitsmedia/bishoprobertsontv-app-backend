@@ -8,17 +8,18 @@ const { requireAuth, requireAdmin } = require("../middleware/auth");
 // Managers; the connection settings (connect/disconnect/test) stay admin-only.
 const { requireArea } = require("../lib/teamAccess");
 const marketing = requireArea("marketing");
-const { encryptJSON, decryptJSON } = require("../utils/crypto");
+const { encryptJSON } = require("../utils/crypto");
+const email = require("../services/emailTransport");
 
 /**
  * Admin Email API
  * Mount: app.use("/api/admin/email", require("./routes/adminEmail"));
  *
  * Endpoints:
- * GET  /api/admin/email/connection
- * POST /api/admin/email/connect
+ * GET  /api/admin/email/connection   which account sends the site's emails
+ * POST /api/admin/email/connect      save an account (any provider)
  * POST /api/admin/email/disconnect
- * POST /api/admin/email/test
+ * POST /api/admin/email/test         really send a test email
  * POST /api/admin/email/send
  * GET  /api/admin/email/jobs
  * GET  /api/admin/email/jobs/:id/items
@@ -27,32 +28,93 @@ const { encryptJSON, decryptJSON } = require("../utils/crypto");
 /* -------------------------------
    Helpers
 -------------------------------- */
-function cleanProvider(p) {
-  return String(p || "")
-    .trim()
-    .toLowerCase();
-}
 function safeStr(v) {
   return (v ?? "").toString();
 }
-function cleanRegion(v) {
-  const r = safeStr(v).trim().toLowerCase();
-  if (r === "eu") return "eu";
-  return "us";
+
+function encryptionReady() {
+  try {
+    encryptJSON({ t: 1 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const KEY_HELP =
+  "The server is missing APP_ENCRYPTION_KEY, which keeps email passwords encrypted. Add it in Render › Environment (a 32-byte base64 value, e.g. from: node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"), then save again.";
+
+// What the admin page may see: never passwords or API keys.
+function publicView(cfg) {
+  if (!cfg) return null;
+  const need = email.PROVIDERS[cfg.provider]?.secret;
+  return {
+    id: cfg.id || null,
+    source: cfg.source, // "admin" | "server"
+    provider: cfg.provider,
+    provider_label: email.PROVIDERS[cfg.provider]?.label || cfg.provider,
+    is_active: true,
+    settings: cfg.settings || {},
+    has_secret: need ? !!cfg.secrets?.[need] : false,
+    status: cfg.status || {},
+    warning: cfg.warning || null,
+    updated_at: cfg.updated_at || null,
+  };
+}
+
+function testEmailContent({ provider, from, siteName }) {
+  const label = email.PROVIDERS[provider]?.label || provider;
+  const when = new Date().toUTCString();
+  const subject = `Test email from ${siteName}`;
+  const text = `This is a test email from ${siteName}.\n\nIf you can read this, the site's emails are working.\n\nSent with: ${label}\nFrom: ${from}\nTime: ${when}`;
+  const esc = (v) =>
+    String(v).replace(
+      /[&<>"]/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+    );
+  const html = `<!doctype html><html><body style="margin:0;background:#f4f3f7;font-family:Arial,Helvetica,sans-serif;color:#1d1726">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:28px 12px"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#ffffff;border-radius:12px;padding:28px">
+<tr><td><h1 style="margin:0 0 12px;font-size:22px">Emails are working</h1>
+<p style="margin:0 0 16px;font-size:16px;line-height:1.5">This is a test email from <strong>${esc(siteName)}</strong>. If you can read this, the site's emails are being delivered.</p>
+<p style="margin:0;font-size:13px;line-height:1.6;color:#5b5466">Sent with: ${esc(label)}<br>From: ${esc(from)}<br>Time: ${esc(when)}</p>
+</td></tr></table></td></tr></table></body></html>`;
+  return { subject, text, html };
 }
 
 /* -------------------------------
-   GET active connection
+   GET which account sends the site's emails
 -------------------------------- */
 router.get("/connection", marketing, async (_req, res) => {
   try {
-    const { rows } = await db.query(
-      `SELECT id, provider, is_active, created_at, updated_at
-       FROM email_connections
-       ORDER BY is_active DESC, updated_at DESC
-       LIMIT 1`,
-    );
-    return res.json({ ok: true, connection: rows[0] || null });
+    let current = null;
+    let error = null;
+    try {
+      current = await email.getEmailConfig({ fresh: true });
+    } catch (e) {
+      error = e.message;
+    }
+    const server = email.envConfig();
+    return res.json({
+      ok: true,
+      // Kept for older screens: the saved admin connection, if any.
+      connection:
+        current && current.source === "admin"
+          ? { ...publicView(current), created_at: null }
+          : null,
+      current: publicView(current),
+      server_fallback: server
+        ? {
+            provider: server.provider,
+            provider_label: email.PROVIDERS[server.provider]?.label,
+            from_email: server.settings.from_email,
+          }
+        : null,
+      error,
+      encryption_ready: encryptionReady(),
+      // Render's free plan blocks mail-server (SMTP) connections.
+      host: process.env.RENDER ? "render" : "",
+    });
   } catch (e) {
     console.error("[adminEmail] GET /connection error:", e);
     return res
@@ -62,104 +124,90 @@ router.get("/connection", marketing, async (_req, res) => {
 });
 
 /* -------------------------------
-   CONNECT provider (store secrets encrypted)
-
-   For Mailgun:
+   SAVE an account (passwords/keys stored encrypted)
    body: {
-     provider: "mailgun",
-     secrets: {
-       api_key, domain, region, from_email, from_name
-       // (we also accept legacy keys: apiKey, fromEmail, fromName)
-     }
+     provider: "mailgun"|"sendgrid"|"postmark"|"brevo"|"resend"|
+               "gmail"|"microsoft365"|"zoho"|"smtp",
+     settings: { from_name, from_email, reply_to?, notify_to?,
+                 domain?, region?, username?, zoho_region?, host?, port?, security? },
+     secrets:  { api_key? | password? }   // blank = keep the saved one
    }
+   (Older body { provider:"mailgun", secrets:{ api_key, domain, region,
+   from_email, from_name } } is still accepted.)
 -------------------------------- */
 router.post("/connect", requireAuth, requireAdmin, async (req, res) => {
-  const provider = cleanProvider(req.body?.provider);
-  const secrets = req.body?.secrets;
-
-  if (!provider) {
-    return res.status(400).json({ ok: false, error: "Missing provider" });
-  }
-  if (!secrets || typeof secrets !== "object") {
-    return res.status(400).json({ ok: false, error: "Missing secrets" });
-  }
-
+  let input;
   try {
-    // Accept both new + legacy key names to avoid frontend breakage
-    const apiKey =
-      safeStr(secrets.api_key).trim() || safeStr(secrets.apiKey).trim();
-    const domain = safeStr(secrets.domain).trim();
-    const region = cleanRegion(secrets.region);
-    const fromEmail =
-      safeStr(secrets.from_email).trim() || safeStr(secrets.fromEmail).trim();
-    const fromName =
-      safeStr(secrets.from_name).trim() ||
-      safeStr(secrets.fromName).trim() ||
-      "Bishop Robertson TV";
+    input = email.normalizeInput(req.body || {});
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e.message });
+  }
+  try {
+    if (!encryptionReady())
+      return res.status(500).json({ ok: false, error: KEY_HELP });
 
-    if (provider === "mailgun") {
-      if (!apiKey) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing secrets.api_key (Mailgun API key)",
-        });
-      }
-      if (!domain) {
-        return res.status(400).json({
-          ok: false,
-          error: "Missing secrets.domain (Mailgun domain)",
-        });
-      }
-      if (!fromEmail) {
-        return res
-          .status(400)
-          .json({ ok: false, error: "Missing secrets.from_email" });
-      }
+    // Blank password/key: keep the saved one (same service only).
+    const need = email.PROVIDERS[input.provider].secret;
+    if (!input.secrets[need]) {
+      const saved = await email
+        .getEmailConfig({ fresh: true })
+        .catch(() => null);
+      if (saved?.source === "admin" && saved.provider === input.provider)
+        input.secrets[need] = saved.secrets[need];
     }
 
-    // Normalize the payload to EXACT names worker expects
-    const payload = {
-      api_key: apiKey,
-      domain: domain || null,
-      region,
-      from_email: fromEmail,
-      from_name: fromName,
-    };
+    const problems = email.validateConfig(input);
+    if (problems.length)
+      return res
+        .status(400)
+        .json({ ok: false, error: problems.join(" "), problems });
 
-    const enc = encryptJSON(payload); // packed string: "iv:tag:ciphertext"
+    const enc = encryptJSON({ [need]: input.secrets[need] });
 
-    // Enforce one active connection
+    await email.ensureEmailSchema();
+    const secretsValue = await email.secretsColumnValue(enc);
     await db.query(
-      `UPDATE email_connections SET is_active = FALSE, updated_at = NOW()`,
+      `UPDATE email_connections SET is_active = FALSE, updated_at = NOW() WHERE is_active = TRUE`,
     );
-
     const ins = await db.query(
-      `INSERT INTO email_connections (provider, secrets_enc, is_active, created_at, updated_at)
-       VALUES ($1, $2, TRUE, NOW(), NOW())
+      `INSERT INTO email_connections (provider, secrets_enc, settings, is_active, created_at, updated_at)
+       VALUES ($1, $2, $3, TRUE, NOW(), NOW())
        RETURNING id, provider, is_active, created_at, updated_at`,
-      [provider, enc],
+      [input.provider, secretsValue, JSON.stringify(input.settings)],
     );
-
-    return res.json({ ok: true, connection: ins.rows[0] });
+    email.clearEmailConfigCache();
+    const current = await email.getEmailConfig({ fresh: true });
+    return res.json({
+      ok: true,
+      connection: ins.rows[0],
+      current: publicView(current),
+    });
   } catch (e) {
     console.error("[adminEmail] POST /connect error:", e);
+    if (/APP_ENCRYPTION_KEY/.test(e?.message || ""))
+      return res.status(500).json({ ok: false, error: KEY_HELP });
     return res
       .status(500)
-      .json({ ok: false, error: "Failed to connect provider" });
+      .json({ ok: false, error: "Failed to save the email account" });
   }
 });
 
 /* -------------------------------
-   DISCONNECT
+   DISCONNECT (the server's .env account, if any, takes over)
 -------------------------------- */
 router.post("/disconnect", requireAuth, requireAdmin, async (_req, res) => {
   try {
+    await email.ensureEmailSchema();
     await db.query(
       `UPDATE email_connections
        SET is_active = FALSE, updated_at = NOW()
        WHERE is_active = TRUE`,
     );
-    return res.json({ ok: true });
+    email.clearEmailConfigCache();
+    const current = await email
+      .getEmailConfig({ fresh: true })
+      .catch(() => null);
+    return res.json({ ok: true, current: publicView(current) });
   } catch (e) {
     console.error("[adminEmail] POST /disconnect error:", e);
     return res.status(500).json({ ok: false, error: "Failed to disconnect" });
@@ -167,38 +215,82 @@ router.post("/disconnect", requireAuth, requireAdmin, async (_req, res) => {
 });
 
 /* -------------------------------
-   TEST (decrypt secrets; verify required fields)
+   TEST: really sends an email.
+   body: { to? }                       → the account in use now
+   body: { to?, provider, settings, secrets } → the form's values, before
+         saving (a blank password/key uses the saved one)
 -------------------------------- */
-router.post("/test", requireAuth, requireAdmin, async (_req, res) => {
+router.post("/test", requireAuth, requireAdmin, async (req, res) => {
+  const to = safeStr(req.body?.to || req.user?.email).trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to))
+    return res
+      .status(400)
+      .json({ ok: false, error: "Enter the address to send the test to." });
+
+  let cfg;
+  let fromForm = false;
   try {
-    const { rows } = await db.query(
-      `SELECT provider, secrets_enc
-       FROM email_connections
-       WHERE is_active = TRUE
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-    );
-
-    if (!rows.length) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No active email provider" });
+    if (req.body?.provider) {
+      fromForm = true;
+      const input = email.normalizeInput(req.body);
+      const need = email.PROVIDERS[input.provider].secret;
+      if (!input.secrets[need]) {
+        const saved = await email
+          .getEmailConfig({ fresh: true })
+          .catch(() => null);
+        if (saved?.source === "admin" && saved.provider === input.provider)
+          input.secrets[need] = saved.secrets[need];
+      }
+      const problems = email.validateConfig(input);
+      if (problems.length)
+        return res
+          .status(400)
+          .json({ ok: false, error: problems.join(" "), problems });
+      cfg = { source: "test", id: null, ...input };
+    } else {
+      cfg = await email.getEmailConfig({ fresh: true });
+      if (!cfg)
+        return res.status(400).json({
+          ok: false,
+          error: "No email account is connected yet.",
+        });
     }
-
-    const provider = rows[0].provider;
-    const secrets = decryptJSON(rows[0].secrets_enc);
-
-    if (provider === "mailgun") {
-      if (!secrets?.api_key) throw new Error("Mailgun api_key missing");
-      if (!secrets?.domain) throw new Error("Mailgun domain missing");
-      if (!secrets?.from_email) throw new Error("Mailgun from_email missing");
-    }
-
-    // Do NOT return secrets
-    return res.json({ ok: true, provider });
   } catch (e) {
-    console.error("[adminEmail] POST /test error:", e);
-    return res.status(500).json({ ok: false, error: "Test failed" });
+    return res.status(400).json({ ok: false, error: e.message });
+  }
+
+  const siteName = process.env.SITE_NAME || "BishopRobertson.TV";
+  const content = testEmailContent({
+    provider: cfg.provider,
+    from: cfg.settings.from_email,
+    siteName,
+  });
+  let ok = false;
+  try {
+    await email.sendMail(
+      { to, ...content },
+      { config: cfg, record: !fromForm },
+    );
+    ok = true;
+    return res.json({
+      ok: true,
+      message: `Test email sent to ${to} with ${email.PROVIDERS[cfg.provider]?.label || cfg.provider}. Check the inbox — and the Spam folder, the first time.`,
+    });
+  } catch (e) {
+    return res.status(400).json({
+      ok: false,
+      error: e.message,
+      code: e.code || "send_failed",
+      detail: e.detail || "",
+    });
+  } finally {
+    if (!fromForm && cfg?.id) {
+      db.query(
+        "UPDATE email_connections SET last_test_at = NOW(), last_test_ok = $2 WHERE id = $1",
+        [cfg.id, ok],
+      ).catch(() => {});
+      email.clearEmailConfigCache();
+    }
   }
 });
 
@@ -229,23 +321,21 @@ router.post("/send", marketing, async (req, res) => {
   }
 
   try {
-    // Ensure provider exists + decryptable
-    const conn = await db.query(
-      `SELECT provider, secrets_enc
-       FROM email_connections
-       WHERE is_active = TRUE
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-    );
-
-    if (!conn.rows.length) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No active email provider" });
+    // An email account must be connected (saved in Email Integration, or
+    // the server's .env settings).
+    let account = null;
+    try {
+      account = await email.getEmailConfig({ fresh: true });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: e.message });
     }
-
-    // Decrypt to fail early if key/format is wrong
-    decryptJSON(conn.rows[0].secrets_enc);
+    if (!account) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "No email account is connected. Connect one in Integrations › Email first.",
+      });
+    }
 
     // Recipients (v1 uses users table)
     const type = safeStr(audience?.type || "all")
@@ -278,6 +368,33 @@ router.post("/send", marketing, async (req, res) => {
          LIMIT 5000`,
       );
       recipients = r.rows;
+    }
+
+    // Leave out people who unsubscribed (preferences page / unsubscribe link).
+    let skippedUnsubscribed = 0;
+    try {
+      const T = require("../services/emailTemplates");
+      await T.ensureSchema();
+      const { rows: offRows } = await db.query(
+        `SELECT email FROM email_preferences
+          WHERE unsubscribed_all = TRUE OR (lists->>'news') = 'false'`,
+      );
+      const off = new Set(offRows.map((r) => String(r.email).toLowerCase()));
+      const before = recipients.length;
+      recipients = recipients.filter(
+        (u) => !off.has(String(u.email).toLowerCase()),
+      );
+      skippedUnsubscribed = before - recipients.length;
+    } catch (e) {
+      console.warn("[adminEmail] unsubscribe filter skipped:", e?.message || e);
+    }
+    if (!recipients.length) {
+      return res.status(400).json({
+        ok: false,
+        error: skippedUnsubscribed
+          ? "Everyone in this audience has unsubscribed from news emails."
+          : "No recipients found.",
+      });
     }
 
     // Create job (try to store attachments if column exists)
@@ -339,7 +456,12 @@ router.post("/send", marketing, async (req, res) => {
     }
 
     // Worker will send + update items -> sent/failed and job status
-    return res.json({ ok: true, jobId, queued: recipients.length });
+    return res.json({
+      ok: true,
+      jobId,
+      queued: recipients.length,
+      skipped_unsubscribed: skippedUnsubscribed,
+    });
   } catch (e) {
     console.error("[adminEmail] POST /send error:", e);
     return res

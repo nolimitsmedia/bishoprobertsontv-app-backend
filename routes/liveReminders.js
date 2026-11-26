@@ -71,13 +71,10 @@ router.post("/", express.json({ limit: "8kb" }), async (req, res) => {
     res.json({ ok: true, email: userId ? email : undefined });
   } catch (e) {
     if (String(e?.code) === "42P01")
-      return res
-        .status(503)
-        .json({
-          ok: false,
-          error:
-            "Reminders are not set up yet (run the 20261113_10 migration).",
-        });
+      return res.status(503).json({
+        ok: false,
+        error: "Reminders are not set up yet (run the 20261113_10 migration).",
+      });
     console.error("[reminders] subscribe failed:", e);
     res.status(500).json({ ok: false, error: "Could not save your reminder." });
   }
@@ -146,10 +143,18 @@ router.get("/unsubscribe", async (req, res) => {
 // ---------- sender ----------
 async function sendDueReminders({
   now = new Date(),
-  siteUrl = process.env.REACT_APP_SITE_URL || process.env.PUBLIC_SITE_URL || "",
-  apiBase = process.env.PUBLIC_API_URL || "",
+  siteUrl = require("../services/emailTemplates").siteUrl(),
+  apiBase = require("../services/emailTemplates").apiUrl(),
   send,
 } = {}) {
+  const T = require("../services/emailTemplates");
+  // Turned off in Admin › Email › Automations: send nothing.
+  try {
+    if (!(await T.getTemplate("live_reminder")).enabled)
+      return { sent: 0, events: 0, off: true };
+  } catch {
+    /* use defaults */
+  }
   // Every live service (one-off or repeating) starting within 30 minutes.
   let events = [];
   try {
@@ -175,7 +180,6 @@ async function sendDueReminders({
     const { rows: subs } = await db.query(
       "SELECT email, token FROM live_reminders WHERE unsubscribed_at IS NULL ORDER BY id LIMIT 5000",
     );
-    const sendFn = send || require("../services/email").sendEmail;
     const when = ev.start_at.toLocaleTimeString("en-US", {
       hour: "numeric",
       minute: "2-digit",
@@ -183,25 +187,21 @@ async function sendDueReminders({
       timeZone: process.env.CALENDAR_TIMEZONE || "America/New_York",
     });
     const title = ev.title || "Live service";
-    const watch = siteUrl
-      ? `${siteUrl.replace(/\/+$/, "")}/#/live-streaming`
-      : "";
+    const watch = `${siteUrl.replace(/\/+$/, "")}/#/live-streaming`;
     let count = 0;
     for (const s of subs) {
       const unsub = `${apiBase.replace(/\/+$/, "")}/api/live-reminders/unsubscribe?token=${s.token}`;
-      try {
-        await sendFn({
-          to: s.email,
-          subject: `Starting soon: ${title}`,
-          text: `${title} starts at ${when}.${watch ? `\n\nWatch live: ${watch}` : ""}\n\nStop these reminders: ${unsub}`,
-          html: `<p><strong>${esc(title)}</strong> starts at ${esc(when)}.</p>${
-            watch ? `<p><a href="${esc(watch)}">Watch live</a></p>` : ""
-          }<p style="font-size:12px;color:#666"><a href="${esc(unsub)}">Stop live service reminders</a></p>`,
-        });
-        count += 1;
-      } catch (e) {
-        console.warn("[reminders] email failed:", e?.message || e);
-      }
+      // Branded email with the admin's wording; skipped for anyone who
+      // unsubscribed from all emails on the preferences page.
+      const r = await T.sendTemplated("live_reminder", {
+        to: s.email,
+        vars: { event_title: title, start_time: when, watch_url: watch },
+        unsubscribeUrl: apiBase ? unsub : undefined,
+        sendFn: send,
+      });
+      if (r.ok && r.status === "sent") count += 1;
+      else if (r.status === "failed")
+        console.warn("[reminders] email failed:", r.error || "");
     }
     await db.query(
       "UPDATE live_reminder_sends SET sent_count = $2 WHERE event_key = $1",

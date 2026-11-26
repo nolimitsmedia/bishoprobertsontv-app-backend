@@ -283,17 +283,21 @@ router.post("/forgot", async (req, res) => {
         [token, user.id],
       );
 
-      const base = appOrigin(req).replace(/\/$/, "");
-      // Adjust "/reset" path to match your front-end route if needed
-      const link = `${base}/reset?token=${encodeURIComponent(token)}`;
+      // The reset page on the public site (hash route). Local development
+      // (request from localhost) links back to the local site instead.
+      const origin = String(req.headers.origin || "");
+      const resetPath = `reset-password?token=${encodeURIComponent(token)}`;
+      const link = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+        ? `${origin}/#/${resetPath}`
+        : require("../services/emailTemplates").sitePage(resetPath);
 
       (async () => {
         try {
           if (sendPasswordResetEmail) {
             await sendPasswordResetEmail({
               to: user.email,
-              name: user.name || user.email,
-              link,
+              name: user.name || "",
+              resetUrl: link,
             });
           }
         } catch (e) {

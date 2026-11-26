@@ -321,7 +321,9 @@ if (process.env.NODE_ENV !== "production") {
   app.use("/dev", authenticateAdmin, devEmailRoutes);
 }
 app.use("/api/emails", emailsRoutes);
+app.use("/api/admin/email/automations", require("./routes/emailAutomations"));
 app.use("/api/admin/email", require("./routes/adminEmail"));
+app.use("/api/email-preferences", require("./routes/emailPreferences"));
 
 app.use("/api", bunnyStreamRouter);
 

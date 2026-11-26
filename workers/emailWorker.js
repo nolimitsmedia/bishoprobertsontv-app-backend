@@ -7,13 +7,47 @@ if (require.main === module) {
 }
 
 const fs = require("fs");
-const axios = require("axios");
-const FormData = require("form-data");
 
 // Allow injected db when run from server.js
 const defaultDb = require("../db");
 
-const { decryptJSON } = require("../utils/crypto");
+// Sends through the account connected in Admin › Integrations › Email (any
+// provider), or the server's .env settings.
+const { getEmailConfig, sendMail } = require("../services/emailTransport");
+const T = require("../services/emailTemplates");
+
+// Every campaign email gets an unsubscribe link (footer + inbox button).
+async function unsubscribeParts(to) {
+  try {
+    const p = await T.prefsFor(to);
+    if (!p) return null;
+    if (!T.wants(p, "news")) return { skip: true };
+    const url = T.oneClickLink(p.token, "news");
+    const prefs = T.preferencesLink(p.token);
+    const headers = { "List-Unsubscribe": `<${url}>` };
+    if (/\/api\/email-preferences\/unsubscribe/.test(url))
+      headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click";
+    const esc = (v) =>
+      String(v)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;");
+    return {
+      headers,
+      html: `<p style="margin:24px 0 0;font:12px/1.6 Arial,sans-serif;color:#6b6475;text-align:center"><a href="${esc(prefs)}" style="color:#6b6475">Email preferences</a> &nbsp;·&nbsp; <a href="${esc(url)}" style="color:#6b6475">Unsubscribe</a></p>`,
+      text: `\n\n—\nEmail preferences: ${prefs}\nUnsubscribe: ${url}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function withFooter(html, footer) {
+  if (!html) return html;
+  return /<\/body>/i.test(html)
+    ? html.replace(/<\/body>/i, `${footer}</body>`)
+    : html + footer;
+}
 
 const WORKER_NAME = "emailWorker";
 
@@ -34,17 +68,6 @@ function errlog(...args) {
 
 function safeStr(v) {
   return (v ?? "").toString();
-}
-
-function normalizeProvider(p) {
-  return safeStr(p).trim().toLowerCase();
-}
-
-function getSecret(secrets, camelKey, snakeKey) {
-  if (!secrets || typeof secrets !== "object") return "";
-  const a = secrets?.[camelKey];
-  const b = secrets?.[snakeKey];
-  return safeStr(a || b).trim();
 }
 
 function parseUploadsPathFromUrl(url) {
@@ -68,99 +91,6 @@ function parseUploadsPathFromUrl(url) {
   if (!absNorm.startsWith(uploadsRoot)) return null;
 
   return absNorm;
-}
-
-function mailgunBaseUrl(region = "us") {
-  return region && region.toLowerCase() === "eu"
-    ? "https://api.eu.mailgun.net"
-    : "https://api.mailgun.net";
-}
-
-async function sendViaMailgun({
-  secrets,
-  to,
-  subject,
-  text,
-  html,
-  attachments = [],
-}) {
-  const apiKey = getSecret(secrets, "apiKey", "api_key");
-  const domain = getSecret(secrets, "domain", "domain");
-  const fromName =
-    getSecret(secrets, "fromName", "from_name") || "Bishop Robertson TV";
-  const fromEmail = getSecret(secrets, "fromEmail", "from_email");
-  const region = getSecret(secrets, "region", "region") || "us";
-
-  if (!apiKey) throw new Error("Mailgun apiKey/api_key missing");
-  if (!domain) throw new Error("Mailgun domain missing");
-  if (!fromEmail) throw new Error("Mailgun fromEmail/from_email missing");
-
-  const from = `${fromName} <${fromEmail}>`;
-
-  const form = new FormData();
-  form.append("from", from);
-  form.append("to", to);
-  form.append("subject", subject || "");
-  if (text) form.append("text", text);
-  if (html) form.append("html", html);
-
-  for (const a of (Array.isArray(attachments) ? attachments : []).slice(0, 8)) {
-    const filePath = parseUploadsPathFromUrl(a?.url);
-    if (!filePath) continue;
-
-    if (fs.existsSync(filePath)) {
-      form.append("attachment", fs.createReadStream(filePath), {
-        filename: a?.name || path.basename(filePath),
-        contentType: a?.mime || undefined,
-      });
-    }
-  }
-
-  const base = mailgunBaseUrl(region);
-  const url = `${base}/v3/${encodeURIComponent(domain)}/messages`;
-
-  const res = await axios.post(url, form, {
-    auth: { username: "api", password: apiKey },
-    headers: form.getHeaders(),
-    timeout: 30000,
-    maxBodyLength: Infinity,
-    maxContentLength: Infinity,
-    validateStatus: (s) => s >= 200 && s < 300,
-  });
-
-  return res.data;
-}
-
-async function getActiveEmailConnection(db) {
-  try {
-    const r = await db.query(
-      `SELECT provider, secrets_enc
-       FROM email_connections
-       WHERE is_active = TRUE
-       ORDER BY updated_at DESC
-       LIMIT 1`,
-    );
-
-    if (r.rows?.length) {
-      const provider = normalizeProvider(r.rows[0].provider);
-      const secrets = decryptJSON(r.rows[0].secrets_enc);
-      return { provider, secrets };
-    }
-  } catch (e) {
-    errlog("getActiveEmailConnection error:", e?.message || e);
-  }
-
-  const provider = "mailgun";
-  const secrets = {
-    apiKey: process.env.MAILGUN_API_KEY || "",
-    domain: process.env.MAILGUN_DOMAIN || "",
-    fromEmail: process.env.MAILGUN_FROM_EMAIL || "",
-    fromName: process.env.MAILGUN_FROM_NAME || "Bishop Robertson TV",
-    region: process.env.MAILGUN_REGION || "us",
-  };
-
-  if (!secrets.apiKey || !secrets.domain || !secrets.fromEmail) return null;
-  return { provider, secrets };
 }
 
 async function updateJobStatus(db, jobId) {
@@ -245,32 +175,79 @@ function normalizeAttachments(job) {
 }
 
 let lastConnFingerprint = "";
+let pausedUntil = 0;
+
+// Problems with the email ACCOUNT (wrong password, blocked server, unverified
+// sender...) would fail every remaining email the same way. Instead of marking
+// a whole campaign failed, those emails go back in the queue and sending
+// pauses for a minute, so the campaign continues once the account is fixed.
+const ACCOUNT_PROBLEMS = new Set([
+  "auth",
+  "unreachable",
+  "config",
+  "sender",
+  "decrypt_failed",
+  "not_configured",
+  "rate_limit",
+]);
+const PAUSE_MS = 60 * 1000;
+
 function fingerprintConn(conn) {
   if (!conn) return "";
-  const provider = normalizeProvider(conn.provider);
-  const domain = getSecret(conn.secrets, "domain", "domain");
-  const fromEmail = getSecret(conn.secrets, "fromEmail", "from_email");
-  const region = getSecret(conn.secrets, "region", "region") || "us";
-  return `${provider}|${region}|${domain}|${fromEmail}`;
+  return `${conn.source}|${conn.provider}|${conn.settings?.from_email || ""}`;
+}
+
+// Read the job's files once per job (not once per recipient).
+function loadAttachments(job) {
+  const out = [];
+  for (const a of normalizeAttachments(job).slice(0, 8)) {
+    const filePath = parseUploadsPathFromUrl(a?.url);
+    if (!filePath || !fs.existsSync(filePath)) continue;
+    try {
+      out.push({
+        filename: a?.name || path.basename(filePath),
+        content: fs.readFileSync(filePath),
+        contentType: a?.mime || undefined,
+      });
+    } catch {
+      /* skip unreadable file */
+    }
+  }
+  return out;
+}
+
+async function requeue(db, ids) {
+  if (!ids.length) return;
+  await db.query(
+    `UPDATE email_job_items
+     SET status='queued', updated_at=NOW()
+     WHERE id = ANY($1::bigint[]) AND status='sending'`,
+    [ids],
+  );
 }
 
 async function processOnce(db, batchSize) {
-  const conn = await getActiveEmailConnection(db);
-  if (!conn) {
-    log("No active email connection and MAILGUN env fallback is incomplete.");
+  if (Date.now() < pausedUntil) return;
+
+  let conn = null;
+  try {
+    conn = await getEmailConfig();
+  } catch (e) {
+    log("Email account can't be used:", e?.message || e);
     return;
   }
-
-  if (normalizeProvider(conn.provider) !== "mailgun") {
-    log(`Provider "${conn.provider}" not implemented in worker yet.`);
+  if (!conn) {
+    log(
+      "No email account connected (Admin › Integrations › Email) and no MAILGUN_/SMTP_ settings in .env.",
+    );
     return;
   }
 
   const fp = fingerprintConn(conn);
   if (VERBOSE || fp !== lastConnFingerprint) {
-    const domain = getSecret(conn.secrets, "domain", "domain");
-    const fromEmail = getSecret(conn.secrets, "fromEmail", "from_email");
-    info(`Using Mailgun domain="${domain}" from="${fromEmail}"`);
+    info(
+      `Sending with ${conn.provider} from="${conn.settings?.from_email || ""}" (${conn.source === "admin" ? "Email Integration" : "server .env"})`,
+    );
     lastConnFingerprint = fp;
   }
 
@@ -290,7 +267,11 @@ async function processOnce(db, batchSize) {
       byJob.get(jobId).push(it);
     }
 
+    const pending = new Set(items.map((it) => it.id));
+    let accountProblem = null;
+
     for (const [jobId, jobItems] of byJob.entries()) {
+      if (accountProblem) break;
       const job = await getJobPayload(db, jobId);
       if (!job) {
         for (const it of jobItems) {
@@ -300,14 +281,16 @@ async function processOnce(db, batchSize) {
              WHERE id=$1`,
             [it.id, "Job not found"],
           );
+          pending.delete(it.id);
         }
         await updateJobStatus(db, jobId);
         continue;
       }
 
-      const attachments = normalizeAttachments(job);
+      const attachments = loadAttachments(job);
 
       for (const it of jobItems) {
+        if (accountProblem) break;
         const to = safeStr(it.email).trim();
         if (!to) {
           await db.query(
@@ -316,17 +299,33 @@ async function processOnce(db, batchSize) {
              WHERE id=$1`,
             [it.id, "Recipient email missing"],
           );
+          pending.delete(it.id);
           continue;
         }
 
+        const unsub = await unsubscribeParts(to);
+        if (unsub?.skip) {
+          // Unsubscribed after the campaign was created.
+          await db.query(
+            `UPDATE email_job_items
+             SET status='failed', error='Not sent: unsubscribed', updated_at=NOW()
+             WHERE id=$1`,
+            [it.id],
+          );
+          pending.delete(it.id);
+          continue;
+        }
         try {
-          await sendViaMailgun({
-            secrets: conn.secrets,
+          const bodyText = safeStr(job.body_text);
+          const bodyHtml = safeStr(job.body_html);
+          await sendMail({
             to,
             subject: safeStr(job.subject),
-            text: safeStr(job.body_text),
-            html: safeStr(job.body_html),
+            text: bodyText ? bodyText + (unsub ? unsub.text : "") : bodyText,
+            html:
+              bodyHtml && unsub ? withFooter(bodyHtml, unsub.html) : bodyHtml,
             attachments,
+            headers: unsub?.headers,
           });
 
           await db.query(
@@ -335,25 +334,34 @@ async function processOnce(db, batchSize) {
              WHERE id=$1`,
             [it.id],
           );
+          pending.delete(it.id);
         } catch (e) {
-          const msg =
-            e?.response?.data?.message ||
-            e?.response?.data?.error ||
-            e?.message ||
-            "Mailgun send failed";
-
-          errlog("Send failed:", safeStr(msg));
-
+          const msg = safeStr(e?.message || "Send failed");
+          if (ACCOUNT_PROBLEMS.has(e?.code)) {
+            accountProblem = msg;
+            break;
+          }
+          errlog("Send failed:", msg);
           await db.query(
             `UPDATE email_job_items
              SET status='failed', error=$2, updated_at=NOW()
              WHERE id=$1`,
-            [it.id, safeStr(msg).slice(0, 1000)],
+            [it.id, msg.slice(0, 1000)],
           );
+          pending.delete(it.id);
         }
       }
 
       await updateJobStatus(db, jobId);
+    }
+
+    if (accountProblem) {
+      await requeue(db, [...pending]);
+      for (const jobId of byJob.keys()) await updateJobStatus(db, jobId);
+      pausedUntil = Date.now() + PAUSE_MS;
+      errlog(
+        `Paused 60s — email account problem, ${pending.size} email(s) put back in the queue: ${accountProblem}`,
+      );
     }
   } catch (e) {
     try {
@@ -396,7 +404,7 @@ async function startEmailWorker(dbInjected, opts = {}) {
   }
 }
 
-module.exports = { startEmailWorker };
+module.exports = { startEmailWorker, processOnce };
 
 if (require.main === module) {
   startEmailWorker(defaultDb, {});
